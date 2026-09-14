@@ -1,0 +1,75 @@
+--- tee.c.orig
++++ tee.c
+@@ -124,32 +124,53 @@
+     }
+ 
+   while ((nr = read(0, buf, TEE_BUFSIZE)) > 0)
+-    for (fl = tee_flist; fl; fl = fl->next)
+-      {
+-	n = nr;
+-	bp = buf;
+-	do
+-	  {
+-	    if ((nw = write (fl->fd, bp, n)) == -1)
+-	      {
+-		builtin_error ("%s: write error: %s", fl->fname, strerror (errno));
+-		rval = EXECUTION_FAILURE;
+-		break;
+-	      }
+-            bp += nw;
+-            QUIT;
+-	  }
+-	while (n -= nw);
+-      }
++    {
++      int live = 0;
++      for (fl = tee_flist; fl; fl = fl->next)
++	{
++	  if (fl->fd < 0)
++	    continue;
++	  n = nr;
++	  bp = buf;
++	  while (n > 0)
++	    {
++	      nw = write (fl->fd, bp, n);
++	      if (nw < 0 && errno == EINTR)
++		{
++		  QUIT;
++		  continue;
++		}
++	      if (nw < 0)
++		{
++		  builtin_error ("%s: write error: %s", fl->fname, strerror (errno));
++		  rval = EXECUTION_FAILURE;
++		  if (fl->fd != 1)
++		    close (fl->fd);
++		  fl->fd = -1;
++		  break;
++		}
++	      bp += nw;
++	      n -= nw;
++	      QUIT;
++	    }
++	  if (fl->fd >= 0)
++	    live++;
++	}
++      if (live == 0)
++	break;
++    }
+   if (nr < 0)
+-    builtin_error ("read error: %s", strerror (errno));
++    {
++      builtin_error ("read error: %s", strerror (errno));
++      rval = EXECUTION_FAILURE;
++    }
+ 
+   /* Deallocate resources -- this is a builtin command. */
+   tee_flist = tee_flist->next;		/* skip bogus close of stdout */
+   while (tee_flist)
+     {
+       fl = tee_flist;
+-      if (close (fl->fd) < 0)
++      if (fl->fd >= 0 && close (fl->fd) < 0)
+ 	{
+ 	  builtin_error ("%s: close_error: %s", fl->fname, strerror (errno));
+ 	  rval = EXECUTION_FAILURE;

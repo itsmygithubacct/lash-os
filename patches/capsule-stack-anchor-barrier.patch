@@ -1,0 +1,26 @@
+--- a/src/pass/stackify.cpp
++++ b/src/pass/stackify.cpp
+@@ -1916,7 +1916,6 @@
+             StepAbi abi = ConfigureStepAbi(*unit.Func, unit.BorrowedContext);
+             Value* fiberControl = abi.Control;
+             unit.Func->getArg(unit.Func->arg_size() - 1)->setName("region");
+-            LoadFrameAnchor(b, unit.Func->getArg(FiberArgumentIndex(unit.BorrowedContext)), unit.Fp, unit.Frame);
+             // Give the post-RA spill mover the native pointer from which it
+             // can recover the fiber slice. On the fixed tier that is the
+             // backing-map argument. On arena it is the control record: the
+@@ -1925,10 +1924,14 @@
+             // even in a unit which has no relocated spill.
+             Value* stackBase = FixedMemory_ ? unit.Func->getArg(StackBackingArgumentIndex(unit.BorrowedContext)) : fiberControl;
+             {
++                // Keep the frame load and its derived addresses after the
++                // spill-backing marker. Otherwise scheduling can move their
++                // register spills before the backing is available.
+                 auto* anchor = InlineAsm::get(FunctionType::get(Type::getVoidTy(Ctx_), {stackBase->getType()}, false), ("# " + bpf::sym::StackAnchor).str(),
+-                    "r", /*hasSideEffects=*/true);
++                    "r,~{memory}", /*hasSideEffects=*/true);
+                 b.CreateCall(anchor, {stackBase});
+             }
++            LoadFrameAnchor(b, unit.Func->getArg(FiberArgumentIndex(unit.BorrowedContext)), unit.Fp, unit.Frame);
+             b.CreateBr(dispatch);
+         }
+     }

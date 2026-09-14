@@ -1,0 +1,25 @@
+{
+  "bash_os": {
+    "source": "https://github.com/itsmygithubacct/bash-os",
+    "revision": "fa178afafddfce8ee870975a38a7f271b25140a9",
+    "local_transformations": [
+      "scripts/adapt-workspaces.py"
+    ],
+    "vendored_scope": "Build inputs and licenses; upstream CI, benchmarks, development reports, examples and tests omitted"
+  },
+  "bpf_capsule": {
+    "source": "https://github.com/ayles/bpf-capsule",
+    "revision": "6733c4531f06f95a32a35c2084b3dcf1a4263746",
+    "local_patches": [
+      "patches/capsule-post-optimization-soft-float.patch",
+      "patches/capsule-reload-reachability.patch",
+      "patches/capsule-stack-anchor-barrier.patch",
+      "patches/capsule-proven-arena-spills.patch",
+      "patches/capsule-flatten-spill-metadata.patch",
+      "patches/capsule-function-line-info.patch",
+      "patches/capsule-wide-integer-widths.patch",
+      "patches/capsule-large-image-budget.patch",
+      "patches/capsule-large-block-continuations.patch"
+    ]
+  }
+}

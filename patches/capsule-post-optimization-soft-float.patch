@@ -1,0 +1,15 @@
+diff --git a/tools/bpf-capsule-ld/main.cpp b/tools/bpf-capsule-ld/main.cpp
+--- a/tools/bpf-capsule-ld/main.cpp
++++ b/tools/bpf-capsule-ld/main.cpp
+@@ -148,7 +148,10 @@ std::string capsulePreparationPipeline() {
+ 
+ std::string capsuleFinalPipeline() {
+     bool arena = Memory == MemoryMode::Arena;
+-    std::string pipeline = "function(bpf-expand-mem),bpf-internalize,globaldce,function(bpf-validate-no-float),"
++    // O2/SROA can materialize floating stores from constant aggregate globals,
++    // whose source layout is intentionally preserved by the first soft-float
++    // pass. Lower those new scalar operations before enforcing the invariant.
++    std::string pipeline = "function(bpf-expand-mem),bpf-soft-float,bpf-internalize,globaldce,function(bpf-validate-no-float),"
+                            "function(bpf-normalize-irreducible,fix-irreducible),bpf-capsule-domains,bpf-remove-suspend-barriers,";
+     if (ManagedAtomics) {
+         pipeline += arena ? "function(bpf-lower-managed-atomics)," : "function(bpf-lower-managed-atomics<fixed>),";

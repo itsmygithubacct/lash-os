@@ -1,0 +1,34 @@
+Vendored from libs.suckless.org/libgrapheme (git://git.suckless.org/libgrapheme).
+Unicode 17.0.0 grapheme-cluster + line/word/sentence/case/bidi tables.
+ISC-licensed.
+
+Files:
+  *.c                  — source files (8 .c, ~4500 LoC)
+  util.h               — internal API
+  grapheme.h           — public API
+  *_data.h             — pre-generated Unicode tables
+                         (originally gen/X.h; renamed to *_data.h to avoid
+                          name collision with src/X.c after flattening)
+  gen_types.h          — shared types for the data tables
+                         (originally gen/types.h)
+  LICENSE.txt          — ISC
+
+Build pre-step (already done at vendoring time): the upstream build runs
+gen/X (compiled C programs) against data/*.txt to produce gen/X.h tables.
+The output of that step is what's vendored here.
+
+Path-rewriting done at vendor time:
+  #include "../gen/X.h"   → #include "X_data.h"
+  #include "../grapheme.h" → #include "grapheme.h"
+  #include "types.h"      → #include "gen_types.h"
+
+After patch-bash-loadables.sh flattening:
+  builtins/_libgrapheme_*.{c,h}  for everything
+
+Loadables that need libgrapheme include:
+  #include "_libgrapheme_grapheme.h"
+
+API entry points (see grapheme.h):
+  grapheme_next_character_break_utf8()  — for cell-width / cursor positioning
+  grapheme_decode_utf8() / grapheme_encode_utf8()
+  grapheme_next_line_break_utf8()       — for word-wrap

@@ -1,0 +1,38 @@
+--- a/src/pass/expand_i128.cpp
++++ b/src/pass/expand_i128.cpp
+@@ -16,7 +16,9 @@
+ namespace {
+ 
+ StringRef arithmeticLibcall(const Instruction& instruction) {
+-    if (instruction.getType()->isIntegerTy(128)) {
++    if (instruction.getType()->isIntegerTy() &&
++        instruction.getType()->getIntegerBitWidth() > 64 &&
++        instruction.getType()->getIntegerBitWidth() <= 128) {
+         switch (instruction.getOpcode()) {
+             case Instruction::Mul:
+                 return bpf::sym::Mul128;
+@@ -53,7 +55,9 @@
+ 
+ // BPF legalizes wide add/shift/compare in registers, but mul/div/rem need
+-// compiler-rt. Keep its ordinary i128 signatures: managed calls already pass
+-// arbitrary-width arguments and results through the fiber frame. There is no
++// compiler-rt. Checked arithmetic can introduce intermediate widths such as
++// i65. Extend those operands to the ordinary i128 helper signature and narrow
++// its result back to the original width. Managed calls already pass arbitrary
++// widths through the fiber frame. There is no
+ // native two-register return ABI or Capsule-specific arithmetic wrapper.
+ struct ExpandI128Pass : public PassInfoMixin<ExpandI128Pass> {
+     PreservedAnalyses run(Module& module, ModuleAnalysisManager&) {
+@@ -73,7 +77,11 @@
+             Value* result;
+             if (isa<BinaryOperator>(instruction)) {
+                 auto helper = module.getOrInsertFunction(name, i128, i128, i128);
+-                result = b.CreateCall(helper, {a, d});
++                bool signedOperation = instruction->getOpcode() == Instruction::SDiv ||
++                                       instruction->getOpcode() == Instruction::SRem;
++                Value* wide = b.CreateCall(helper,
++                    {b.CreateIntCast(a, i128, signedOperation), b.CreateIntCast(d, i128, signedOperation)});
++                result = b.CreateIntCast(wide, instruction->getType(), signedOperation);
+             } else {
+                 Value* product;
+                 Value* overflow;

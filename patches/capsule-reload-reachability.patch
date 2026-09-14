@@ -1,0 +1,74 @@
+--- a/src/pass/stackify.cpp
++++ b/src/pass/stackify.cpp
+@@ -3499,25 +3499,42 @@
+             return;
+         }
+ 
+-        auto reachableWithout = [](BasicBlock* start, BasicBlock* target, BasicBlock* avoid) {
+-            if (start == avoid) {
++        // The question is existential over all resume roots. Compute their
++        // union once per excluded reload block, rather than a fresh graph
++        // search for every (load, use, resume) triple. No CFG changes occur
++        // until the collected reloads are localized below.
++        DenseMap<BasicBlock*, unsigned> blockIds;
++        for (BasicBlock& block : func) {
++            blockIds[&block] = blockIds.size();
++        }
++        DenseMap<BasicBlock*, BitVector> reachable;
++        auto reachableWithout = [&](BasicBlock* target, BasicBlock* avoid) {
++            if (target == avoid) {
+                 return false;
+             }
+-            SmallPtrSet<BasicBlock*, 32> seen;
+-            SmallVector<BasicBlock*, 32> worklist{start};
+-            seen.insert(start);
+-            while (!worklist.empty()) {
+-                BasicBlock* block = worklist.pop_back_val();
+-                if (block == target) {
+-                    return true;
+-                }
+-                for (BasicBlock* succ : successors(block)) {
+-                    if (succ != avoid && seen.insert(succ).second) {
+-                        worklist.push_back(succ);
++            auto [cached, inserted] = reachable.try_emplace(avoid, func.size(), false);
++            BitVector& seen = cached->second;
++            if (inserted) {
++                SmallVector<BasicBlock*, 32> worklist;
++                for (BasicBlock* resume : resumes) {
++                    unsigned id = blockIds.lookup(resume);
++                    if (resume != avoid && !seen.test(id)) {
++                        seen.set(id);
++                        worklist.push_back(resume);
+                     }
+                 }
+-            }
+-            return false;
++                while (!worklist.empty()) {
++                    BasicBlock* block = worklist.pop_back_val();
++                    for (BasicBlock* succ : successors(block)) {
++                        unsigned id = blockIds.lookup(succ);
++                        if (succ != avoid && !seen.test(id)) {
++                            seen.set(id);
++                            worklist.push_back(succ);
++                        }
++                    }
++                }
++            }
++            return seen.test(blockIds.lookup(target));
+         };
+ 
+         SmallVector<LoadInst*> bypassed;
+@@ -3534,12 +3551,7 @@
+                 if (auto* phi = dyn_cast<PHINode>(user)) {
+                     useBlock = phi->getIncomingBlock(use);
+                 }
+-                for (BasicBlock* resume : resumes) {
+-                    if (reachableWithout(resume, useBlock, load->getParent())) {
+-                        bad = true;
+-                        break;
+-                    }
+-                }
++                bad = reachableWithout(useBlock, load->getParent());
+                 if (bad) {
+                     break;
+                 }

@@ -1,0 +1,35 @@
+# bash-loadables-pure.list — the POSIX-utility baseline: the 28 loadables from
+# GNU bash's own examples/loadables, taken from the pinned tarball at build
+# time — except stat, cut and seq, which this repo's own MIT sources
+# replace in every variant. The smallest useful bash-os:
+#   ./build.sh --list config/bash-loadables-pure.list   ->  out/bash-pure
+# Same NAME|short-doc grammar as bash-loadables.list (config/loadables.sh).
+
+basename|basename
+cat|cat
+chmod|chmod
+cut|cut -b LIST | -c LIST | -f LIST [-d DELIM] [-s] [-z] [--complement] [--output-delimiter=STRING] [-a ARRAY] [FILE...]
+dirname|dirname
+head|head
+id|id
+ln|ln
+logname|logname
+mkdir|mkdir
+mkfifo|mkfifo
+mktemp|mktemp
+pathchk|pathchk
+printenv|printenv
+realpath|realpath
+rm|rm
+rmdir|rmdir
+seq|seq [-w] [-s STRING] [-f FORMAT] [FIRST [INCREMENT]] LAST
+sleep|sleep
+stat|stat
+strftime|strftime
+strptime|strptime
+sync|sync
+tee|tee
+tty|tty
+uname|uname
+unlink|unlink
+whoami|whoami

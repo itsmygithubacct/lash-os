@@ -1,0 +1,32 @@
+monocypher 4.0.2 — vendored from
+https://monocypher.org/download/monocypher-4.0.2.tar.gz
+sha256 38d07179738c0c90677dba3ceb7a7b8496bcfea758ba1a53e803fed30ae0879c
+
+License: BSD-2-Clause OR CC0-1.0 (we use BSD-2-Clause; see LICENSE.txt).
+The combined statically-linked bash binary is GPL-3+ derivative work
+(per binhex precedent); BSD-2 is GPL-3+ compatible — no license conflict.
+
+Refresh procedure when bumping versions:
+    1. Download new tarball from https://monocypher.org/download/
+    2. tar xzf, then:
+        cp src/monocypher.c   scripts/loadables/_monocypher/
+        cp src/monocypher.h   scripts/loadables/_monocypher/
+        cp LICENCE.md         scripts/loadables/_monocypher/LICENSE.txt
+    3. Update the version + sha256 in this file.
+    4. Re-run RFC 8032 KAT test (tests/bash-os/08-bashcrypto-ed25519.sh).
+
+Files used by bash-os:
+    monocypher.c    — implementation (~3 KLoC)
+    monocypher.h    — public API (~300 lines)
+    LICENSE.txt     — upstream LICENCE.md verbatim
+
+Files NOT used:
+    src/optional/   — chacha20+poly1305 alternatives + ed25519-shake;
+                      ChaCha20+Poly1305 is provided by the Stage 19
+                      mbedTLS path, and standard SHA-512 Ed25519 is
+                      sufficient.
+
+The underscore prefix on this directory tells
+scripts/patch-bash-loadables.sh to skip its file-glob loop —
+monocypher is library code that bashcrypto.c #includes, NOT a
+separate bash builtin.

@@ -1,0 +1,30 @@
+--- a/src/pass/machine_flatten.cpp
++++ b/src/pass/machine_flatten.cpp
+@@ -25,6 +25,8 @@
+ #include "llvm/CodeGen/MachineFunctionPass.h"
+ #include "llvm/CodeGen/MachineInstr.h"
+ #include "llvm/CodeGen/MachineJumpTableInfo.h"
++#include "llvm/CodeGen/MachineMemOperand.h"
++#include "llvm/CodeGen/PseudoSourceValue.h"
+ #include "llvm/CodeGen/MachineModuleInfo.h"
+ #include "llvm/CodeGen/TargetInstrInfo.h"
+ #include "llvm/CodeGen/TargetPassConfig.h"
+@@ -166,7 +168,17 @@
+             if (!instruction.memoperands_empty()) {
+                 SmallVector<MachineMemOperand*, 2> memory;
+                 for (MachineMemOperand* operand : instruction.memoperands()) {
+-                    memory.push_back(destination.getMachineMemOperand(operand, operand->getAAInfo()));
++                    if (isa_and_nonnull<FixedStackPseudoSourceValue>(operand->getPseudoValue())) {
++                        // PEI and spill relocation have already selected the
++                        // physical address. The old frame index belongs to
++                        // source, not destination. Keep a conservative memory
++                        // reference instead of exposing that invalid index to
++                        // late analyses such as LiveDebugValues.
++                        memory.push_back(destination.getMachineMemOperand(operand,
++                            MachinePointerInfo(operand->getAddrSpace(), operand->getOffset()), operand->getMemoryType()));
++                    } else {
++                        memory.push_back(destination.getMachineMemOperand(operand, operand->getAAInfo()));
++                    }
+                 }
+                 clone->setMemRefs(destination, memory);
+             }

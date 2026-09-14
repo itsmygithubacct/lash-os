@@ -1,0 +1,18 @@
+Vendored from cktan/tomlc17 (https://github.com/cktan/tomlc17).
+TOML v1.1.0 parser. MIT-licensed.
+Pinned version: R260517 (cb9bba39f2e63a9e67fa61d6c7521a184eb5fc38).
+
+Files:
+  tomlc17.c      — single-file parser (~2900 LoC)
+  tomlc17.h      — public API header
+  LICENSE.txt    — MIT (CK Tan)
+
+Compile-time options: defaults. The library uses standard C with
+<stdbool.h> + <stdint.h> + <stdio.h>.
+
+After patch-bash-loadables.sh flattening, files land at:
+  builtins/_tomlc17_tomlc17.c
+  builtins/_tomlc17_tomlc17.h
+
+Loadables that need tomlc17 include:
+  #include "_tomlc17_tomlc17.h"

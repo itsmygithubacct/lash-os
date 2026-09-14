@@ -1,0 +1,387 @@
+/*
+ * config_parser.c - Common configuration file parser functions
+ *
+ * This file is part of the SSH Library
+ *
+ * Copyright (c) 2009-2013    by Andreas Schneider <asn@cryptomilk.org>
+ *
+ * The SSH Library is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU Lesser General Public License as published by
+ * the Free Software Foundation; either version 2.1 of the License, or (at your
+ * option) any later version.
+ *
+ * The SSH Library is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+ * or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Lesser General Public
+ * License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public License
+ * along with the SSH Library; see the file COPYING.  If not, write to
+ * the Free Software Foundation, Inc., 59 Temple Place - Suite 330, Boston,
+ * MA 02111-1307, USA.
+ */
+
+#include "config.h"
+#include <string.h>
+#include <strings.h>
+#include <stdlib.h>
+extern char *strdup(const char *);
+
+#include <ctype.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+
+#include "config_parser.h"
+#include "priv.h"
+#include "misc.h"
+
+/* Returns the original string after skipping the leading whitespace
+ * until finding LF.
+ * This is useful in case we need to get the rest of the line (for example
+ * external command).
+ */
+char *ssh_config_get_cmd(char **str)
+{
+    register char *c = NULL;
+    char *r = NULL;
+
+    /* Ignore leading spaces */
+    for (c = *str; *c; c++) {
+        if (!isblank((unsigned char)*c)) {
+            break;
+        }
+    }
+
+    for (r = c; *c; c++) {
+        if (*c == '\n') {
+            *c = '\0';
+            goto out;
+        }
+    }
+
+out:
+    *str = c + 1;
+
+    return r;
+}
+
+/* Returns the next token delimited by whitespace or equal sign (=)
+ * respecting the quotes creating separate token (including whitespaces).
+ */
+char *ssh_config_get_token_info(char **str, struct ssh_config_token_info *info)
+{
+    register char *c = NULL;
+    /* Write cursor for the normalized token. Quotes and selected escape
+     * characters are dropped while still returning a pointer into the original
+     * buffer.
+     */
+    char *dst = NULL;
+    bool had_equal = false;
+    bool found = false;
+    bool invalid = false;
+    char *r = NULL;
+
+    if (info != NULL) {
+        info->found = false;
+        info->had_equal = false;
+        info->invalid = false;
+    }
+
+    /* Ignore leading spaces */
+    for (c = *str; *c; c++) {
+        if (! isblank(*c)) {
+            break;
+        }
+    }
+
+    /* End of string or a bare newline means there is no token here, not an
+     * explicit empty token (""). Keep found=false in both cases; the newline
+     * branch also consumes the line boundary.
+     */
+    if (*c == '\0') {
+        r = c;
+        goto out;
+    }
+    if (*c == '\n') {
+        r = c;
+        *c = '\0';
+        c++;
+        goto out;
+    }
+
+    found = true;
+
+    /* If we start with quote, return the whole quoted block */
+    if (*c == '\"') {
+        bool closed_quote = false;
+
+        r = dst = ++c;
+        while (*c != '\0' && *c != '\n') {
+            if (*c == '\\' && c[1] == '\"') {
+                c++;
+            } else if (*c == '\"') {
+                *dst = '\0';
+                c++;
+                closed_quote = true;
+                break;
+            }
+            *dst++ = *c++;
+        }
+        if (!closed_quote) {
+            invalid = true;
+            *dst = '\0';
+            if (*c == '\n') {
+                c++;
+            }
+        }
+    } else {
+        /* Otherwise terminate on space, equal or newline */
+        r = dst = c;
+        for (; *c; c++) {
+            /* Treat escaped whitespace outside quotes as part of the current
+             * token, e.g. "tag\ name". The backslash is dropped as the token
+             * is compacted in place through dst.
+             *
+             * Note: there is no general backslash escape; the quoted branch
+             * above only recognizes \", and this branch only recognizes
+             * \<blank>.
+             */
+            if (*c == '\\' && isblank((unsigned char)c[1])) {
+                c++;
+                *dst++ = *c;
+            } else if (isblank((unsigned char)*c) || *c == '=' || *c == '\n') {
+                had_equal = (*c == '=');
+                *dst = '\0';
+                c++;
+                break;
+            } else {
+                *dst++ = *c;
+            }
+        }
+        if (*c == '\0') {
+            *dst = '\0';
+        }
+    }
+
+    /* Skip any other remaining whitespace */
+    while (isblank((unsigned char)*c) || *c == '\n' ||
+           (!had_equal && *c == '=')) {
+        if (*c == '=') {
+            had_equal = true;
+        }
+        c++;
+    }
+out:
+    *str = c;
+    if (info != NULL) {
+        info->found = found;
+        info->had_equal = had_equal;
+        info->invalid = invalid;
+    }
+    return r;
+}
+
+char *ssh_config_get_token(char **str)
+{
+    return ssh_config_get_token_info(str, NULL);
+}
+
+long ssh_config_get_long(char **str, long notfound)
+{
+    char *p = NULL, *endp = NULL;
+    long i;
+
+    p = ssh_config_get_token(str);
+    if (p && *p) {
+        i = strtol(p, &endp, 10);
+        if (p == endp || *endp != '\0') {
+            return notfound;
+        }
+        return i;
+    }
+
+    return notfound;
+}
+
+const char *ssh_config_get_str_tok(char **str, const char *def)
+{
+    char *p = NULL;
+
+    p = ssh_config_get_token(str);
+    if (p && *p) {
+        return p;
+    }
+
+    return def;
+}
+
+int ssh_config_get_yesno(char **str, int notfound)
+{
+    const char *p = NULL;
+
+    p = ssh_config_get_str_tok(str, NULL);
+    if (p == NULL) {
+        return notfound;
+    }
+
+    {
+        int is_yes = (strcasecmp(p, "yes") == 0);
+        int is_true = (strcasecmp(p, "true") == 0);
+        if (is_yes || is_true) {
+            return 1;
+        } else {
+            int is_no = (strcasecmp(p, "no") == 0);
+            int is_false = (strcasecmp(p, "false") == 0);
+            if (is_no || is_false) {
+                return 0;
+            }
+        }
+
+    }
+
+    return notfound;
+}
+
+int ssh_config_parse_uri(const char *tok,
+                         char **username,
+                         char **hostname,
+                         char **port,
+                         bool ignore_port,
+                         bool strict)
+{
+    const char *endp = NULL;
+    long port_n;
+    int rc;
+
+    /* Sanitize inputs */
+    if (username != NULL) {
+        *username = NULL;
+    }
+    if (hostname != NULL) {
+        *hostname = NULL;
+    }
+    if (port != NULL) {
+        *port = NULL;
+    }
+
+    /* Username part (optional) */
+    endp = strrchr(tok, '@');
+    if (endp != NULL) {
+        /* Zero-length username is not valid */
+        if (tok == endp) {
+            goto error;
+        }
+        if (username != NULL) {
+            *username = strndup(tok, endp - tok);
+            if (*username == NULL) {
+                goto error;
+            }
+            rc = ssh_check_username_syntax(*username);
+            if (rc != SSH_OK) {
+                goto error;
+            }
+        }
+        tok = endp + 1;
+        /* If there is second @ character, this does not look like our URI */
+        endp = strchr(tok, '@');
+        if (endp != NULL) {
+            goto error;
+        }
+    }
+
+    /* Hostname */
+    if (*tok == '[') {
+        /* IPv6 address is enclosed with square brackets */
+        tok++;
+        endp = strchr(tok, ']');
+        if (endp == NULL) {
+            goto error;
+        }
+    } else if (!ignore_port) {
+        /* Hostnames or aliases expand to the last colon (if port is requested)
+         * or to the end */
+        endp = strrchr(tok, ':');
+        if (endp == NULL) {
+            endp = strchr(tok, '\0');
+        }
+    } else {
+        /* If no port is requested, expand to the end of line
+         * (to accommodate the IPv6 addresses) */
+        endp = strchr(tok, '\0');
+    }
+    if (tok == endp) {
+        /* Zero-length hostnames are not valid */
+        goto error;
+    }
+    if (hostname != NULL) {
+        *hostname = strndup(tok, endp - tok);
+        if (*hostname == NULL) {
+            goto error;
+        }
+        if (strict) {
+            /* if not an ip, check syntax */
+            rc = ssh_is_ipaddr(*hostname);
+            if (rc == 0) {
+                rc = ssh_check_hostname_syntax(*hostname);
+                if (rc != SSH_OK) {
+                    goto error;
+                }
+            }
+        } else {
+            /* Reject shell metacharacters to allow config aliases with
+             * non-RFC1035 chars (e.g. %, _). Modeled on OpenSSH's
+             * valid_hostname() in ssh.c. */
+            const char *c = NULL;
+            if ((*hostname)[0] == '-') {
+                goto error;
+            }
+            for (c = *hostname; *c != '\0'; c++) {
+                const char *is_meta = strchr("'`\"$\\;&<>|(){},", *c);
+                int is_space = isspace((unsigned char)*c);
+                int is_ctrl = iscntrl((unsigned char)*c);
+                if (is_meta != NULL || is_space || is_ctrl) {
+                    goto error;
+                }
+            }
+        }
+    }
+    /* Skip also the closing bracket */
+    if (*endp == ']') {
+        endp++;
+    }
+
+    /* Port (optional) */
+    if (*endp != '\0') {
+        char *port_end = NULL;
+
+        /* Verify the port is valid positive number */
+        port_n = strtol(endp + 1, &port_end, 10);
+        if (port_n < 1 || *port_end != '\0') {
+            SSH_LOG(SSH_LOG_TRACE, "Failed to parse port number."
+                    " The value '%ld' is invalid or there are some"
+                    " trailing characters: '%s'", port_n, port_end);
+            goto error;
+        }
+        if (port != NULL) {
+            *port = strdup(endp + 1);
+            if (*port == NULL) {
+                goto error;
+            }
+        }
+    }
+
+    return SSH_OK;
+
+error:
+    if (username != NULL) {
+        SAFE_FREE(*username);
+    }
+    if (hostname != NULL) {
+        SAFE_FREE(*hostname);
+    }
+    if (port != NULL) {
+        SAFE_FREE(*port);
+    }
+    return SSH_ERROR;
+}

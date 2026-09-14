@@ -1,0 +1,25 @@
+Vendored from cr-marcstevens/sha1collisiondetection
+(https://github.com/cr-marcstevens/sha1collisiondetection), via
+git's bundled copy at research/refs/git/sha1dc/.
+
+Files:
+  sha1.c       — SHA-1 + collision detection logic
+  sha1.h       — public API header
+  ubc_check.c  — unavoidable-bit-condition tables (the bulk of the
+                 collision-detection apparatus)
+  ubc_check.h  — UBC API header
+  LICENSE.txt  — MIT (Stevens / Shumow / git contributors)
+
+Compile-time options used here: defaults. The library auto-detects
+endianness for x86_64 (SHA1DC_ON_INTEL_LIKE_PROCESSOR) — no manual
+SHA1DC_BIGENDIAN / SHA1DC_FORCE_LITTLEENDIAN needed.
+
+By the time this lands in builtins/, patch-bash-loadables.sh has
+flattened the file tree to:
+  builtins/_sha1dc_sha1.c       (was sha1.c)
+  builtins/_sha1dc_sha1.h       (was sha1.h)
+  builtins/_sha1dc_ubc_check.c  (was ubc_check.c)
+  builtins/_sha1dc_ubc_check.h  (was ubc_check.h)
+
+Loadables that need sha1dc include the flattened path:
+  #include "_sha1dc_sha1.h"

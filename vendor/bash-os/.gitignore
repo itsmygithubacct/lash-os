@@ -1,0 +1,9 @@
+# build products and the extracted bash tree
+/build/
+/dl/
+/out/
+*.stage.*
+
+# Python helper bytecode
+__pycache__/
+*.pyc

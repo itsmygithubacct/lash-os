@@ -1,0 +1,102 @@
+--- a/src/pass/stackify.cpp
++++ b/src/pass/stackify.cpp
+@@ -10,6 +10,7 @@
+ #include <llvm/ADT/BitVector.h>
+ #include <llvm/ADT/DenseMap.h>
+ #include <llvm/ADT/MapVector.h>
++#include <llvm/ADT/PostOrderIterator.h>
+ #include <llvm/ADT/SCCIterator.h>
+ #include <llvm/ADT/SetVector.h>
+ #include <llvm/Analysis/AssumptionCache.h>
+@@ -393,6 +394,7 @@
+         if (InputError_) {
+             return false;
+         }
++        InsertLargePathYields();
+         ValidateYieldCalls();
+         ValidateJumpCalls();
+         if (YieldError_ || JumpError_) {
+@@ -1724,6 +1726,70 @@
+                 InputError_ = true;
+             }
+         }
++    }
++
++    // Bound long generated paths before pointer validation and SSA demotion.
++    // Reverse postorder accounts for forward edges across branch joins. A
++    // separate condition budget bounds combinatorial branch exploration;
++    // select instructions may become machine branches, and the stock
++    // verifier may split scalar states at constant AND/OR operations.
++    // The existing loop pass handles backedges separately. Internal boundaries
++    // use ordinary suspension liveness/frame checks and never publish I/O.
++    void InsertLargePathYields() {
++        SmallVector<Instruction*> points;
++        Function* yield = Module_.getFunction(bpf::sym::Yield);
++        Function* setjmp = Module_.getFunction(bpf::sym::Setjmp);
++        Function* longjmp = Module_.getFunction(bpf::sym::Longjmp);
++        for (auto&& [function, info] : Managed_) {
++            if (function->getInstructionCount() < 1024)
++                continue;
++            DenseMap<BasicBlock*, std::pair<unsigned, unsigned>> tails;
++            ReversePostOrderTraversal<Function*> order(function);
++            for (BasicBlock* block : order) {
++                unsigned span = 0, branches = 0;
++                for (BasicBlock* predecessor : predecessors(block)) {
++                    if (auto found = tails.find(predecessor); found != tails.end()) {
++                        span = std::max(span, found->second.first);
++                        branches = std::max(branches, found->second.second);
++                    }
++                }
++                for (Instruction& instruction : *block) {
++                    if (isa<PHINode, AllocaInst, DbgInfoIntrinsic>(instruction) ||
++                        instruction.isEHPad() ||
++                        (instruction.isTerminator() && instruction.getNumSuccessors() <= 1))
++                        continue;
++                    if (auto* call = dyn_cast<CallBase>(&instruction)) {
++                        Function* callee = ResolveDirectCallee(*call);
++                        if (IsManagedCall(call) ||
++                            (callee && (callee == yield || callee == setjmp || callee == longjmp))) {
++                            span = branches = 0;
++                            continue;
++                        }
++                    }
++                    if (span == 256 || branches == 4) {
++                        points.push_back(&instruction);
++                        span = branches = 0;
++                    }
++                    ++span;
++                    bool bitmask = (instruction.getOpcode() == Instruction::And ||
++                                    instruction.getOpcode() == Instruction::Or) &&
++                                   (isa<ConstantInt>(instruction.getOperand(0)) ||
++                                    isa<ConstantInt>(instruction.getOperand(1)));
++                    branches += bitmask || isa<SelectInst>(instruction) || instruction.isTerminator();
++                }
++                tails[block] = {span, branches};
++            }
++        }
++        if (points.empty())
++            return;
++        auto marker = Module_.getOrInsertFunction(bpf::sym::Yield, Type::getVoidTy(Ctx_));
++        for (Instruction* point : points) {
++            IRBuilder<> builder(point);
++            auto* call = builder.CreateCall(marker);
++            call->setDebugLoc(point->getDebugLoc());
++            call->setMetadata("bpf.capsule.internal.yield", MDNode::get(Ctx_, {}));
++        }
++        bpf::stats() << "stackify: added " << points.size() << " large-path continuation boundaries\n";
+     }
+ 
+     void ValidateYieldCalls() {
+@@ -4519,8 +4585,10 @@
+ 
+         IRBuilder<> b(branch);
+         StoreProvisionalRegionId(b, resumeRegionId, ResumeRegionIdPtr(b))->setDebugLoc(debugLoc);
+-        b.CreateStore(ConstantInt::get(I64_, CAPSULE_YIELD), OutcomePtr(b))->setDebugLoc(debugLoc);
+-        b.CreateRet(ConstantInt::get(I32_, ActionStop))->setDebugLoc(debugLoc);
++        const bool internal = call->getMetadata("bpf.capsule.internal.yield") != nullptr;
++        if (!internal)
++            b.CreateStore(ConstantInt::get(I64_, CAPSULE_YIELD), OutcomePtr(b))->setDebugLoc(debugLoc);
++        b.CreateRet(ConstantInt::get(I32_, internal ? ActionContinue : ActionStop))->setDebugLoc(debugLoc);
+         branch->eraseFromParent();
+         call->eraseFromParent();
+         return resume;

@@ -1,0 +1,509 @@
+{
+  "commands": {
+    "pcre": {
+      "libs": [
+        "-lpcre2-8"
+      ]
+    },
+    "netids": {
+      "libs": [
+        "-lpcre2-8"
+      ],
+      "requires": [
+        "pcap"
+      ]
+    },
+    "zstd": {
+      "libs": [
+        "-lzstd"
+      ]
+    },
+    "zstdcat": {
+      "libs": [
+        "-lzstd"
+      ],
+      "requires": [
+        "zstd"
+      ]
+    },
+    "zlib": {
+      "libs": [
+        "-lz",
+        "-llzma",
+        "-lzstd",
+        "-lbz2"
+      ]
+    },
+    "zcat": {
+      "libs": [
+        "-lz"
+      ]
+    },
+    "more": {
+      "helpers": [
+        "_bl_key"
+      ]
+    },
+    "less": {
+      "helpers": [
+        "_bl_key"
+      ]
+    },
+    "top": {
+      "helpers": [
+        "_bl_screen"
+      ]
+    },
+    "slabtop": {
+      "helpers": [
+        "_bl_screen",
+        "_bl_proc"
+      ]
+    },
+    "ncdu": {
+      "helpers": [
+        "_bl_screen"
+      ]
+    },
+    "tui": {
+      "helpers": [
+        "_bl_screen"
+      ]
+    },
+    "vmstat": {
+      "helpers": [
+        "_bl_proc"
+      ]
+    },
+    "toml": {
+      "helpers": [
+        "_tomlc17"
+      ]
+    },
+    "sqlite": {
+      "helpers": [
+        "_sqlite"
+      ],
+      "libs": [
+        "-ldl",
+        "-lpthread"
+      ]
+    },
+    "vi": {
+      "helpers": [
+        "_bl_key"
+      ]
+    },
+    "vt": {
+      "helpers": [
+        "_libgrapheme"
+      ]
+    },
+    "utf8": {
+      "helpers": [
+        "_libgrapheme"
+      ]
+    },
+    "dialog": {
+      "helpers": [
+        "_bl_key"
+      ]
+    },
+    "whiptail": {
+      "helpers": [
+        "_bl_key"
+      ]
+    },
+    "crypto": {
+      "helpers": [
+        "_mbedtls",
+        "_monocypher",
+        "_bashos_authcrypto"
+      ]
+    },
+    "claude": {
+      "helpers": [
+        "_mbedtls"
+      ]
+    },
+    "ldap": {
+      "helpers": [
+        "_mbedtls"
+      ],
+      "requires": [
+        "crypto"
+      ]
+    },
+    "integrity": {
+      "helpers": [
+        "_mbedtls",
+        "_monocypher"
+      ]
+    },
+    "dns": {
+      "helpers": [
+        "_mbedtls"
+      ]
+    },
+    "login": {
+      "helpers": [
+        "_bashauth"
+      ]
+    },
+    "passwd": {
+      "helpers": [
+        "_bashauth"
+      ]
+    },
+    "auth": {
+      "helpers": [
+        "_bashauth",
+        "_mbedtls"
+      ]
+    },
+    "su": {
+      "helpers": [
+        "_bashauth"
+      ]
+    },
+    "doas": {
+      "helpers": [
+        "_bashauth",
+        "_mbedtls"
+      ],
+      "requires": [
+        "sudo"
+      ]
+    },
+    "cksum": {
+      "helpers": [
+        "_mbedtls"
+      ]
+    },
+    "obj": {
+      "helpers": [
+        "_sha1dc"
+      ],
+      "libs": [
+        "-lz"
+      ]
+    },
+    "index": {
+      "helpers": [
+        "_sha1dc"
+      ]
+    },
+    "pack": {
+      "helpers": [
+        "_sha1dc"
+      ],
+      "libs": [
+        "-lz"
+      ]
+    },
+    "ssh": {
+      "helpers": [
+        "_libssh"
+      ]
+    },
+    "pkg": {
+      "helpers": [
+        "_mbedtls"
+      ],
+      "libs": [
+        "-llzma"
+      ]
+    },
+    "ntp": {
+      "helpers": [
+        "_mbedtls"
+      ],
+      "requires": [
+        "crypto"
+      ]
+    },
+    "mail": {
+      "helpers": [
+        "_mbedtls",
+        "_monocypher"
+      ]
+    },
+    "rsync": {
+      "helpers": [
+        "_md4"
+      ],
+      "libs": [
+        "-lz"
+      ]
+    },
+    "wg": {
+      "helpers": [
+        "_mbedtls"
+      ]
+    },
+    "acme": {
+      "helpers": [
+        "_mbedtls"
+      ]
+    },
+    "uuidgen": {
+      "helpers": [
+        "_mbedtls"
+      ]
+    },
+    "screen": {
+      "helpers": [
+        "_libssh",
+        "_ptybroker"
+      ],
+      "libs": [
+        "-lz"
+      ],
+      "requires": [
+        "ptybroker"
+      ]
+    },
+    "sshd": {
+      "helpers": [
+        "_libssh"
+      ]
+    },
+    "tiv": {
+      "helpers": [
+        "_stb"
+      ]
+    },
+    "kitty": {
+      "helpers": [
+        "_stb"
+      ]
+    },
+    "sixel": {
+      "helpers": [
+        "_stb"
+      ]
+    },
+    "nano": {
+      "helpers": [
+        "_libgrapheme",
+        "_bl_key"
+      ],
+      "requires": [
+        "ts"
+      ]
+    },
+    "ts": {
+      "helpers": [
+        "_tree_sitter",
+        "_ts_bash",
+        "_ts_json",
+        "_ts_toml",
+        "_ts_markdown",
+        "_ts_markdown_inline"
+      ]
+    },
+    "hl": {
+      "helpers": [],
+      "requires": [
+        "ts"
+      ]
+    },
+    "sudo": {
+      "helpers": [
+        "_bashauth",
+        "_mbedtls"
+      ],
+      "requires": [
+        "doas"
+      ]
+    },
+    "killall": {
+      "requires": [
+        "pgrep"
+      ]
+    },
+    "killall5": {
+      "requires": [
+        "pgrep"
+      ]
+    },
+    "pkill": {
+      "requires": [
+        "pgrep"
+      ]
+    },
+    "netstat": {
+      "requires": [
+        "ss"
+      ]
+    },
+    "scp": {
+      "requires": [
+        "sftp"
+      ]
+    },
+    "apropos": {
+      "requires": [
+        "man"
+      ]
+    },
+    "whatis": {
+      "requires": [
+        "man"
+      ]
+    },
+    "termpixel_pong": {
+      "requires": [
+        "termpixel"
+      ]
+    },
+    "undo": {
+      "requires": [
+        "buf"
+      ]
+    },
+    "clip": {
+      "requires": [
+        "buf"
+      ]
+    },
+    "gpu": {
+      "helpers": [
+        "_soft_raster"
+      ],
+      "libs": [
+        "-ldl",
+        "-lm"
+      ]
+    },
+    "ptybroker": {
+      "helpers": [
+        "_ptybroker"
+      ],
+      "libs": [
+        "-ldl"
+      ]
+    }
+  },
+  "helpers": {
+    "_jsmn": {
+      "license": "MIT",
+      "notice": "LICENSE.txt"
+    },
+    "_bl_key": {
+      "license": "MIT",
+      "notice": "LICENSE.txt"
+    },
+    "_bl_screen": {
+      "requires": [
+        "_bl_key"
+      ],
+      "license": "MIT",
+      "notice": "LICENSE.txt"
+    },
+    "_bl_proc": {
+      "license": "MIT",
+      "notice": "LICENSE.txt"
+    },
+    "_tomlc17": {
+      "license": "MIT",
+      "notice": "LICENSE.txt"
+    },
+    "_sqlite": {
+      "license": "Public domain",
+      "notice": "LICENSE.txt"
+    },
+    "_libgrapheme": {
+      "license": "ISC",
+      "notice": "LICENSE.txt"
+    },
+    "_mbedtls": {
+      "license": "Apache-2.0",
+      "notice": "LICENSE.txt",
+      "requires": [],
+      "libs": [
+        "-lpthread"
+      ]
+    },
+    "_libssh": {
+      "license": "LGPL-2.1",
+      "notice": "LICENSE.txt",
+      "requires": [
+        "_mbedtls"
+      ],
+      "libs": [
+        "-lz"
+      ]
+    },
+    "_monocypher": {
+      "license": "BSD-2-Clause OR CC0-1.0",
+      "notice": "LICENSE.txt",
+      "requires": []
+    },
+    "_sha1dc": {
+      "license": "MIT",
+      "notice": "LICENSE.txt",
+      "requires": []
+    },
+    "_md4": {
+      "license": "Public domain",
+      "notice": "LICENSE.txt",
+      "requires": []
+    },
+    "_bashauth": {
+      "license": "MIT",
+      "notice": "LICENSE.txt",
+      "requires": [
+        "_bashos_authcrypto"
+      ]
+    },
+    "_bashos_authcrypto": {
+      "license": "MIT",
+      "notice": "LICENSE.txt",
+      "requires": [
+        "_monocypher"
+      ]
+    },
+    "_stb": {
+      "license": "MIT",
+      "notice": "LICENSE.txt",
+      "requires": []
+    },
+    "_tree_sitter": {
+      "license": "MIT AND Unicode-DFS-2016",
+      "notice": "LICENSE.txt",
+      "requires": [],
+      "additional_notices": [
+        "UNICODE-LICENSE.txt"
+      ]
+    },
+    "_ts_bash": {
+      "license": "MIT",
+      "notice": "LICENSE.txt"
+    },
+    "_ts_json": {
+      "license": "MIT",
+      "notice": "LICENSE.txt"
+    },
+    "_ts_toml": {
+      "license": "MIT",
+      "notice": "LICENSE.txt"
+    },
+    "_ts_markdown": {
+      "license": "MIT",
+      "notice": "LICENSE.txt"
+    },
+    "_ts_markdown_inline": {
+      "license": "MIT",
+      "notice": "LICENSE.txt"
+    },
+    "_soft_raster": {
+      "license": "MIT",
+      "notice": "LICENSE.txt"
+    },
+    "_ptybroker": {
+      "license": "MIT",
+      "notice": "LICENSE.txt"
+    }
+  }
+}

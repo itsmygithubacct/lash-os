@@ -1,0 +1,16 @@
+build/
+out/
+dl/
+result
+result-*
+__pycache__/
+*.pyc
+
+# Machine configuration and agent working files belong outside this checkout.
+/config/local.json
+/.env
+/.env.*
+/.codex/
+/.claude/
+/AGENTS.md
+/CLAUDE.md

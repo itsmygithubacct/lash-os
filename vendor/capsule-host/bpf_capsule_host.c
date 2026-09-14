@@ -1,0 +1,1079 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception OR GPL-2.0-only
+// Host-side Capsule setup, memory access, and lifetime management.
+#include "bpf_capsule_host.h"
+#include "internal/bpf_capsule_abi.h"
+#include "bpf_capsule_alloc.h"
+#include "bpf_capsule_names.h"
+
+#include <bpf/bpf.h>
+#include <bpf/btf.h>
+#include <bpf/libbpf.h>
+#include <errno.h>
+#include <limits.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
+// Allocation-free names for the shared statuses and framework codes,
+// like strerror().
+
+const char* bpf_capsule_status_string(uint32_t status) {
+    switch (status) {
+        case CAPSULE_OK:
+            return "ok";
+        case CAPSULE_PENDING:
+            return "pending";
+        case CAPSULE_YIELD:
+            return "yield";
+        case CAPSULE_EXITED:
+            return "exited";
+        default:
+            return "unknown status";
+    }
+}
+
+// Names the framework's negative codes without allocation, like strerror().
+// Non-negative codes are the guest's own exit statuses and have no framework
+// meaning to name.
+const char* bpf_capsule_error_string(int64_t code) {
+    switch (code) {
+        case CAPSULE_ERROR_POOL_EXHAUSTED:
+            return "fiber pool exhausted";
+        case CAPSULE_ERROR_INVALID_CONTINUATION:
+            return "invalid continuation";
+        case CAPSULE_ERROR_STALE_CONTINUATION:
+            return "stale continuation";
+        case CAPSULE_ERROR_NOT_PENDING:
+            return "continuation is not pending";
+        case CAPSULE_ERROR_POOL_CORRUPT:
+            return "fiber pool corrupt";
+        case CAPSULE_ERROR_RETURN_MISMATCH:
+            return "return value layout mismatch";
+        case CAPSULE_ERROR_STACK_OVERFLOW:
+            return "fiber stack overflow";
+        case CAPSULE_ERROR_MEMORY_FAULT:
+            return "capsule memory fault";
+        case CAPSULE_ERROR_INVALID_DISPATCH:
+            return "invalid managed dispatch";
+        case CAPSULE_ERROR_INTRINSIC_GUARD:
+            return "unlowered compiler intrinsic";
+        case CAPSULE_ERROR_UNREACHABLE:
+            return "unreachable code executed";
+        case CAPSULE_ERROR_TRAP:
+            return "trap executed";
+        case CAPSULE_ERROR_ALLOCATOR_CORRUPT:
+            return "allocator state corrupt";
+        case CAPSULE_ERROR_BAD_PLAN:
+            return "loader applied an incomplete configuration plan";
+        default:
+            return code >= 0 ? "guest exit status" : "unknown framework code";
+    }
+}
+
+struct bpf_capsule_state {
+    void* window;
+    const struct __bpf_capsule_object_config* config;
+    const volatile struct __bpf_capsule_arena_control* arena_control;
+    struct bpf_capsule_extension* extensions;
+    int freplace_required;
+    int freplace_attached;
+    int initialized;
+};
+
+struct bpf_capsule_extension {
+    struct bpf_object* object;
+    struct bpf_link** links;
+    size_t link_count;
+    struct bpf_capsule_extension* next;
+};
+
+static int __bpf_capsule_is_freplace_program(const struct bpf_program* program) {
+    static const char prefix[] = BPF_CAPSULE_FREPLACE_PROGRAM_PREFIX;
+    const char* section = bpf_program__section_name(program);
+    return section && !strncmp(section, prefix, sizeof(prefix) - 1) && section[sizeof(prefix) - 1];
+}
+
+static struct bpf_capsule_state* __bpf_capsule_state(const struct bpf_capsule* capsule) {
+    return capsule ? (struct bpf_capsule_state*)capsule->private_data : NULL;
+}
+
+static inline int __bpf_capsule_layout_header_valid(const struct __bpf_capsule_object_config* config) {
+    return config->stack_bytes_per_fiber && !(config->stack_bytes_per_fiber & (config->stack_bytes_per_fiber - 1u)) &&
+        config->stack_bytes_per_fiber <= BPF_CAPSULE_MEMORY_REGION_SIZE && config->max_fibers && config->max_fibers <= BPF_CAPSULE_MAX_FIBERS_LIMIT &&
+        config->heap_base >= BPF_CAPSULE_ARENA_PAGE_SIZE && config->heap_base <= UINT32_MAX && config->memory_backend <= BPF_CAPSULE_MEMORY_ARENA &&
+        (config->memory_backend == BPF_CAPSULE_MEMORY_ARENA
+                ? config->direct_memory_regions == 0
+                : config->direct_memory_regions > 0 && config->direct_memory_regions <= BPF_CAPSULE_MAX_DIRECT_MEMORY_REGIONS) &&
+        config->abi_magic == BPF_CAPSULE_ABI_MAGIC && config->abi_version == BPF_CAPSULE_ABI_VERSION;
+}
+
+// The planning arithmetic behind bpf_capsule_configure(): validate the
+// requested capacities against the object's .rodata.bpfconfig record, then
+// finish the record in place and return the backend map's entry count —
+// overflow regions on the fixed-map tier, pages on the arena tier. The
+// record carries its own memory tier, so no other input exists, and nothing
+// is written until every check has passed. This is the function a
+// non-libbpf loader ports. Errors: ENOENT the
+// record is not this compiler's; EINVAL inconsistent record; E2BIG
+// fiber_count above the compiled ceiling; EOVERFLOW unrepresentable capacities.
+int __bpf_capsule_plan(struct __bpf_capsule_object_config* config, size_t config_size, struct bpf_capsule_config requested, uint32_t* backend_entries) {
+    if (!config || !backend_entries || !requested.fiber_count) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (config_size < sizeof(*config)) {
+        errno = ENOENT;
+        return -1;
+    }
+    if (requested.fiber_count > config->max_fibers) {
+        errno = E2BIG;
+        return -1;
+    }
+    if (!__bpf_capsule_layout_header_valid(config)) {
+        errno = EINVAL;
+        return -1;
+    }
+    int has_arena = config->memory_backend == BPF_CAPSULE_MEMORY_ARENA;
+    uint32_t direct_region_maps = config->direct_memory_regions;
+
+    const uint64_t address_limit = 1ull << 32;
+    if (requested.heap_bytes > address_limit - config->heap_base) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    uint64_t heap_end = config->heap_base + requested.heap_bytes;
+
+    uint64_t stack_floor = has_arena ? 0 : (uint64_t)direct_region_maps * BPF_CAPSULE_MEMORY_REGION_SIZE;
+    // Mirrors the compiler's ConfigureObjectLayout: the stack bank must
+    // start on a stack_bytes_per_fiber boundary, because sp/fp are full
+    // pointer values and the compiled slice mask is exact only then (the
+    // fixed tier's region alignment already covers it — slices are at most
+    // one region).
+    uint64_t stack_alignment = has_arena
+        ? (config->stack_bytes_per_fiber > BPF_CAPSULE_ARENA_PAGE_SIZE ? config->stack_bytes_per_fiber : BPF_CAPSULE_ARENA_PAGE_SIZE)
+        : BPF_CAPSULE_MEMORY_REGION_SIZE;
+    uint64_t stack_base = heap_end > stack_floor ? heap_end : stack_floor;
+    if (stack_base > address_limit - (stack_alignment - 1u)) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    stack_base = (stack_base + stack_alignment - 1u) & ~(stack_alignment - 1u);
+    uint64_t stack_bytes = (uint64_t)config->stack_bytes_per_fiber * requested.fiber_count;
+    if (stack_bytes >= address_limit - stack_base) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    uint64_t memory_end = stack_base + stack_bytes;
+
+    uint32_t entries;
+    if (!has_arena) {
+        uint32_t regions = (uint32_t)((memory_end + BPF_CAPSULE_MEMORY_REGION_SIZE - 1u) >> BPF_CAPSULE_MEMORY_REGION_SHIFT);
+        entries = regions > direct_region_maps ? regions - direct_region_maps : 0;
+        if (!entries) {
+            errno = EINVAL;
+            return -1;
+        }
+    } else {
+        uint64_t sparse_pages = (memory_end + BPF_CAPSULE_ARENA_PAGE_SIZE - 1u) >> BPF_CAPSULE_ARENA_PAGE_SHIFT;
+        uint64_t pages = (uint64_t)config->arena_image_pages + sparse_pages + BPF_CAPSULE_ARENA_SLICE_SLACK_PAGES(config->stack_bytes_per_fiber);
+        if (!pages || pages > BPF_CAPSULE_MAX_ARENA_PAGES) {
+            errno = EOVERFLOW;
+            return -1;
+        }
+        entries = (uint32_t)pages;
+    }
+
+    config->fiber_count = requested.fiber_count;
+    config->heap_bytes = requested.heap_bytes;
+    config->stack_base = stack_base;
+    config->memory_end = memory_end;
+    *backend_entries = entries;
+    return 0;
+}
+
+// Copy an object-owned configuration record only after proving that the map
+// contains the complete ABI record. Keeping this boundary separate prevents
+// a short or foreign .rodata.bpfconfig map from being dereferenced before the
+// loader can return its documented ENOENT result.
+int __bpf_capsule_copy_plan(
+    const void* config_data, size_t config_size, struct bpf_capsule_config requested, struct __bpf_capsule_object_config* planned, uint32_t* backend_entries) {
+    if (!planned || !backend_entries) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (!config_data || config_size < sizeof(*planned)) {
+        errno = ENOENT;
+        return -1;
+    }
+    memcpy(planned, config_data, sizeof(*planned));
+    return __bpf_capsule_plan(planned, config_size, requested, backend_entries);
+}
+
+static inline struct bpf_map* __bpf_capsule_memory_region(struct bpf_object* object, uint32_t index) {
+    char name[32];
+    snprintf(name, sizeof(name), BPF_CAPSULE_SECTION_DATA_HEAP_PREFIX "%u", index);
+    struct bpf_map* map = bpf_object__find_map_by_name(object, name);
+    if (!map) {
+        snprintf(name, sizeof(name), BPF_CAPSULE_SECTION_BSS_HEAP_PREFIX "%u", index);
+        map = bpf_object__find_map_by_name(object, name);
+    }
+    return map;
+}
+
+// Reserve one PROT_NONE window of address space: 4GiB-aligned, covering the
+// full 32-bit offset domain plus the function-token range above it. The
+// alignment makes base + offset == base | offset, so the guest recovers an
+// offset by truncating to the low word (free in BPF: 32-bit ALU
+// zero-extends); the PROT_NONE span makes any stray dereference of a
+// capsule-shaped pointer fault instead of aliasing unrelated mappings.
+// Address space is free with MAP_NORESERVE; only the leading alignment
+// slack is returned.
+static inline uintptr_t __bpf_capsule_reserve_window(void) {
+    const uintptr_t view_alignment = 1ull << 32;
+    const uintptr_t token_tail = BPF_CAPSULE_FUNCTION_TOKEN_SPAN;
+    size_t reserve = (size_t)(2 * view_alignment + token_tail);
+    uint8_t* raw = (uint8_t*)mmap(NULL, reserve, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (raw == MAP_FAILED) {
+        return 0;
+    }
+    uint8_t* aligned = (uint8_t*)(((uintptr_t)raw + view_alignment - 1u) & ~(view_alignment - 1u));
+    if (aligned != raw) {
+        munmap(raw, (size_t)(aligned - raw));
+    }
+    size_t tail = reserve - (size_t)(aligned - raw) - (size_t)(view_alignment + token_tail);
+    if (tail) {
+        munmap(aligned + view_alignment + token_tail, tail);
+    }
+    return (uintptr_t)aligned;
+}
+
+static inline int __bpf_capsule_restore_reservation(void* address, size_t size) {
+    void* restored = mmap(address, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_NORESERVE, -1, 0);
+    return restored == MAP_FAILED ? -1 : 0;
+}
+
+// MANDATORY, once per object after open and before load — this is the
+// host-side half of the object's memory identity, not an optional tuning
+// knob. It selects the application-level capacities (finish the
+// configuration record with the planning arithmetic, then resize the fiber
+// maps and the tier's backend map to match it), reserves the object's
+// 4GiB-aligned memory window, and bakes the window base into the
+// to-be-frozen config, where the object's first-entry check demands a
+// nonzero value. On the fixed tier the window is where
+// bpf_capsule_initialize() later assembles the shared view, so guest
+// pointers are host pointers; on the arena tier the window becomes the
+// arena's kernel-pinned user_vm_start (libbpf maps the arena into it with
+// MAP_FIXED at load). Calling it again before load replaces the previous
+// selection (the prior window reservation is released). Errors: EBUSY the
+// object is already loaded; E2BIG fiber_count exceeds the compiled
+// BPF_CAPSULE_MAX_FIBERS ceiling; ENOENT the object was not built by this
+// compiler; ENOMEM no memory window is available;
+// EINVAL/EOVERFLOW malformed or unrepresentable capacities. A
+// libbpf map-resize failure is returned through the errno corresponding to
+// libbpf's negative error.
+int linux_bash_capsule_configure_at(struct bpf_capsule* capsule, struct bpf_object* object, struct bpf_capsule_config requested, uintptr_t desired_window) {
+    if (!capsule || !object) {
+        errno = EINVAL;
+        return -1;
+    }
+    struct bpf_capsule_state* state = __bpf_capsule_state(capsule);
+    if ((capsule->object && capsule->object != object) || (!capsule->object && state)) {
+        errno = EBUSY;
+        return -1;
+    }
+    struct bpf_map* config_map = bpf_object__find_map_by_name(object, BPF_CAPSULE_SECTION_CONFIG);
+    size_t config_size = 0;
+    struct __bpf_capsule_object_config* config = config_map ? (struct __bpf_capsule_object_config*)bpf_map__initial_value(config_map, &config_size) : NULL;
+    if (!config) {
+        errno = ENOENT;
+        return -1;
+    }
+    if (bpf_map__fd(config_map) >= 0) {
+        errno = EBUSY;
+        return -1;
+    }
+    int freplace_required = 0;
+    struct bpf_program* program;
+    bpf_object__for_each_program(program, object) {
+        bpf_program__set_flags(program, (bpf_program__flags(program) & ~BPF_F_ANY_ALIGNMENT) | BPF_F_STRICT_ALIGNMENT);
+        if (!__bpf_capsule_is_freplace_program(program)) {
+            continue;
+        }
+        int error = bpf_program__set_autoload(program, false);
+        if (error) {
+            errno = error < 0 ? -error : error;
+            return -1;
+        }
+        freplace_required = 1;
+    }
+    if (config->memory_view_base != (uintptr_t)(state ? state->window : NULL)) {
+        // A reservation can only be replaced by the handle that owns it.
+        errno = EBUSY;
+        return -1;
+    }
+
+    struct __bpf_capsule_object_config planned;
+    uint32_t backend_entries = 0;
+    if (__bpf_capsule_copy_plan(config, config_size, requested, &planned, &backend_entries)) {
+        return -1;
+    }
+
+    struct bpf_map* backend =
+        bpf_object__find_map_by_name(object, planned.memory_backend == BPF_CAPSULE_MEMORY_ARENA ? BPF_CAPSULE_MAP_ARENA : BPF_CAPSULE_MAP_HEAP_ARRAY);
+    if (!backend) {
+        errno = ENOENT;
+        return -1;
+    }
+
+    const char* fiber_map_names[3] = {0};
+    size_t fiber_map_count = 0;
+    if (planned.memory_backend == BPF_CAPSULE_MEMORY_ARENA) {
+        fiber_map_names[fiber_map_count++] = BPF_CAPSULE_MAP_ISSUED_FIBERS;
+        fiber_map_names[fiber_map_count++] = BPF_CAPSULE_MAP_FREE_FIBERS;
+    } else {
+        fiber_map_names[fiber_map_count++] = BPF_CAPSULE_MAP_FIBER_LEASES;
+    }
+    fiber_map_names[fiber_map_count++] = BPF_CAPSULE_MAP_CONTINUATION_CLAIMS;
+    struct bpf_map* fiber_maps[3] = {0};
+    uint32_t old_entries[3] = {0};
+    for (size_t i = 0; i < fiber_map_count; ++i) {
+        fiber_maps[i] = bpf_object__find_map_by_name(object, fiber_map_names[i]);
+        if (!fiber_maps[i]) {
+            errno = ENOENT;
+            return -1;
+        }
+        old_entries[i] = bpf_map__max_entries(fiber_maps[i]);
+    }
+
+    // Reserve first so a failed replacement leaves the old configuration and
+    // every libbpf map property untouched.
+    uintptr_t window = 0;
+    if (desired_window) {
+        if (desired_window & 0xffffffffull) {
+            errno = EINVAL;
+            return -1;
+        }
+        void* reserved = mmap((void*)desired_window, BPF_CAPSULE_MEMORY_WINDOW_SIZE, PROT_NONE,
+            MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0);
+        if (reserved == MAP_FAILED) return -1;
+        if ((uintptr_t)reserved != desired_window) {
+            munmap(reserved, BPF_CAPSULE_MEMORY_WINDOW_SIZE);
+            errno = EADDRNOTAVAIL;
+            return -1;
+        }
+        window = desired_window;
+    } else {
+        window = __bpf_capsule_reserve_window();
+    }
+    if (!window) {
+        errno = ENOMEM;
+        return -1;
+    }
+    int new_state = state == NULL;
+    if (new_state) {
+        state = (struct bpf_capsule_state*)calloc(1, sizeof(*state));
+        if (!state) {
+            (void)munmap((void*)window, (size_t)BPF_CAPSULE_MEMORY_WINDOW_SIZE);
+            return -1;
+        }
+    }
+
+    size_t changed = 0;
+    for (size_t i = 0; i < fiber_map_count; ++i) {
+        int error = bpf_map__set_max_entries(fiber_maps[i], requested.fiber_count);
+        if (error) {
+            int saved_errno = error < 0 ? -error : error;
+            while (changed) {
+                --changed;
+                (void)bpf_map__set_max_entries(fiber_maps[changed], old_entries[changed]);
+            }
+            (void)munmap((void*)(uintptr_t)window, (size_t)BPF_CAPSULE_MEMORY_WINDOW_SIZE);
+            if (new_state) {
+                free(state);
+            }
+            errno = saved_errno;
+            return -1;
+        }
+        changed = i + 1;
+    }
+
+    uint32_t old_backend_entries = bpf_map__max_entries(backend);
+    uint64_t old_map_extra = bpf_map__map_extra(backend);
+    int error = bpf_map__set_max_entries(backend, backend_entries);
+    if (error) {
+        int saved_errno = error < 0 ? -error : error;
+        while (changed) {
+            --changed;
+            (void)bpf_map__set_max_entries(fiber_maps[changed], old_entries[changed]);
+        }
+        (void)munmap((void*)(uintptr_t)window, (size_t)BPF_CAPSULE_MEMORY_WINDOW_SIZE);
+        if (new_state) {
+            free(state);
+        }
+        errno = saved_errno;
+        return -1;
+    }
+
+    if (planned.memory_backend == BPF_CAPSULE_MEMORY_ARENA) {
+        // The arena claims the window at load: libbpf passes map_extra as
+        // the kernel-pinned user_vm_start and maps the arena there with
+        // MAP_FIXED, replacing exactly the pages it owns; the rest of the
+        // window stays PROT_NONE so wild capsule-shaped pointers fault.
+        error = (int)bpf_map__set_map_extra(backend, window);
+        if (error) {
+            int saved_errno = error < 0 ? -error : error;
+            (void)bpf_map__set_map_extra(backend, old_map_extra);
+            (void)bpf_map__set_max_entries(backend, old_backend_entries);
+            while (changed) {
+                --changed;
+                (void)bpf_map__set_max_entries(fiber_maps[changed], old_entries[changed]);
+            }
+            (void)munmap((void*)(uintptr_t)window, (size_t)BPF_CAPSULE_MEMORY_WINDOW_SIZE);
+            if (new_state) {
+                free(state);
+            }
+            errno = saved_errno;
+            return -1;
+        }
+    }
+    void* old_window = state->window;
+    planned.memory_view_base = window;
+    *config = planned;
+    capsule->object = object;
+    capsule->private_data = state;
+    state->window = (void*)window;
+    state->freplace_required = freplace_required;
+    state->freplace_attached = 0;
+    if (old_window) {
+        (void)munmap(old_window, (size_t)BPF_CAPSULE_MEMORY_WINDOW_SIZE);
+    }
+    return 0;
+}
+
+static void __bpf_capsule_destroy_extension(struct bpf_capsule_extension* extension) {
+    if (!extension) {
+        return;
+    }
+    while (extension->link_count) {
+        bpf_link__destroy(extension->links[--extension->link_count]);
+    }
+    free(extension->links);
+    bpf_object__close(extension->object);
+    free(extension);
+}
+
+struct __bpf_capsule_target_functions {
+    struct btf* btf;
+    void* records;
+    uint32_t count;
+    uint32_t record_size;
+};
+
+static void __bpf_capsule_destroy_target_functions(struct __bpf_capsule_target_functions* functions) {
+    btf__free(functions->btf);
+    free(functions->records);
+}
+
+static int __bpf_capsule_read_target_functions(int fd, struct __bpf_capsule_target_functions* functions) {
+    struct bpf_prog_info info = {0};
+    uint32_t info_size = sizeof(info);
+    if (bpf_prog_get_info_by_fd(fd, &info, &info_size)) {
+        return -1;
+    }
+    if (!info.btf_id || !info.nr_func_info || info.func_info_rec_size < sizeof(struct bpf_func_info)) {
+        errno = ENODATA;
+        return -1;
+    }
+    if (info.nr_func_info > SIZE_MAX / info.func_info_rec_size) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    uint32_t btf_id = info.btf_id;
+    uint32_t count = info.nr_func_info;
+    uint32_t record_size = info.func_info_rec_size;
+    functions->records = calloc(count, record_size);
+    if (!functions->records) {
+        return -1;
+    }
+    functions->count = count;
+    functions->record_size = record_size;
+    memset(&info, 0, sizeof(info));
+    info.nr_func_info = count;
+    info.func_info_rec_size = record_size;
+    info.func_info = (uintptr_t)functions->records;
+    info_size = sizeof(info);
+    if (bpf_prog_get_info_by_fd(fd, &info, &info_size)) {
+        return -1;
+    }
+    functions->count = info.nr_func_info;
+    functions->btf = btf__load_from_kernel_by_id(btf_id);
+    return functions->btf ? 0 : -1;
+}
+
+static int __bpf_capsule_target_has_function(const struct __bpf_capsule_target_functions* functions, const char* name) {
+    for (uint32_t index = 0; index < functions->count; ++index) {
+        const struct bpf_func_info* info = (const struct bpf_func_info*)((const uint8_t*)functions->records + (size_t)index * functions->record_size);
+        const struct btf_type* type = btf__type_by_id(functions->btf, info->type_id);
+        const char* candidate = type && btf_kind(type) == BTF_KIND_FUNC ? btf__name_by_offset(functions->btf, type->name_off) : NULL;
+        if (candidate && !strcmp(candidate, name)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int __bpf_capsule_load_freplace(
+    struct bpf_capsule* capsule, const void* object_data, size_t object_size, struct bpf_program* target, struct bpf_capsule_extension** output) {
+    *output = NULL;
+    struct bpf_capsule_extension* extension = calloc(1, sizeof(*extension));
+    if (!extension) {
+        return -1;
+    }
+    // libbpf prefixes internal data maps with the object name. Preserve it so
+    // reopened maps have the same names as the already loaded base maps and
+    // can be matched and reused below.
+    struct bpf_object_open_opts open_options = {
+        .sz = sizeof(open_options),
+        .object_name = bpf_object__name(capsule->object),
+    };
+    extension->object = bpf_object__open_mem(object_data, object_size, &open_options);
+    if (!extension->object) {
+        int saved_errno = errno;
+        free(extension);
+        errno = saved_errno;
+        return -1;
+    }
+    struct __bpf_capsule_target_functions target_functions = {0};
+    if (__bpf_capsule_read_target_functions(bpf_program__fd(target), &target_functions)) {
+        goto error;
+    }
+
+    struct bpf_map* map;
+    bpf_object__for_each_map(map, extension->object) {
+        struct bpf_map* base_map = bpf_object__find_map_by_name(capsule->object, bpf_map__name(map));
+        int fd = base_map ? bpf_map__fd(base_map) : -1;
+        if (fd < 0) {
+            // Machine code can introduce a constant-pool map used only by
+            // freplace programs, so the base load legitimately skipped it.
+            // Immutable program data may be private to each reopened object;
+            // every mutable map carries Capsule state and must be shared.
+            if (bpf_map__map_flags(map) & BPF_F_RDONLY_PROG) {
+                continue;
+            }
+            errno = ENOENT;
+            goto error;
+        }
+        int result = bpf_map__reuse_fd(map, fd);
+        if (result) {
+            errno = result < 0 ? -result : result;
+            goto error;
+        }
+    }
+
+    size_t program_count = 0;
+    struct bpf_program* program;
+    bpf_object__for_each_program(program, extension->object) {
+        bpf_program__set_flags(program, (bpf_program__flags(program) & ~BPF_F_ANY_ALIGNMENT) | BPF_F_STRICT_ALIGNMENT);
+        if (!__bpf_capsule_is_freplace_program(program)) {
+            int disable_error = bpf_program__set_autoload(program, false);
+            if (disable_error) {
+                errno = disable_error < 0 ? -disable_error : disable_error;
+                goto error;
+            }
+            continue;
+        }
+        const char* target_name = bpf_program__section_name(program) + sizeof(BPF_CAPSULE_FREPLACE_SECTION_PREFIX) - 1;
+        if (!__bpf_capsule_target_has_function(&target_functions, target_name)) {
+            int disable_error = bpf_program__set_autoload(program, false);
+            if (disable_error) {
+                errno = disable_error < 0 ? -disable_error : disable_error;
+                goto error;
+            }
+            continue;
+        }
+        int result = bpf_program__set_attach_target(program, bpf_program__fd(target), target_name);
+        if (result) {
+            errno = result < 0 ? -result : result;
+            goto error;
+        }
+        ++program_count;
+    }
+    if (!program_count) {
+        __bpf_capsule_destroy_target_functions(&target_functions);
+        __bpf_capsule_destroy_extension(extension);
+        return 0;
+    }
+    __bpf_capsule_destroy_target_functions(&target_functions);
+    memset(&target_functions, 0, sizeof(target_functions));
+    extension->links = calloc(program_count, sizeof(*extension->links));
+    if (!extension->links) {
+        goto error;
+    }
+    int result = bpf_object__load(extension->object);
+    if (result) {
+        errno = result < 0 ? -result : result;
+        goto error;
+    }
+    bpf_object__for_each_program(program, extension->object) {
+        if (!bpf_program__autoload(program)) {
+            continue;
+        }
+        // The target was fixed before load, when its BTF id is part of the
+        // extension program's verifier contract.
+        struct bpf_link* link = bpf_program__attach_freplace(program, 0, NULL);
+        long link_error = libbpf_get_error(link);
+        if (link_error) {
+            errno = (int)-link_error;
+            goto error;
+        }
+        extension->links[extension->link_count++] = link;
+    }
+    *output = extension;
+    return 0;
+
+error:
+    {
+        int saved_errno = errno;
+        __bpf_capsule_destroy_target_functions(&target_functions);
+        __bpf_capsule_destroy_extension(extension);
+        errno = saved_errno;
+        return -1;
+    }
+}
+
+// Attach every compiler-produced freplace step from the original object to
+// every loaded entry program which contains the corresponding BTF targets.
+// The same ELF bytes are reopened because freplace needs the target program's
+// fd at load time. All reopened objects and links join the Capsule lifetime.
+int bpf_capsule_attach_freplace(struct bpf_capsule* capsule, const void* object_data, size_t object_size) {
+    struct bpf_capsule_state* state = __bpf_capsule_state(capsule);
+    if (!capsule || !capsule->object || !state || !object_data || !object_size) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (state->config) {
+        errno = EBUSY;
+        return -1;
+    }
+    if (!state->freplace_required) {
+        errno = ENOENT;
+        return -1;
+    }
+    if (state->freplace_attached) {
+        errno = EALREADY;
+        return -1;
+    }
+
+    struct bpf_capsule_extension* attached = NULL;
+    size_t attached_targets = 0;
+    struct bpf_program* target;
+    bpf_object__for_each_program(target, capsule->object) {
+        if (__bpf_capsule_is_freplace_program(target) || bpf_program__fd(target) < 0) {
+            continue;
+        }
+        struct bpf_capsule_extension* extension = NULL;
+        if (__bpf_capsule_load_freplace(capsule, object_data, object_size, target, &extension)) {
+            goto error;
+        }
+        if (!extension) {
+            continue;
+        }
+        extension->next = attached;
+        attached = extension;
+        ++attached_targets;
+    }
+    if (!attached_targets) {
+        errno = ENOENT;
+        goto error;
+    }
+    while (attached) {
+        struct bpf_capsule_extension* extension = attached;
+        attached = extension->next;
+        extension->next = state->extensions;
+        state->extensions = extension;
+    }
+    state->freplace_attached = 1;
+    return 0;
+
+error:
+    {
+        int saved_errno = errno;
+        while (attached) {
+            struct bpf_capsule_extension* extension = attached;
+            attached = extension->next;
+            __bpf_capsule_destroy_extension(extension);
+        }
+        errno = saved_errno;
+        return -1;
+    }
+}
+
+// End the host lifetime and release its complete address-space window. Call
+// this after the last entry and memory-view release. Success clears the handle,
+// so cleanup paths may call it after partial setup and may call it repeatedly.
+int bpf_capsule_release(struct bpf_capsule* capsule) {
+    if (!capsule) {
+        errno = EINVAL;
+        return -1;
+    }
+    struct bpf_capsule_state* state = __bpf_capsule_state(capsule);
+    if (!state) {
+        capsule->object = NULL;
+        return 0;
+    }
+    while (state->extensions) {
+        struct bpf_capsule_extension* extension = state->extensions;
+        state->extensions = extension->next;
+        __bpf_capsule_destroy_extension(extension);
+    }
+    if (state->window && munmap(state->window, (size_t)BPF_CAPSULE_MEMORY_WINDOW_SIZE)) {
+        return -1;
+    }
+    free(state);
+    memset(capsule, 0, sizeof(*capsule));
+    return 0;
+}
+
+// MANDATORY, once after load and before the first entry — entries fail
+// closed until initialization has completed; there is no lazy fallback.
+// Arena-backed objects have a generated program (bpf_capsule_init) that
+// brings up the managed memory: it commits the sparse storage for globals,
+// heap, and fiber stacks, publishes the run-time-chosen virtual base, and
+// applies pointer-valued global fixups (libbpf applies no relocations
+// inside an arena section). On the fixed-map tier it applies the compiler's
+// `.rodata.bpffix` pointer-fixup table to the loaded image and publishes the
+// readiness word. The initializer reports
+// allocation failure through its return value, the second error channel of
+// BPF_PROG_TEST_RUN.
+// (Defined after the memory helpers below, which the fixed tier's fixup
+// application uses.)
+int bpf_capsule_initialize(struct bpf_capsule* capsule);
+
+// Bind the loaded object's maps to its existing lifetime. Arena mappings are
+// borrowed from libbpf; the fixed tier maps its regions over the reserved
+// window so guest-published pointers are directly readable by the host.
+static int __bpf_capsule_prepare_memory(struct bpf_capsule* capsule) {
+    struct bpf_capsule_state* state = __bpf_capsule_state(capsule);
+    if (!capsule || !capsule->object || !state || !state->window) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (state->config) {
+        return 0;
+    }
+    struct bpf_object* object = capsule->object;
+    state->arena_control = NULL;
+    int region_fds[BPF_CAPSULE_MAX_DIRECT_MEMORY_REGIONS];
+    uint32_t region_count = 0;
+    int overflow_fd = -1;
+    size_t overflow_value_size = 0;
+    uint32_t overflow_entries = 0;
+
+    struct bpf_map* config_map = bpf_object__find_map_by_name(object, BPF_CAPSULE_SECTION_CONFIG);
+    size_t config_size = 0;
+    const struct __bpf_capsule_object_config* config =
+        config_map ? (const struct __bpf_capsule_object_config*)bpf_map__initial_value(config_map, &config_size) : NULL;
+    if (!config || config_size < sizeof(*config)) {
+        errno = ENOENT;
+        return -1;
+    }
+    if (config->memory_view_base != (uintptr_t)state->window) {
+        errno = EINVAL;
+        return -1;
+    }
+    uint64_t heap_end = (uint64_t)config->heap_base + config->heap_bytes;
+    uint64_t stack_bytes = (uint64_t)config->stack_bytes_per_fiber * config->fiber_count;
+    if (!__bpf_capsule_layout_header_valid(config) || !config->fiber_count || config->fiber_count > config->max_fibers || heap_end > config->stack_base ||
+        config->stack_base > UINT32_MAX || stack_bytes > (1ull << 32) - config->stack_base || config->memory_end != config->stack_base + stack_bytes) {
+        errno = EINVAL;
+        return -1;
+    }
+    struct bpf_map* arena = bpf_object__find_map_by_name(object, BPF_CAPSULE_MAP_ARENA);
+    if (config->memory_backend == BPF_CAPSULE_MEMORY_ARENA) {
+        if (!arena) {
+            errno = ENOENT;
+            return -1;
+        }
+        struct bpf_map* control_map = bpf_object__find_map_by_name(object, BPF_CAPSULE_SECTION_ARENA_CONTROL);
+        size_t control_size = 0;
+        const struct __bpf_capsule_arena_control* control =
+            control_map ? (const struct __bpf_capsule_arena_control*)bpf_map__initial_value(control_map, &control_size) : NULL;
+        if (!control || control_size < sizeof(*control)) {
+            errno = EFAULT;
+            return -1;
+        }
+        size_t initialized_size = 0;
+        uint8_t* base = (uint8_t*)bpf_map__initial_value(arena, &initialized_size);
+        long page_size_result = sysconf(_SC_PAGESIZE);
+        size_t page_size = page_size_result > 0 ? (size_t)page_size_result : 0;
+        if (!base || !page_size || bpf_map__max_entries(arena) > SIZE_MAX / page_size) {
+            errno = EFAULT;
+            return -1;
+        }
+        state->arena_control = (const volatile struct __bpf_capsule_arena_control*)control;
+        state->config = config;
+        return 0;
+    }
+    if (config->memory_backend != BPF_CAPSULE_MEMORY_FIXED || arena) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    while (region_count < config->direct_memory_regions) {
+        struct bpf_map* map = __bpf_capsule_memory_region(object, region_count);
+        if (!map) {
+            errno = ENOENT;
+            return -1;
+        }
+        if (bpf_map__value_size(map) != BPF_CAPSULE_MEMORY_REGION_SIZE) {
+            errno = EFAULT;
+            return -1;
+        }
+        region_fds[region_count] = bpf_map__fd(map);
+        ++region_count;
+    }
+    struct bpf_map* overflow = bpf_object__find_map_by_name(object, BPF_CAPSULE_MAP_HEAP_ARRAY);
+    if (overflow) {
+        overflow_fd = bpf_map__fd(overflow);
+        overflow_value_size = bpf_map__value_size(overflow);
+        overflow_entries = bpf_map__max_entries(overflow);
+    }
+
+    // Map each region once into the shared address window. Without shadow
+    // copies, host and guest read and write the very same bytes.
+    uintptr_t view_base = config->memory_view_base;
+    if (!view_base) {
+        // A zero base means bpf_capsule_configure() never ran; the object
+        // itself refuses to execute in that state, so a memory view over it
+        // is meaningless.
+        errno = EINVAL;
+        return -1;
+    }
+    {
+        long view_page_result = sysconf(_SC_PAGESIZE);
+        size_t view_page = view_page_result > 0 ? (size_t)view_page_result : 0;
+        const size_t overflow_stride = BPF_CAPSULE_MEMORY_REGION_SIZE;
+        uint64_t total_regions = (uint64_t)region_count + overflow_entries;
+        int usable = overflow_value_size == overflow_stride && view_page && !(view_base & (view_page - 1u)) && !(overflow_stride & (view_page - 1u)) &&
+            total_regions <= (1ull << 32) / BPF_CAPSULE_MEMORY_REGION_SIZE && total_regions * BPF_CAPSULE_MEMORY_REGION_SIZE >= config->memory_end &&
+            view_base <= UINTPTR_MAX - total_regions * BPF_CAPSULE_MEMORY_REGION_SIZE;
+        if (!usable) {
+            errno = EFAULT;
+        }
+        uint8_t* view_at = (uint8_t*)view_base;
+        uint64_t mapped_regions = 0;
+        for (uint64_t region = 0; usable && region < total_regions; ++region) {
+            int fd = region < region_count ? region_fds[region] : overflow_fd;
+            off_t file_offset = region < region_count ? 0 : (off_t)((region - region_count) * overflow_stride);
+            if (fd < 0) {
+                errno = EFAULT;
+                usable = 0;
+            } else if (mmap(view_at + region * BPF_CAPSULE_MEMORY_REGION_SIZE, BPF_CAPSULE_MEMORY_REGION_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED,
+                           fd, file_offset) == MAP_FAILED) {
+                usable = 0;
+            } else {
+                ++mapped_regions;
+            }
+        }
+        if (usable && mprotect(view_at, view_page, PROT_NONE)) {
+            usable = 0;
+        }
+        if (!usable) {
+            int saved_errno = errno;
+            if (mapped_regions && __bpf_capsule_restore_reservation(view_at, (size_t)mapped_regions * BPF_CAPSULE_MEMORY_REGION_SIZE)) {
+                return -1;
+            }
+            errno = saved_errno;
+            return -1;
+        }
+    }
+    state->config = config;
+    return 0;
+}
+
+int bpf_capsule_initialize(struct bpf_capsule* capsule) {
+    struct bpf_capsule_state* state = __bpf_capsule_state(capsule);
+    if (!capsule || !capsule->object || !state || !state->window) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (state->freplace_required && !state->freplace_attached) {
+        errno = ENOLINK;
+        return -1;
+    }
+    struct bpf_object* object = capsule->object;
+    struct bpf_program* initializer = bpf_object__find_program_by_name(object, BPF_CAPSULE_PROGRAM_INIT);
+    if (initializer) {
+        int fd = bpf_program__fd(initializer);
+        if (fd < 0) {
+            errno = -fd;
+            return -1;
+        }
+        struct bpf_test_run_opts options;
+        memset(&options, 0, sizeof(options));
+        options.sz = sizeof(options);
+        int error = bpf_prog_test_run_opts(fd, &options);
+        if (error) {
+            errno = error < 0 ? -error : error;
+            return -1;
+        }
+        if ((int)options.retval < 0) {
+            errno = -(int)options.retval;
+            return -1;
+        }
+    }
+    if (__bpf_capsule_prepare_memory(capsule)) {
+        return -1;
+    }
+    // Fixed tier: pointer-valued initializers are baked as bare window
+    // displacements because the window base is load-time; the compiler
+    // lists every such slot in .rodata.bpffix. Add the window to each slot
+    // here, then publish readiness — capsule_call fails closed until this
+    // word is set, which is what makes this verb mandatory on this tier
+    // too. Idempotent: a second call observes the word and changes nothing.
+    struct bpf_map* ready_map = bpf_object__find_map_by_name(object, BPF_CAPSULE_SECTION_READY);
+    if (!ready_map) {
+        state->initialized = 1;
+        return 0; // arena tier: readiness is the arena control word
+    }
+    size_t ready_size = 0;
+    uint32_t* ready = (uint32_t*)bpf_map__initial_value(ready_map, &ready_size);
+    if (!ready || ready_size < sizeof(*ready)) {
+        errno = EFAULT;
+        return -1;
+    }
+    if (*ready) {
+        state->initialized = 1;
+        return 0;
+    }
+    uintptr_t window = state->config->memory_view_base;
+    struct bpf_map* fixup_map = bpf_object__find_map_by_name(object, BPF_CAPSULE_SECTION_FIXUPS);
+    if (fixup_map) {
+        size_t table_bytes = 0;
+        const uint64_t* slots = (const uint64_t*)bpf_map__initial_value(fixup_map, &table_bytes);
+        if (!slots) {
+            errno = EFAULT;
+            return -1;
+        }
+        for (size_t i = 0; i < table_bytes / sizeof(uint64_t); ++i) {
+            if (slots[i] < BPF_CAPSULE_ARENA_PAGE_SIZE || slots[i] > state->config->heap_base - sizeof(uintptr_t)) {
+                errno = EFAULT;
+                return -1;
+            }
+            uintptr_t value = 0;
+            memcpy(&value, (const void*)(window + slots[i]), sizeof(value));
+            value += window;
+            memcpy((void*)(window + slots[i]), &value, sizeof(value));
+        }
+    }
+    *ready = 1;
+    state->initialized = 1;
+    return 0;
+}
+
+// Kept separate from object discovery so the syscall/error protocol can be
+// tested without loading a BPF program. Not part of the public host API.
+int __bpf_capsule_alloc_run(int fd, struct __bpf_capsule_alloc_request* request) {
+    struct bpf_test_run_opts options = {
+        .sz = sizeof(options),
+        // For BPF_PROG_TYPE_SYSCALL, ctx_in is an in/out buffer; ctx_out is
+        // not supported. This storage belongs to this host call alone.
+        .ctx_in = request,
+        .ctx_size_in = sizeof(*request),
+    };
+    for (;;) {
+        int error = bpf_prog_test_run_opts(fd, &options);
+        if (error || (int)options.retval < 0) {
+            int saved_errno = error ? errno : -(int)options.retval;
+            // If a resume failed before consuming the known continuation,
+            // return its fiber. Preserve the original error even if reset
+            // also fails (for example, because the program fd was closed).
+            if (request->result.continuation != BPF_CAPSULE_NO_CONTINUATION) {
+                request->operation = BPF_CAPSULE_ALLOC_RESET;
+                (void)bpf_prog_test_run_opts(fd, &options);
+            }
+            errno = saved_errno;
+            return -1;
+        }
+        switch (request->result.status) {
+            case CAPSULE_OK:
+                if (request->output.error) {
+                    errno = request->output.error;
+                    return -1;
+                }
+                return 0;
+            case CAPSULE_PENDING:
+            case CAPSULE_YIELD:
+                request->operation = BPF_CAPSULE_ALLOC_CONTINUE;
+                break;
+            case CAPSULE_EXITED:
+                errno = request->result.code == CAPSULE_ERROR_POOL_EXHAUSTED ? EAGAIN : ECANCELED;
+                return -1;
+            default:
+                errno = EPROTO;
+                return -1;
+        }
+    }
+}
+
+static int __bpf_capsule_allocate(const struct bpf_capsule* capsule, struct __bpf_capsule_alloc_request* request) {
+    const struct bpf_capsule_state* state = __bpf_capsule_state(capsule);
+    if (!state || !state->initialized) {
+        errno = EINVAL;
+        return -1;
+    }
+    struct bpf_program* program = bpf_object__find_program_by_name(capsule->object, BPF_CAPSULE_PROGRAM_ALLOC);
+    if (!program || bpf_program__fd(program) < 0) {
+        errno = ENOENT;
+        return -1;
+    }
+    return __bpf_capsule_alloc_run(bpf_program__fd(program), request);
+}
+
+void* bpf_capsule_malloc(const struct bpf_capsule* capsule, size_t size) {
+    struct __bpf_capsule_alloc_request request = {.operation = BPF_CAPSULE_ALLOC_MALLOC, .size = size, .result = {.continuation = BPF_CAPSULE_NO_CONTINUATION}};
+    return __bpf_capsule_allocate(capsule, &request) ? NULL : request.output.pointer;
+}
+
+int bpf_capsule_free(const struct bpf_capsule* capsule, void* pointer) {
+    if (!pointer) {
+        return 0;
+    }
+    struct __bpf_capsule_alloc_request request = {
+        .operation = BPF_CAPSULE_ALLOC_FREE, .pointer = pointer, .result = {.continuation = BPF_CAPSULE_NO_CONTINUATION}};
+    return __bpf_capsule_allocate(capsule, &request);
+}
+
+// Observability over the view: the managed image's bounds in the external
+// virtual address domain. Capsule pointers are full virtual addresses on both
+// tiers; on the arena tier the start is meaningful once
+// bpf_capsule_initialize() has run (virtual_base reads as zero before
+// then).
+uint64_t bpf_capsule_memory_size(const struct bpf_capsule* capsule) {
+    const struct bpf_capsule_state* state = __bpf_capsule_state(capsule);
+    return state && state->config ? state->config->memory_end : 0;
+}
+
+void* bpf_capsule_memory_start(const struct bpf_capsule* capsule) {
+    const struct bpf_capsule_state* state = __bpf_capsule_state(capsule);
+    if (!state || !state->config) {
+        return 0;
+    }
+    // On the arena tier this is a full user virtual address: adding an
+    // object offset yields exactly the pointer value the capsule itself
+    // would hold, and (once the object is initialized) a pointer the host
+    // can dereference through its own arena mapping.
+    if (state->arena_control) {
+        return (void*)state->arena_control->virtual_base;
+    }
+    // Fixed tier: capsule pointers are base + offset and this is that base
+    // (the window bpf_capsule_configure() reserved and baked).
+    return (void*)state->config->memory_view_base;
+}
+
+int bpf_capsule_configure(struct bpf_capsule* capsule, struct bpf_object* object, struct bpf_capsule_config requested) {
+    return linux_bash_capsule_configure_at(capsule, object, requested, 0);
+}

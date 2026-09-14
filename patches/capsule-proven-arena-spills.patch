@@ -1,0 +1,74 @@
+--- a/src/pass/unified_spills_mir.cpp
++++ b/src/pass/unified_spills_mir.cpp
+@@ -424,6 +424,7 @@
+     unsigned opCast = 0, opMOVri32 = 0, opJULTri = 0, opJMP = 0, opRET = 0;
+     std::set<MachineInstr*> arenaRepairStackAccesses;
+     std::set<int32_t> arenaPointerStackWords;
++    std::set<int32_t> arenaNonPointerStackWords;
+ 
+     const OpInfo& info(const MachineInstr& MI) {
+         unsigned op = MI.getOpcode();
+@@ -490,6 +491,7 @@
+ 
+     arenaRepairStackAccesses.clear();
+     arenaPointerStackWords.clear();
++    arenaNonPointerStackWords.clear();
+     int32_t frameLow = 0;
+     for (MachineBasicBlock& block : MF) {
+         for (MachineInstr& MI : block) {
+@@ -1126,9 +1128,10 @@
+     // The simpler spill-value lattice below deliberately optimizes for scalar
+     // range propagation and can lose BPF's pointer provenance at joins. This
+     // may/must analysis is the authoritative one for arena pointers. Record
+-    // every native stack word which can carry one and pin that word: untyped
+-    // scalar storage cannot preserve PTR_TO_ARENA, and casting a mixed
+-    // scalar/pointer word on reload would be wrong on one of the paths.
++    // every word which may carry one, and whether any full-width access is
++    // not definitely an arena pointer. Mixed words must stay native. Words
++    // proven to contain only arena pointers may use the explicit cast/store/
++    // cast-back path, if the scalar lattice independently agrees.
+     analyzeFacts();
+     for (MachineBasicBlock& block : MF) {
+         if (!reachable.count(&block)) {
+@@ -1137,19 +1140,24 @@
+         ArenaFacts state = incoming[&block];
+         for (MachineInstr& instruction : block) {
+             const OpInfo& oi = info(instruction);
+-            if ((oi.kind == OpInfo::Store || oi.kind == OpInfo::Load) && oi.width == 8 && instruction.getNumOperands() >= 3 &&
++            if ((oi.kind == OpInfo::Store || oi.kind == OpInfo::Load || oi.kind == OpInfo::StoreImm) && oi.width == 8 && instruction.getNumOperands() >= 3 &&
+                 instruction.getOperand(1).isReg() && instruction.getOperand(2).isImm() && ridx(instruction.getOperand(1)) == 10) {
+                 int64_t offset = instruction.getOperand(2).getImm();
+                 if (offset >= INT32_MIN && offset <= INT32_MAX) {
+-                    bool carriesArena = false;
++                    bool carriesArena = false, alwaysArena = false;
+                     if (oi.kind == OpInfo::Store && instruction.getOperand(0).isReg()) {
+                         int source = ridx(instruction.getOperand(0));
+                         carriesArena = source >= 0 && state.May.test(source);
+-                    } else {
++                        alwaysArena = source >= 0 && state.Must.test(source);
++                    } else if (oi.kind == OpInfo::Load) {
+                         carriesArena = state.StackMay.count((int32_t)offset);
++                        alwaysArena = state.StackMust.count((int32_t)offset);
+                     }
+                     if (carriesArena) {
+                         arenaPointerStackWords.insert((int32_t)offset & ~7);
++                    }
++                    if (!alwaysArena) {
++                        arenaNonPointerStackWords.insert((int32_t)offset & ~7);
+                     }
+                 }
+             }
+@@ -1947,7 +1955,12 @@
+         }
+     }
+     for (int32_t word : arenaPointerStackWords) {
+-        wordCls[word] = SlotClass::Stack;
++        // Keep uncertain/mixed pointers native. Relocation is allowed only
++        // when both analyses prove every access is an arena pointer, with
++        // no overlapping access, helper address, or repair pin above.
++        if (wordCls[word] != SlotClass::UnifiedArena || arenaNonPointerStackWords.count(word)) {
++            wordCls[word] = SlotClass::Stack;
++        }
+     }
+ 
+     // The resolved backing pointer does not exist until the anchor. Any word

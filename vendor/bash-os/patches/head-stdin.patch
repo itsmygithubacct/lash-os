@@ -1,0 +1,98 @@
+--- head.c.orig
++++ head.c
+@@ -86,8 +86,51 @@
+ 	  if (ch == '\n')
+ 	    break;
+ 	}
++      if (ch == EOF)
++        break;
++    }
++  if (ferror (fp))
++    {
++      builtin_error ("read error: %s", strerror (errno));
++      return EXECUTION_FAILURE;
+     }
+   return (EXECUTION_SUCCESS);
++}
++
++/* stdin's FILE belongs to the persistent shell. A private stream prevents
++   buffered bytes and EOF from surviving a redirection. Seek back unread bytes
++   on regular files; pipes must not read beyond the requested last line. */
++static int
++stdin_head (int nline)
++{
++  int fd, seekable, rval;
++  FILE *fp;
++
++  fd = dup (STDIN_FILENO);
++  if (fd < 0)
++    {
++      builtin_error ("stdin: %s", strerror (errno));
++      return EXECUTION_FAILURE;
++    }
++  fp = fdopen (fd, "r");
++  if (fp == NULL)
++    {
++      builtin_error ("stdin: %s", strerror (errno));
++      close (fd);
++      return EXECUTION_FAILURE;
++    }
++  seekable = lseek (fd, 0, SEEK_CUR) != (off_t)-1;
++  if (seekable == 0)
++    setvbuf (fp, NULL, _IONBF, 0);
++  rval = file_head (fp, nline);
++  if (seekable && fseeko (fp, 0, SEEK_CUR) != 0)
++    {
++      builtin_error ("stdin: %s", strerror (errno));
++      rval = EXECUTION_FAILURE;
++    }
++  if (fclose (fp) != 0)
++    rval = EXECUTION_FAILURE;
++  return rval;
+ }
+ 
+ int
+@@ -123,15 +166,17 @@
+     }
+   list = loptend;
+ 
++  rval = EXECUTION_SUCCESS;
+   if (list == 0)
+-    return (file_head (stdin, nline));
+-
+-  for (rval = EXECUTION_SUCCESS, opt = 1, l = list; l; l = l->next)
++    rval = stdin_head (nline);
++
++  for (opt = 1, l = list; l; l = l->next)
+     {
+       fp = fopen (l->word->word, "r");
+       if (fp == NULL)
+ 	{
+ 	  builtin_error ("%s: %s", l->word->word, strerror (errno));
++          rval = EXECUTION_FAILURE;
+ 	  continue;
+ 	}
+       if (list->next)	/* more than one file */
+@@ -140,10 +185,18 @@
+ 	  opt = 0;
+ 	}
+       QUIT;
+-      rval = file_head (fp, nline);
+-      fclose (fp);
+-    }
+-   
++      if (file_head (fp, nline) != EXECUTION_SUCCESS)
++        rval = EXECUTION_FAILURE;
++      if (fclose (fp) != 0)
++        rval = EXECUTION_FAILURE;
++    }
++
++  if (fflush (stdout) == EOF || ferror (stdout))
++    {
++      builtin_error ("write error: %s", strerror (errno));
++      rval = EXECUTION_FAILURE;
++    }
++  clearerr (stdout);
+   return (rval);
+ }
+ 

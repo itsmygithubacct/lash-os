@@ -1,0 +1,316 @@
+# config/bash-loadables.list — loadables compiled into bash-os as static
+# builtins. NAME[|short-doc], one per line; '#' comments, blanks ignored
+# (config/loadables.sh is the one parser). A NAME resolves to loadables/NAME.c
+# in this repo, or to bash's own examples/loadables/NAME.c from the pinned
+# tarball (the stock set). build.sh injects them; num_shell_builtins self-sizes.
+#
+# Curated 2026-09-05 from the lichee-nano-bashos appliance's inject list, with
+# the four board-coupled managers (bashnpu, bashyolox, bashrtsp, detectlog)
+# left in that project. Expanded to 277 entries on 2026-09-07.
+# See docs/PROVENANCE.md for source and helper licence details.
+
+basename|basename
+cat|cat
+chmod|chmod
+cut|cut -b LIST | -c LIST | -f LIST [-d DELIM] [-s] [-z] [--complement] [--output-delimiter=STRING] [-a ARRAY] [FILE...]
+dirname|dirname
+head|head
+id|id
+ln|ln
+logname|logname
+mkdir|mkdir
+mkfifo|mkfifo
+mktemp|mktemp
+pathchk|pathchk
+printenv|printenv
+realpath|realpath
+rm|rm
+rmdir|rmdir
+seq|seq [-w] [-s STRING] [-f FORMAT] [FIRST [INCREMENT]] LAST
+sleep|sleep
+stat|stat
+strftime|strftime
+strptime|strptime
+sync|sync
+tee|tee
+tty|tty
+uname|uname
+unlink|unlink
+whoami|whoami
+fdflags|fdflags
+finfo|finfo
+fltexpr|fltexpr
+getconf|getconf
+setpgid|setpgid
+bashio|bashio
+bashpoll|bashpoll
+bashinotify|bashinotify
+bashclock|bashclock
+bashjson|bashjson
+binhex|binhex
+bashbase64|bashbase64
+bashtermraw|bashtermraw
+bashkmod|bashkmod
+bashmount|bashmount
+bashlogger|bashlogger
+bashsyslogd|bashsyslogd
+ls|ls [OPTION]... [FILE]...
+cp|cp [-r] SRC... DST
+mv|mv SRC... DST
+touch|touch FILE...
+find|find [PATH] [EXPR]
+sed|sed [OPTION] SCRIPT [FILE]
+sort|sort [OPTION] [FILE]
+tail|tail [-n N] [-f] [FILE]
+wc|wc [-clw] [FILE]
+readlink|readlink [-f] FILE
+ps|ps snapshot of processes
+free|free memory summary
+dd|dd if= of= ...
+df|df [FILE]
+du|du [FILE]
+reboot|reboot the system
+halt|halt the system
+poweroff|power off the system
+chown|chown OWNER[:GROUP] FILE...
+rngseed|Credit and refresh the kernel random seed
+rtspcat|RTSP/RTP H.264 client, access units out as framed records
+httpd|HTTP server primitive: listen, accept one request, reply
+chgrp|chgrp GROUP FILE...
+tr|tr
+uniq|uniq
+nl|nl
+od|od
+cmp|cmp
+date|date
+env|env
+xargs|xargs
+truncate|truncate
+hostname|hostname
+rev|rev
+fold|fold
+comm|comm
+paste|paste [-d LIST] FILE...
+pgrep|pgrep PATTERN
+pidof|pidof NAME
+killall|killall NAME
+killall5|killall5 -SIG
+pkill|pkill PATTERN
+grep|grep [-EFivwcnrl] PATTERN [FILE]
+ip|ip addr|link|route ...
+bashdhcp|DHCPv4 client (RFC2131 DISCOVER/OFFER/REQUEST/ACK + parse-message)
+nice|nice [-n N] CMD
+nohup|nohup CMD
+link|link TARGET NAME
+blkid|blkid [DEV]
+lsblk|lsblk
+diff|diff A B
+ss|ss [-tuln]
+netstat|netstat -tuln (via ss backend)
+ping|ping [-c N] HOST
+
+# archives
+pax|POSIX pax ustar archives: list, -w create, -r extract, -rw copy
+
+# compression (libzstd loaded at run time; no link-time dependency)
+zstd|Compress or decompress files with zstd
+zstdcat|Decompress zstd files to standard output
+
+# util-linux family (imported 2026-09-06 from the upstream collection)
+flock|Manage advisory file locks via flock(2)
+setsid|Run a program in a new session
+ionice|Get or set the I/O scheduling class and priority of a process
+blockdev|Call block-device ioctls from the command line
+ipcmk|Create System V IPC resources
+ipcctl|Run gated System V IPC control operations
+chattr|Change file attributes on a Linux filesystem
+lsattr|List file attributes on a Linux filesystem
+mkswap|Set up a Linux swap area
+swapon|Enable a swap area, or list the active ones
+swapoff|Disable a swap area
+wipefs|Detect or wipe filesystem / swap signatures
+fincore|Count pages of a file resident in core (the page cache)
+fsfreeze|Suspend or resume access to a filesystem
+losetup|Set up and control loop devices
+dmsetup|Low-level device-mapper control
+getfacl|Display POSIX.1e file access control lists
+setfacl|Set POSIX.1e file access control lists
+fstrim|Discard unused blocks on a mounted filesystem
+prlimit|prlimit(8) subset over prlimit(2)
+hwclock|hwclock(8) subset over /dev/rtc0
+renice|Change the niceness of running processes (POSIX renice)
+taskset|Run or query commands with a CPU affinity mask
+chrt|Show or change process scheduling policy and priority
+uclampset|Show process utilization clamp values through sched_getattr(2)
+
+# text and formatting tools (imported 2026-09-06 from the upstream collection)
+expand|Convert tabs to spaces (POSIX expand)
+unexpand|Convert spaces to tabs (POSIX unexpand)
+split|Split a file into pieces (POSIX split)
+csplit|Context-split a file (POSIX csplit)
+join|Relational join on two sorted files (POSIX join)
+pr|Format text for printing (POSIX pr)
+tac|Concatenate and print files in reverse (last record first)
+column|Aligned-column formatter (util-linux column subset)
+col|Filter CTL-H overstrike sequences (util-linux col)
+colrm|Remove byte-columns from each stdin line (util-linux colrm)
+expr|Evaluate POSIX expr(1) expressions
+hexdump|Byte-oriented hex dump (hexdump-compatible, focused on -C canonical)
+tput|Query a curated terminfo-compatible ANSI capability table
+tinfo|Read compiled terminfo entries
+strings|Print printable character sequences from files or stdin
+ed|ed [-s] [FILE]
+ar|Create, list, or extract simple ar archives. Writes are deterministic
+uuencode|uuencode [-m] [FILE] NAME
+uudecode|Decode traditional uuencode and base64-uuencode streams
+
+# Process and system tools
+who|who
+w|w
+uptime|uptime
+lsof|lsof
+timeout|timeout
+signal|signal
+hostid|hostid
+sysctl|sysctl
+dmesg|dmesg
+genl|genl
+mlock|mlock
+utmp|utmp
+userdb|userdb
+keyctl|keyctl
+caps|caps
+cred|cred
+ns|ns
+xattr|xattr
+
+# Additional upstream loadables
+nc|nc
+pkt|pkt
+http|http
+pcap|pcap
+dhcp6|dhcp6
+dhcpd6|dhcpd6
+sftp|sftp
+scp|scp
+audit|audit
+fail2ban|fail2ban
+
+# Additional upstream loadables
+asort|asort
+totp|totp
+scrub|scrub
+bignum|bignum
+tz|tz
+locale|locale
+scm|scm
+notify|notify
+cluster|cluster
+at|at
+batch|batch
+crontab|crontab
+payload|payload
+fsck|fsck
+mkfs|mkfs
+lpr|lpr
+opt|opt
+cal|cal
+man|man
+apropos|apropos
+whatis|whatis
+file|file
+
+# Additional upstream loadables
+pty|pty
+expect|expect
+termpixel|termpixel
+termpixel_pong|termpixel_pong
+escdelay|escdelay
+fifo|fifo
+kgetch|kgetch
+wgetch|wgetch
+wget_wch|wget_wch
+mouse|mouse
+script|script
+buf|buf
+undo|undo
+clip|clip
+nano2|nano2
+watch|watch
+wall|wall
+write|write
+
+# Additional upstream loadables
+awk|awk
+jq|jq
+bc|bc
+vec|vec
+sv|sv
+cron|cron
+curl|curl
+fw|fw
+dhcpd|dhcpd
+fdisk|fdisk
+strace|strace
+coreutils|coreutils
+bsdgames|bsdgames
+
+# Additional upstream loadables
+pcre|pcre
+zlib|zlib
+zcat|zcat
+netids|netids
+more|more
+less|less
+top|top
+slabtop|slabtop
+ncdu|ncdu
+tui|tui
+vmstat|vmstat
+toml|toml
+sqlite|sqlite
+vi|vi
+vt|vt
+utf8|utf8
+dialog|dialog
+whiptail|whiptail
+
+# Linux process accounting snapshots
+procstat|procstat iostat|mpstat|sar|pidstat|prtstat|pmap|pldd [OPTIONS]
+
+# Additional upstream loadables
+crypto|crypto
+claude|claude
+ldap|ldap
+integrity|integrity
+dns|dns
+login|login
+passwd|passwd
+auth|auth
+su|su
+doas|doas
+cksum|cksum
+obj|obj
+index|index
+pack|pack
+ssh|ssh
+pkg|pkg
+ntp|ntp
+mail|mail
+rsync|rsync
+wg|wg
+acme|acme
+uuidgen|uuidgen
+screen|screen
+sshd|sshd
+tiv|tiv
+kitty|kitty
+sixel|sixel
+nano|nano
+ts|ts
+hl|hl
+sudo|sudo
+
+# Persistent graphics canvas and optional GPU renderer
+gpu|gpu COMMAND [ARGUMENT ...]
+ptybroker|Persistent local raw PTYs with bounded native I/O

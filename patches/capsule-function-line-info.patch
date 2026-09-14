@@ -1,0 +1,34 @@
+--- a/tools/bpf-capsule-ld/main.cpp
++++ b/tools/bpf-capsule-ld/main.cpp
+@@ -87,6 +87,8 @@
+ cl::opt<bool> EmitLlvm("emit-llvm", cl::desc("Stop after the capsule pipeline and emit bitcode (debugging)"), cl::init(false), cl::cat(LinkerCategory));
+ cl::opt<bool> EmitAssembly("emit-asm", cl::desc("Stop after code generation and emit BPF assembly (debugging)"), cl::init(false), cl::cat(LinkerCategory));
+ cl::opt<bool> SaveTemps("save-temps", cl::desc("Keep <output>.linked.bc and <output>.capsule.bc beside the output"), cl::init(false), cl::cat(LinkerCategory));
++cl::opt<bool> FunctionLineInfo("function-line-info", cl::desc("Keep BTF type and function information without instruction locations or local-variable debug records"),
++    cl::init(false), cl::cat(LinkerCategory));
+ cl::opt<std::string> PipelineOverride(
+     "passes", cl::desc("Replace the capsule pipeline with this opt-style pass string (experiments)"), cl::init(""), cl::cat(LinkerCategory));
+ cl::opt<std::string> CPU("mcpu", cl::desc("BPF ISA version (v3 or v4; default v3)"), cl::init("v3"), cl::cat(LinkerCategory));
+@@ -751,6 +753,22 @@
+     for (Function& function : *module) {
+         function.setUWTableKind(UWTableKind::None);
+         function.setDoesNotThrow();
++        if (FunctionLineInfo) {
++            // BTF types, globals, prototypes and function locations are still
++            // required by libbpf and the verifier. Only omit fine-grained
++            // source records, whose string emission is quadratic in LLVM 23.
++            std::vector<Instruction*> debugIntrinsics;
++            for (BasicBlock& block : function) {
++                for (Instruction& instruction : block) {
++                    instruction.dropDbgRecords();
++                    instruction.setDebugLoc(DebugLoc());
++                    if (isa<DbgInfoIntrinsic>(instruction))
++                        debugIntrinsics.push_back(&instruction);
++                }
++            }
++            for (Instruction* instruction : debugIntrinsics)
++                instruction->eraseFromParent();
++        }
+     }
+ 
+     if (EmitAssembly) {

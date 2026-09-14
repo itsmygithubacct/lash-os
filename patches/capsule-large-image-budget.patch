@@ -1,0 +1,35 @@
+--- a/src/pass/stackify.cpp
++++ b/src/pass/stackify.cpp
+@@ -111,7 +111,9 @@
+ // The measured root-count curve and these automatic thresholds are documented
+ // in DESIGN.md; they are compiler policy, not per-object tuning knobs.
+ constexpr uint64_t RootLoadTarget = 7500;
+-constexpr unsigned MaxMergeRoots = 64;
++// Large linked applications need smaller independently verified roots. The
++// existing 256-function budget still bounds the selected root count.
++constexpr unsigned MaxMergeRoots = 128;
+ // One allocation unit becomes one disconnected component in a root. Keep its
+ // post-codegen path comfortably below the verifier's 8192-jump sequence cap.
+ constexpr uint64_t MaxUnitLoad = 3500;
+@@ -120,8 +122,10 @@
+ // own body, branches and memory operations.  It is deliberately shared by
+ // both memory representations: target selection must not change program
+ // semantics or require an application-specific scheduling override.
+-constexpr unsigned ChunkTripLimit = 8;
+-constexpr unsigned NativeLinearTripLimit = 64;
++// Arena spills cannot carry a verifier-visible induction proof. Dispatch
++// managed loop iterations through continuations, preserving their semantics.
++constexpr unsigned ChunkTripLimit = 1;
++constexpr unsigned NativeLinearTripLimit = 0;
+ 
+ bool IsLateMemoryIntrinsic(const Function& func) {
+     return func.getName() == bpf::sym::HeapStart || func.getName() == bpf::sym::HeapSize;
+@@ -3050,7 +3054,7 @@
+                     // marginal-cost allocator below spends finite global
+                     // verifier headroom on the hottest requests instead of
+                     // changing every loop at one arbitrary module-size cliff.
+-                    const unsigned desiredMaxChunkTrips = branchFanout <= 1 ? 16 : ChunkTripLimit;
++                    const unsigned desiredMaxChunkTrips = ChunkTripLimit;
+                     auto sizeChunk = [&](unsigned maximum) {
+                         if (!verifierBodyCost) {
+                             return 0u;
