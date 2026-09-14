@@ -12,16 +12,29 @@ def inspect(path):
     def readelf(option):
         return subprocess.check_output(["readelf", option, "--wide", str(path)],
                                        text=True, env=environment)
-    if not re.search(r"Type:\s+(EXEC|DYN)\b", readelf("--file-header")):
+    header = readelf("--file-header")
+    if not re.search(r"Type:\s+(EXEC|DYN)\b", header):
         raise ValueError(f"{path} is not an ELF executable")
     headers = readelf("--program-headers")
     dynamic = readelf("--dynamic")
     interpreter = re.search(r"Requesting program interpreter: (.*?)\]", headers)
     return {
+        "machine": re.search(r"Machine:\s*(.*)", header).group(1).strip(),
+        "class": re.search(r"Class:\s*(.*)", header).group(1).strip(),
+        "data": re.search(r"Data:\s*(.*)", header).group(1).strip(),
         "interpreter": interpreter.group(1) if interpreter else None,
         "needed_libraries": re.findall(r"\(NEEDED\).*?\[(.*?)\]", dynamic),
         "runtime_search_paths": re.findall(r"\((?:RPATH|RUNPATH)\).*?\[(.*?)\]", dynamic),
     }
+
+
+def require_arch(path, arch):
+    result = inspect(path)
+    machines = {"x86_64": "Advanced Micro Devices X86-64", "aarch64": "AArch64", "riscv64": "RISC-V"}
+    if (result["machine"] != machines[arch] or result["class"] != "ELF64" or
+            "little endian" not in result["data"]):
+        raise ValueError(f"{path} is not a little-endian {arch} ELF64 executable: {result}")
+    return result
 
 
 def require_static(path):

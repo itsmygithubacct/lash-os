@@ -18,11 +18,34 @@ in that workspace, outside the release Git tree.
 | `make test-mlkem` | Deterministic ML-KEM key generation, encapsulation and decapsulation across native and kernel code |
 | `make test-sha1dc` | SHA-1 padding vectors and collision-check continuation behavior |
 | `python3 -B tests/reachability-equivalence.py` | Compiler reachability transformation equivalence |
+| `scripts/dev.py python3 -B scripts/test-architecture.py --arch ARCH` | Extract an actual portable artifact, boot its matching guest kernel and check raw syscall translation plus all 279 builtin registrations |
+| `scripts/dev.py python3 -B scripts/test-architecture.py --arch ARCH --full` | Full shell/builtin cases and PTY job-control tests inside that artifact's guest kernel |
+| `scripts/dev.py python3 -B scripts/test-guest-runtime.py --arch ARCH` | Production guest init and console protocol, shared home, outbound networking and processes; `--smoke` omits the process cases |
 
 The host C tests need no BPF privileges or VM; their Make targets build the
 image first. Existing builds can be tested directly with `scripts/dev.py ctest
 --test-dir PATH --output-on-failure` (add `--shell portable` before `ctest` for
 the portable build).
+
+`make portable-all` builds static loaders for x86_64, aarch64 and riscv64 and
+runs the host tests for each. Cross-compiled host tests use QEMU user emulation.
+The architecture boot harness uses KVM when available for the native target and
+explicit TCG emulation otherwise. Its reports record that choice and the exact
+artifact hash under `reports/architectures/`. TCG tests verify the target kernel,
+eBPF image and guest behavior; native KVM and the production launcher's host
+confinement require separate testing on a compatible machine. The production
+launcher continues to require KVM.
+For native targets, the harness runs the QEMU and libraries extracted from the
+artifact itself. `--jobs-only` runs the PTY group separately, and `--network-only`
+runs the loopback HTTP and post-DNS fork checks. The architecture
+harness gives each PTY step up to five minutes for image verification; direct
+users of the helper can set `LASHOS_TEST_STEP_TIMEOUT_MS` explicitly.
+
+For the RISC-V kernel's JIT change, build the upstream test module with
+`scripts/dev.py python3 -B scripts/build-kernel.py --arch riscv64 --jit-selftest`.
+Pass `--jit-selftest PATH/TO/kernel/lib/test_bpf.ko` to the architecture harness
+to run Linux's BPF instruction tests before the shell smoke check. The module
+must match the bundled kernel and remains a test artifact outside the checkout.
 
 The dedicated VM suites require KVM, QEMU, a readable compatible Linux kernel,
 BusyBox, `script`, and a C compiler. They run without host disks, networking or

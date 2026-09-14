@@ -21,6 +21,7 @@
 #include <zstd.h>
 #include "sandbox_host.h"
 #include "sandbox_protocol.h"
+#include "sandbox_platform.h"
 
 #define SB_MAX_ARCHIVE (512ULL << 20)
 static const unsigned char bundle_magic[16] = "LASHOS-VM-v1";
@@ -465,7 +466,7 @@ static void launch_qemu(const char *directory, int root, int share, int channel,
     QA("-accel");
     QA("kvm");
     QA("-machine");
-    QA("pc");
+    QA(SB_MACHINE);
     QA("-cpu");
     QA("host");
     QA("-m");
@@ -481,14 +482,16 @@ static void launch_qemu(const char *directory, int root, int share, int channel,
     QA("-no-reboot");
     QA("-L");
     QA("firmware");
+#ifdef SB_BIOS
     QA("-bios");
-    QA("firmware/bios-256k.bin");
+    QA(SB_BIOS);
+#endif
     QA("-kernel");
     QA("kernel");
     QA("-initrd");
     QA("initramfs");
     QA("-append");
-    QA("console=ttyS0 rdinit=/init quiet loglevel=0 panic=-1 net.ifnames=0");
+    QA("console=" SB_CONSOLE " rdinit=/init quiet loglevel=0 panic=-1 net.ifnames=0");
     QA("-chardev");
     QA("file,id=boot,path=boot.log,append=on");
     QA("-serial");

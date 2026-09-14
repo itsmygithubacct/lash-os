@@ -1,4 +1,4 @@
-/* Private host/guest console protocol. Both endpoints are little-endian x86_64. */
+/* Private host/guest console protocol. Both endpoints are 64-bit little-endian. */
 #ifndef LASH_SANDBOX_PROTOCOL_H
 #define LASH_SANDBOX_PROTOCOL_H
 #include <errno.h>

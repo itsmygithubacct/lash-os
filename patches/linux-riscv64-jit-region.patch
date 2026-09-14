@@ -1,0 +1,21 @@
+Reserve room for the full Capsule image and process snapshots. The 1 GiB
+window remains inside the RV64 module area and within the JIT's signed
+32-bit relative-call reach of the pinned kernel. RWX protections and
+allocation accounting are unchanged. RV32 keeps its existing limit.
+
+--- a/arch/riscv/include/asm/pgtable.h
++++ b/arch/riscv/include/asm/pgtable.h
+@@ -44,11 +44,12 @@
+ #define VMALLOC_END      PAGE_OFFSET
+ #define VMALLOC_START    (PAGE_OFFSET - VMALLOC_SIZE)
+ 
+-#define BPF_JIT_REGION_SIZE	(SZ_128M)
+ #ifdef CONFIG_64BIT
++#define BPF_JIT_REGION_SIZE	(SZ_1G)
+ #define BPF_JIT_REGION_START	(BPF_JIT_REGION_END - BPF_JIT_REGION_SIZE)
+ #define BPF_JIT_REGION_END	(MODULES_END)
+ #else
++#define BPF_JIT_REGION_SIZE	(SZ_128M)
+ #define BPF_JIT_REGION_START	(PAGE_OFFSET - BPF_JIT_REGION_SIZE)
+ #define BPF_JIT_REGION_END	(VMALLOC_END)
+ #endif

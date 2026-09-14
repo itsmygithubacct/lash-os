@@ -115,7 +115,7 @@
 #define SIOCGSTAMPNS    0x8907
 #endif
 
-/* x86_64 needs no ioctl fixups. */
+/* The supported 64-bit Linux targets share these ioctl request encodings. */
 
 int ioctl(int fd, unsigned long request, ...);
 

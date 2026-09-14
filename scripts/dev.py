@@ -11,11 +11,11 @@ os.environ.setdefault("PYTHONDONTWRITEBYTECODE", "1")
 command = sys.argv[1:]
 profile = "default"
 if command[:1] == ["--shell"]:
-    if len(command) < 3 or command[1] not in ("default", "portable"):
-        sys.exit("usage: scripts/dev.py [--shell default|portable] COMMAND [ARGUMENT ...]")
+    if len(command) < 3 or command[1] not in ("default", "portable", "portable-aarch64", "portable-riscv64"):
+        sys.exit("usage: scripts/dev.py [--shell default|portable|portable-aarch64|portable-riscv64] COMMAND [ARGUMENT ...]")
     profile, command = command[1], command[2:]
 if not command:
-    sys.exit("usage: scripts/dev.py [--shell default|portable] COMMAND [ARGUMENT ...]")
+    sys.exit("usage: scripts/dev.py [--shell default|portable|portable-aarch64|portable-riscv64] COMMAND [ARGUMENT ...]")
 active = os.environ.get("LINUX_BASH_DEV_SHELL")
 ready = active == profile or (not active and profile == "default" and shutil.which("bpf-capsule-cc"))
 if not ready:

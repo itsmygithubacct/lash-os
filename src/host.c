@@ -57,6 +57,8 @@
 #include "kernel_control.h"
 #include "bash.skel.h"
 #include "sandbox_host.h"
+#include "native_syscalls.h"
+#include "sandbox_platform.h"
 
 #define MAX_FDS 256
 #define MAX_DIRS 64
@@ -778,7 +780,7 @@ static unsigned long namespace_clone_request(struct bridge_host *h,
     if (!r || r->operation != PX_RAW_SYSCALL)
         return 0;
     uint64_t *v = memory(h, r->args[0], 7 * sizeof(uint64_t));
-    if (!v || v[0] != SYS_clone)
+    if (!v || v[0] != LASH_SYS_clone)
         return 0;
     unsigned long allowed = CLONE_NEWCGROUP | CLONE_NEWIPC | CLONE_NEWNET | CLONE_NEWNS |
                             CLONE_NEWPID | CLONE_NEWUSER | CLONE_NEWUTS;
@@ -881,7 +883,10 @@ int main(int argc, char **argv) {
             sandbox.network = !strcmp(argv[1] + 18, "user");
             sandbox_tuning = 1;
         }
-        else if (!strcmp(argv[1], "--help")) {
+        else if (!strcmp(argv[1], "--version")) {
+            puts("lashos " LASHOS_VERSION " (" SB_ARCH "-linux)");
+            return 0;
+        } else if (!strcmp(argv[1], "--help")) {
             puts("Usage: linux-bash-os [loader options] [Bash arguments...]\n"
                  "  --sandbox    Run in the bundled KVM VM (default on other operating systems).\n"
                  "  --host       Run directly in this kernel; requires BPF loading privileges.\n"
@@ -892,10 +897,11 @@ int main(int argc, char **argv) {
                  "  --mount-cwd  Share the launch directory at /home (automatic in sandbox mode).\n"
                  "               In host mode: private bind mount, requires CAP_SYS_ADMIN.\n"
                  "  --stats      Print kernel execution statistics on exit.\n"
+                 "  --version    Show the lashos release version without loading BPF.\n"
                  "  --help       Show this help without loading BPF.\n"
                  "Loader options must precede Bash arguments. Use -- to end option parsing.\n"
                  "Bash runs with --noprofile --norc; accepts -c COMMAND, a script, or -i.\n"
-                 "Sandbox: x86_64 Linux, KVM access and Landlock ABI 6 required; run without sudo.\n"
+                 "Sandbox: " SB_ARCH " Linux, KVM access and Landlock ABI 6 required; run without sudo.\n"
                  "The launch folder is writable /home; the remaining guest filesystem is temporary.\n"
                  "Installed systems with trusted os-release ID=linux-bash-os default to host mode.");
             return 0;

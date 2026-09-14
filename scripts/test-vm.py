@@ -83,6 +83,7 @@ def main():
     shutil.copyfile(ROOT / "config/os-release", stage / "etc/os-release")
     shutil.copyfile(ROOT/"config/builtin-names", stage/"builtin-names")
     shutil.copyfile(ROOT/"tests/cases.sh", stage/"core-cases.sh")
+    shutil.copyfile(ROOT/"tests/network-cases.sh", stage/"network-cases.sh")
     (stage/"etc/hosts").write_text("127.0.0.1 localhost\n::1 localhost\n")
     test = args.init
     if test.exists():

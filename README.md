@@ -71,7 +71,8 @@ KVM virtual machine. The directory you launch from becomes writable `/home`;
 Bash starts there with `HOME=/home`. The remaining guest filesystem is temporary.
 The VM has **2 virtual CPUs, 4 GiB RAM, and outbound networking by default**.
 
-Run as an ordinary user with access to `/dev/kvm`. The host must be x86_64 Linux
+Run as an ordinary user with access to `/dev/kvm`. Use the binary matching the
+host CPU: x86_64, ARM64 (`aarch64`), or RISC-V64 (`riscv64`). The host needs Linux
 with hardware virtualization, KVM, and Landlock ABI 6 (normally Linux 6.12 or
 later with Landlock enabled). It needs an executable temporary filesystem at
 `/tmp` or `/var/tmp` outside the exported folder. Missing requirements stop
@@ -121,8 +122,8 @@ profile for direct execution with `--host`; it does not bundle a VM.
 The executable embeds its BPF object; `$LASHOS_OUT/bash.bpf.o` is retained for inspection.
 BTF type and function information and linked/lowered bitcode checkpoints remain
 available for diagnosis. CMake's `LINUX_BASH_DETAILED_DEBUG=ON` enables more detail.
-Local compiler patches are explained in [patches/README.md](patches/README.md);
-the verifier remains enabled. There is no custom kernel module or kernel patch.
+Local compiler and runtime patches are explained in [patches/README.md](patches/README.md).
+The verifier remains enabled, and the runtime requires no custom kernel module.
 
 ## Portable executable
 
@@ -135,14 +136,57 @@ cd /path/to/my-folder
 ./lash-os ./script.sh arg1
 ```
 
-`$LASHOS_OUT/portable/linux-bash-os` is a single x86_64 Linux executable, approximately
-93 MiB. It statically links the outer loader with musl, libbpf, libelf, zlib and
+`$LASHOS_OUT/portable/linux-bash-os` is a single x86_64 Linux executable. It
+statically links the outer loader with musl, libbpf, libelf, zlib and
 zstd, and includes the VM runtime, its library closure and firmware, Linux,
 and the guest filesystem. The guest contains the same full eBPF Bash image,
 all 279 selected builtins, and BusyBox external tools. Nix, QEMU, shared-library
 packages, and a host kernel with eBPF arena support are not needed at the
 destination. The host KVM, Landlock, and temporary-filesystem requirements above
-still apply. This build currently supports Linux on x86_64, not macOS or Windows.
+still apply. The executables target Linux.
+
+Build the three architectures from an x86_64 or ARM64 Linux build machine:
+
+```sh
+make portable-all
+# Or select one target:
+make portable-x86_64
+make portable-aarch64
+make portable-riscv64
+```
+
+These targets build Linux 6.18.52 from the checksum-pinned source and fetch
+checksum-pinned Debian 13 runtime packages into isolated sysroots. They do not
+install those packages on the build host. Build tools, including cross-compilers,
+QEMU emulators and `dpkg-deb`, come from the pinned Nix development shells.
+`KERNEL_JOBS=4` controls compilation parallelism per kernel. All downloads,
+sysroots, kernel trees, intermediates and outputs use the external workspace.
+
+| Target | Portable output relative to `$LASHOS_OUT` |
+| --- | --- |
+| x86_64 | `portable/linux-bash-os` |
+| ARM64 | `portable-aarch64/linux-bash-os` |
+| RISC-V64 | `portable-riscv64/linux-bash-os` |
+
+Each output is one executable with its matching QEMU, kernel and guest tools;
+it runs the same architecture-independent eBPF Bash image. `--version` reports
+the lashos release and target without starting a VM. Use `-- --version` to pass
+that option to GNU Bash. ARM64 requires LSE atomics and uses 4 KiB guest pages;
+RISC-V requires Zacas atomics. The host CPU and KVM must expose those extensions
+to the VM. Native KVM and confinement must be
+validated on each destination architecture; emulated guest tests alone do not
+establish those properties.
+
+The original `make portable` target still bundles the configured x86_64 build
+host kernel and runtime. Use `make portable-x86_64` for the pinned release runtime.
+Maintainers refresh package locks with `scripts/prepare-runtime.py --arch ARCH
+--update-lock`, using authenticated Debian APT metadata; normal builds use the
+checked-in locks in [config/runtime](config/runtime).
+
+`make release-candidates` builds all three and collects versioned executables,
+inventories and `SHA256SUMS` under `$LASHOS_OUT/releases/0.1.0/`. For existing
+builds, run `scripts/dev.py python3 -B scripts/package-release.py`. This collects
+local files; publishing a tagged release is a separate step.
 
 The adjacent `portable.json` is an optional inventory, not a runtime dependency.
 The regular executable in `$LASHOS_OUT/linux-bash-os` includes the same VM bundle but

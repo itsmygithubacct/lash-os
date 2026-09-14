@@ -1,0 +1,896 @@
+{
+  "distribution": "Debian 13 (trixie)",
+  "architecture": "riscv64",
+  "packages": [
+    {
+      "name": "adduser",
+      "version": "3.152",
+      "architecture": "all",
+      "source": "adduser",
+      "source_version": "3.152",
+      "url": "https://deb.debian.org/debian/pool/main/a/adduser/adduser_3.152_all.deb",
+      "sha256": "e50984d2e1ef6300e3fd51303839842189a077b10cb5cadff1923df10c61c493",
+      "bytes": 190932
+    },
+    {
+      "name": "base-files",
+      "version": "13.8+deb13u7",
+      "architecture": "riscv64",
+      "source": "base-files",
+      "source_version": "13.8+deb13u7",
+      "url": "https://deb.debian.org/debian/pool/main/b/base-files/base-files_13.8+deb13u7_riscv64.deb",
+      "sha256": "72966ca403d6f712ce7bbfd642084b373a56ac675b3200a87f7a63dcf7408533",
+      "bytes": 88248
+    },
+    {
+      "name": "base-passwd",
+      "version": "3.6.7",
+      "architecture": "riscv64",
+      "source": "base-passwd",
+      "source_version": "3.6.7",
+      "url": "https://deb.debian.org/debian/pool/main/b/base-passwd/base-passwd_3.6.7_riscv64.deb",
+      "sha256": "527a76e04f3c00c65fb5a698eb8d17218bc016ec404924d46a4c49346bddf059",
+      "bytes": 53752
+    },
+    {
+      "name": "busybox",
+      "version": "1:1.37.0-6+b9",
+      "architecture": "riscv64",
+      "source": "busybox",
+      "source_version": "1:1.37.0-6",
+      "url": "https://deb.debian.org/debian/pool/main/b/busybox/busybox_1.37.0-6+b9_riscv64.deb",
+      "sha256": "abf119e3d97531fa9aafd9186613ea7fe9bc3f6e64e2b6f05eb8fe7ebdd23492",
+      "bytes": 504920
+    },
+    {
+      "name": "ca-certificates",
+      "version": "20250419",
+      "architecture": "all",
+      "source": "ca-certificates",
+      "source_version": "20250419",
+      "url": "https://deb.debian.org/debian/pool/main/c/ca-certificates/ca-certificates_20250419_all.deb",
+      "sha256": "ef590f89563aa4b46c8260d49d1cea0fc1b181d19e8df3782694706adf05c184",
+      "bytes": 161704
+    },
+    {
+      "name": "debconf",
+      "version": "1.5.91",
+      "architecture": "all",
+      "source": "debconf",
+      "source_version": "1.5.91",
+      "url": "https://deb.debian.org/debian/pool/main/d/debconf/debconf_1.5.91_all.deb",
+      "sha256": "1ddc7e6c5925f748eefb7ca811d98e049f18c158bb21fbc7e122262ce6011e49",
+      "bytes": 121088
+    },
+    {
+      "name": "gcc-14-base",
+      "version": "14.2.0-19",
+      "architecture": "riscv64",
+      "source": "gcc-14",
+      "source_version": "14.2.0-19",
+      "url": "https://deb.debian.org/debian/pool/main/g/gcc-14/gcc-14-base_14.2.0-19_riscv64.deb",
+      "sha256": "bb871e84c5c108463fa6a858e72f15cbf809f3888442b89941fc625449874206",
+      "bytes": 49428
+    },
+    {
+      "name": "libacl1",
+      "version": "2.3.2-2+b1",
+      "architecture": "riscv64",
+      "source": "acl",
+      "source_version": "2.3.2-2",
+      "url": "https://deb.debian.org/debian/pool/main/a/acl/libacl1_2.3.2-2+b1_riscv64.deb",
+      "sha256": "9929497fdd0f08bb76b49d059005c327619447cefd46bea167a8e2944979a93f",
+      "bytes": 32872
+    },
+    {
+      "name": "libaio1t64",
+      "version": "0.3.113-8+b1",
+      "architecture": "riscv64",
+      "source": "libaio",
+      "source_version": "0.3.113-8",
+      "url": "https://deb.debian.org/debian/pool/main/liba/libaio/libaio1t64_0.3.113-8+b1_riscv64.deb",
+      "sha256": "8d3aa6e512dce032522dc9bbd18f8f7bec0ef1af09ea57f2202b6c708ebb2eb0",
+      "bytes": 14788
+    },
+    {
+      "name": "libasound2-data",
+      "version": "1.2.14-1+deb13u1",
+      "architecture": "all",
+      "source": "alsa-lib",
+      "source_version": "1.2.14-1+deb13u1",
+      "url": "https://deb.debian.org/debian/pool/main/a/alsa-lib/libasound2-data_1.2.14-1+deb13u1_all.deb",
+      "sha256": "04688afdff3769c0f685541daed7b2f6f0cb946799ddf1d5847ddf11fe245559",
+      "bytes": 21188
+    },
+    {
+      "name": "libasound2t64",
+      "version": "1.2.14-1+deb13u1",
+      "architecture": "riscv64",
+      "source": "alsa-lib",
+      "source_version": "1.2.14-1+deb13u1",
+      "url": "https://deb.debian.org/debian/pool/main/a/alsa-lib/libasound2t64_1.2.14-1+deb13u1_riscv64.deb",
+      "sha256": "bd1dd7af810b8e39e0a030402f58f478a10c44fbcb41c5bfb424af317e829e4c",
+      "bytes": 382140
+    },
+    {
+      "name": "libatomic1",
+      "version": "14.2.0-19",
+      "architecture": "riscv64",
+      "source": "gcc-14",
+      "source_version": "14.2.0-19",
+      "url": "https://deb.debian.org/debian/pool/main/g/gcc-14/libatomic1_14.2.0-19_riscv64.deb",
+      "sha256": "ebaf12b2de00a4b567f70c629c0ff744dc92491029b3219d59c05c733f200c65",
+      "bytes": 8672
+    },
+    {
+      "name": "libattr1",
+      "version": "1:2.5.2-3",
+      "architecture": "riscv64",
+      "source": "attr",
+      "source_version": "1:2.5.2-3",
+      "url": "https://deb.debian.org/debian/pool/main/a/attr/libattr1_2.5.2-3_riscv64.deb",
+      "sha256": "7780428a9d05d8d5659a632b90d52d1efe2cd79dd61300a744c342a53428afd5",
+      "bytes": 22884
+    },
+    {
+      "name": "libaudit-common",
+      "version": "1:4.0.2-2+deb13u1",
+      "architecture": "all",
+      "source": "audit",
+      "source_version": "1:4.0.2-2+deb13u1",
+      "url": "https://deb.debian.org/debian/pool/main/a/audit/libaudit-common_4.0.2-2+deb13u1_all.deb",
+      "sha256": "b9d32e5ff04fd747aacb7d6b3ebbbbf734ddefb2f1695f0b1b2a4b5e51b1052e",
+      "bytes": 12812
+    },
+    {
+      "name": "libaudit1",
+      "version": "1:4.0.2-2+deb13u1",
+      "architecture": "riscv64",
+      "source": "audit",
+      "source_version": "1:4.0.2-2+deb13u1",
+      "url": "https://deb.debian.org/debian/pool/main/a/audit/libaudit1_4.0.2-2+deb13u1_riscv64.deb",
+      "sha256": "69b65713b787512eef20c407ce9d02926e60af3c43bd2464a54ac7bea7b8c3fb",
+      "bytes": 56216
+    },
+    {
+      "name": "libblkid1",
+      "version": "2.41.5-0+deb13u1",
+      "architecture": "riscv64",
+      "source": "util-linux",
+      "source_version": "2.41.5-0+deb13u1",
+      "url": "https://deb.debian.org/debian/pool/main/u/util-linux/libblkid1_2.41.5-0+deb13u1_riscv64.deb",
+      "sha256": "1d40b51c92ed4ccd3e9d16f53022781e5a7f5fea983f2384ae49e7ba2c155e26",
+      "bytes": 193532
+    },
+    {
+      "name": "libbpf1",
+      "version": "1:1.5.0-3",
+      "architecture": "riscv64",
+      "source": "libbpf",
+      "source_version": "1.5.0-3",
+      "url": "https://deb.debian.org/debian/pool/main/libb/libbpf/libbpf1_1.5.0-3_riscv64.deb",
+      "sha256": "729a2ed6109921948fb6bba8df5482918f2c09430b904b6e395c7fe74edbaa92",
+      "bytes": 171392
+    },
+    {
+      "name": "libbrlapi0.8",
+      "version": "6.7-3.1+deb13u3",
+      "architecture": "riscv64",
+      "source": "brltty",
+      "source_version": "6.7-3.1+deb13u3",
+      "url": "https://deb.debian.org/debian/pool/main/b/brltty/libbrlapi0.8_6.7-3.1+deb13u3_riscv64.deb",
+      "sha256": "96165121fe1f40fcb1ce9a431bc32fc5eb9b73721a677a0c40e5c06ba0ba680e",
+      "bytes": 92888
+    },
+    {
+      "name": "libbsd0",
+      "version": "0.12.2-2",
+      "architecture": "riscv64",
+      "source": "libbsd",
+      "source_version": "0.12.2-2",
+      "url": "https://deb.debian.org/debian/pool/main/libb/libbsd/libbsd0_0.12.2-2_riscv64.deb",
+      "sha256": "1ba7054b1de3931ebe3a7be38a1ba3cd5dbfe4eb647fc259425af8db76f89660",
+      "bytes": 131812
+    },
+    {
+      "name": "libbz2-1.0",
+      "version": "1.0.8-6",
+      "architecture": "riscv64",
+      "source": "bzip2",
+      "source_version": "1.0.8-6",
+      "url": "https://deb.debian.org/debian/pool/main/b/bzip2/libbz2-1.0_1.0.8-6_riscv64.deb",
+      "sha256": "27c7937eb4d2e314e1f0a57a99a20c141c55f720e5ee93d2244de432fd247a55",
+      "bytes": 40280
+    },
+    {
+      "name": "libc6",
+      "version": "2.41-12+deb13u4",
+      "architecture": "riscv64",
+      "source": "glibc",
+      "source_version": "2.41-12+deb13u4",
+      "url": "https://deb.debian.org/debian/pool/main/g/glibc/libc6_2.41-12+deb13u4_riscv64.deb",
+      "sha256": "77f0da760da3eab6318917857669ec23556b4e1ee489218cb966884a11b0d967",
+      "bytes": 2470128
+    },
+    {
+      "name": "libcacard0",
+      "version": "1:2.8.0-3+b2",
+      "architecture": "riscv64",
+      "source": "libcacard",
+      "source_version": "1:2.8.0-3",
+      "url": "https://deb.debian.org/debian/pool/main/libc/libcacard/libcacard0_2.8.0-3+b2_riscv64.deb",
+      "sha256": "8f12304be68633e3c480ce7f06c0b51b628ff681c62594d8119d674fc09239d0",
+      "bytes": 90724
+    },
+    {
+      "name": "libcap-ng0",
+      "version": "0.8.5-4+b1",
+      "architecture": "riscv64",
+      "source": "libcap-ng",
+      "source_version": "0.8.5-4",
+      "url": "https://deb.debian.org/debian/pool/main/libc/libcap-ng/libcap-ng0_0.8.5-4+b1_riscv64.deb",
+      "sha256": "2d3a19435ca2479b992f47d7db0b8c598ce05cf88cb0103d91b3d76a1524681b",
+      "bytes": 17168
+    },
+    {
+      "name": "libcap2",
+      "version": "1:2.75-10+deb13u1+b3",
+      "architecture": "riscv64",
+      "source": "libcap2",
+      "source_version": "1:2.75-10+deb13u1",
+      "url": "https://deb.debian.org/debian/pool/main/libc/libcap2/libcap2_2.75-10+deb13u1+b3_riscv64.deb",
+      "sha256": "ef9e04266f4e9302f17e9acc0ce8cd4cad50d05539b8e64a4019a03e3f776699",
+      "bytes": 29544
+    },
+    {
+      "name": "libcapstone5",
+      "version": "5.0.7-1~deb13u1",
+      "architecture": "riscv64",
+      "source": "capstone",
+      "source_version": "5.0.7-1~deb13u1",
+      "url": "https://deb.debian.org/debian/pool/main/c/capstone/libcapstone5_5.0.7-1~deb13u1_riscv64.deb",
+      "sha256": "a63b2167df72dabfd2f22190f11b01a7ddd7bc34e893802c527db2bd7ce97b7b",
+      "bytes": 763420
+    },
+    {
+      "name": "libcrypt1",
+      "version": "1:4.4.38-1",
+      "architecture": "riscv64",
+      "source": "libxcrypt",
+      "source_version": "1:4.4.38-1",
+      "url": "https://deb.debian.org/debian/pool/main/libx/libxcrypt/libcrypt1_4.4.38-1_riscv64.deb",
+      "sha256": "85ae0d868b2a27043249ca332dac782a1a67e3171139b0f57d63414eaf4ec887",
+      "bytes": 105532
+    },
+    {
+      "name": "libdb5.3t64",
+      "version": "5.3.28+dfsg2-9",
+      "architecture": "riscv64",
+      "source": "db5.3",
+      "source_version": "5.3.28+dfsg2-9",
+      "url": "https://deb.debian.org/debian/pool/main/d/db5.3/libdb5.3t64_5.3.28+dfsg2-9_riscv64.deb",
+      "sha256": "3f8a92882a38f877711912c82d6013112b9c086bd83215a3adade0801b36c29c",
+      "bytes": 716044
+    },
+    {
+      "name": "libdebconfclient0",
+      "version": "0.280",
+      "architecture": "riscv64",
+      "source": "cdebconf",
+      "source_version": "0.280",
+      "url": "https://deb.debian.org/debian/pool/main/c/cdebconf/libdebconfclient0_0.280_riscv64.deb",
+      "sha256": "e8788f444aa000e878f31633686b701119dd350935e8d106e2b479af3d369e06",
+      "bytes": 10484
+    },
+    {
+      "name": "libelf1t64",
+      "version": "0.192-4",
+      "architecture": "riscv64",
+      "source": "elfutils",
+      "source_version": "0.192-4",
+      "url": "https://deb.debian.org/debian/pool/main/e/elfutils/libelf1t64_0.192-4_riscv64.deb",
+      "sha256": "d2ce018898814c005a363792c236fa0b33291bf3d775f9173ef97d7c9416dc03",
+      "bytes": 193940
+    },
+    {
+      "name": "libexecs1",
+      "version": "1.4-2+b2",
+      "architecture": "riscv64",
+      "source": "libexecs",
+      "source_version": "1.4-2",
+      "url": "https://deb.debian.org/debian/pool/main/libe/libexecs/libexecs1_1.4-2+b2_riscv64.deb",
+      "sha256": "ab4225cde8386e4f4f6808db56d3953e333f4a1365064086b1223160f22d49b5",
+      "bytes": 7664
+    },
+    {
+      "name": "libfdt1",
+      "version": "1.7.2-2+b1",
+      "architecture": "riscv64",
+      "source": "device-tree-compiler",
+      "source_version": "1.7.2-2",
+      "url": "https://deb.debian.org/debian/pool/main/d/device-tree-compiler/libfdt1_1.7.2-2+b1_riscv64.deb",
+      "sha256": "883ac23e2fcec1c24004b43471c923435666c2dd9a5e88b0cce372c211144d1a",
+      "bytes": 23828
+    },
+    {
+      "name": "libffi8",
+      "version": "3.4.8-2",
+      "architecture": "riscv64",
+      "source": "libffi",
+      "source_version": "3.4.8-2",
+      "url": "https://deb.debian.org/debian/pool/main/libf/libffi/libffi8_3.4.8-2_riscv64.deb",
+      "sha256": "f2dc7319a32fb0af68723f781667aa876efb402301e9cb170d2979d394c11bfb",
+      "bytes": 21668
+    },
+    {
+      "name": "libfuse3-4",
+      "version": "3.17.2-3",
+      "architecture": "riscv64",
+      "source": "fuse3",
+      "source_version": "3.17.2-3",
+      "url": "https://deb.debian.org/debian/pool/main/f/fuse3/libfuse3-4_3.17.2-3_riscv64.deb",
+      "sha256": "b7e67c0145d997efbabe8ca65f81299a80db3a98455fb07102b867f99dde97f0",
+      "bytes": 97448
+    },
+    {
+      "name": "libgcc-s1",
+      "version": "14.2.0-19",
+      "architecture": "riscv64",
+      "source": "gcc-14",
+      "source_version": "14.2.0-19",
+      "url": "https://deb.debian.org/debian/pool/main/g/gcc-14/libgcc-s1_14.2.0-19_riscv64.deb",
+      "sha256": "16d3f9f534028615413d23f649e5d246baef48fe7db739ad564ef8b9a6e5587c",
+      "bytes": 56788
+    },
+    {
+      "name": "libglib2.0-0t64",
+      "version": "2.84.4-3~deb13u5",
+      "architecture": "riscv64",
+      "source": "glib2.0",
+      "source_version": "2.84.4-3~deb13u5",
+      "url": "https://deb.debian.org/debian/pool/main/g/glib2.0/libglib2.0-0t64_2.84.4-3~deb13u5_riscv64.deb",
+      "sha256": "c47f583ab9990e9f8121dacfd1ead934509deb4621d574964578a42ee04ee98b",
+      "bytes": 1530668
+    },
+    {
+      "name": "libgmp10",
+      "version": "2:6.3.0+dfsg-3",
+      "architecture": "riscv64",
+      "source": "gmp",
+      "source_version": "2:6.3.0+dfsg-3",
+      "url": "https://deb.debian.org/debian/pool/main/g/gmp/libgmp10_6.3.0+dfsg-3_riscv64.deb",
+      "sha256": "f09a7beea39293dc5047af3750d8359c9fe4fd9f35195e7bba5048e5a66b58d8",
+      "bytes": 557844
+    },
+    {
+      "name": "libgnutls30t64",
+      "version": "3.8.9-3+deb13u4",
+      "architecture": "riscv64",
+      "source": "gnutls28",
+      "source_version": "3.8.9-3+deb13u4",
+      "url": "https://deb.debian.org/debian/pool/main/g/gnutls28/libgnutls30t64_3.8.9-3+deb13u4_riscv64.deb",
+      "sha256": "2afdbd6c5ec40b2981d95949b34d04a8b404245336485cc97ee09c29c4549f23",
+      "bytes": 1447916
+    },
+    {
+      "name": "libhogweed6t64",
+      "version": "3.10.1-1",
+      "architecture": "riscv64",
+      "source": "nettle",
+      "source_version": "3.10.1-1",
+      "url": "https://deb.debian.org/debian/pool/main/n/nettle/libhogweed6t64_3.10.1-1_riscv64.deb",
+      "sha256": "627a0a47e5256c2e681fb6405b68b12e4c16b193afdaa1c63d67b891baf8fb51",
+      "bytes": 335852
+    },
+    {
+      "name": "libibverbs1",
+      "version": "56.1-1",
+      "architecture": "riscv64",
+      "source": "rdma-core",
+      "source_version": "56.1-1",
+      "url": "https://deb.debian.org/debian/pool/main/r/rdma-core/libibverbs1_56.1-1_riscv64.deb",
+      "sha256": "17c12d1e2e10fd92075358fd0008873ae91d33d5b7cb853d9eaea0037097b9a2",
+      "bytes": 62728
+    },
+    {
+      "name": "libidn2-0",
+      "version": "2.3.8-2",
+      "architecture": "riscv64",
+      "source": "libidn2",
+      "source_version": "2.3.8-2",
+      "url": "https://deb.debian.org/debian/pool/main/libi/libidn2/libidn2-0_2.3.8-2_riscv64.deb",
+      "sha256": "bbedb5eacf03878007aa288e8993b0ca7509282366d94a5399fbdd19f79b9fe3",
+      "bytes": 108828
+    },
+    {
+      "name": "libjpeg62-turbo",
+      "version": "1:2.1.5-4",
+      "architecture": "riscv64",
+      "source": "libjpeg-turbo",
+      "source_version": "1:2.1.5-4",
+      "url": "https://deb.debian.org/debian/pool/main/libj/libjpeg-turbo/libjpeg62-turbo_2.1.5-4_riscv64.deb",
+      "sha256": "859970b9a4379c1cdef6127fcdc21fd6a445f0188e9bd8a35199d2d6bcd49a3b",
+      "bytes": 154840
+    },
+    {
+      "name": "libmd0",
+      "version": "1.1.0-2+b1",
+      "architecture": "riscv64",
+      "source": "libmd",
+      "source_version": "1.1.0-2",
+      "url": "https://deb.debian.org/debian/pool/main/libm/libmd/libmd0_1.1.0-2+b1_riscv64.deb",
+      "sha256": "b9d39f5d9bae99bdad80528fe6ffab501d0b0add8e2e388850b359a69094e64a",
+      "bytes": 37592
+    },
+    {
+      "name": "libmount1",
+      "version": "2.41.5-0+deb13u1",
+      "architecture": "riscv64",
+      "source": "util-linux",
+      "source_version": "2.41.5-0+deb13u1",
+      "url": "https://deb.debian.org/debian/pool/main/u/util-linux/libmount1_2.41.5-0+deb13u1_riscv64.deb",
+      "sha256": "6e699c242b9c82bd2e4fa6c33ef1d9579f4a6389f82beace2371aa9af3a4984d",
+      "bytes": 227400
+    },
+    {
+      "name": "libncursesw6",
+      "version": "6.5+20250216-2",
+      "architecture": "riscv64",
+      "source": "ncurses",
+      "source_version": "6.5+20250216-2",
+      "url": "https://deb.debian.org/debian/pool/main/n/ncurses/libncursesw6_6.5+20250216-2_riscv64.deb",
+      "sha256": "16debd916a1ecd95f6449d5bb739015dbb0d4c07f5aaa2360f11d1028b182eac",
+      "bytes": 140584
+    },
+    {
+      "name": "libnettle8t64",
+      "version": "3.10.1-1",
+      "architecture": "riscv64",
+      "source": "nettle",
+      "source_version": "3.10.1-1",
+      "url": "https://deb.debian.org/debian/pool/main/n/nettle/libnettle8t64_3.10.1-1_riscv64.deb",
+      "sha256": "c69e8bd70176287e5edc802606ebe348c90ce7e0944c85bd86badbbe07ad4198",
+      "bytes": 334612
+    },
+    {
+      "name": "libnl-3-200",
+      "version": "3.7.0-2",
+      "architecture": "riscv64",
+      "source": "libnl3",
+      "source_version": "3.7.0-2",
+      "url": "https://deb.debian.org/debian/pool/main/libn/libnl3/libnl-3-200_3.7.0-2_riscv64.deb",
+      "sha256": "1a011a0da6f18c3817d1be34a828b02be8013f97b65394b438cd1d61d6f3d6e2",
+      "bytes": 60024
+    },
+    {
+      "name": "libnl-route-3-200",
+      "version": "3.7.0-2",
+      "architecture": "riscv64",
+      "source": "libnl3",
+      "source_version": "3.7.0-2",
+      "url": "https://deb.debian.org/debian/pool/main/libn/libnl3/libnl-route-3-200_3.7.0-2_riscv64.deb",
+      "sha256": "480dbb63a3327513b8ca68d6512997b1dfb3139f6eb3c32d3ffb89a83b6c69ae",
+      "bytes": 183432
+    },
+    {
+      "name": "libnspr4",
+      "version": "2:4.36-1",
+      "architecture": "riscv64",
+      "source": "nspr",
+      "source_version": "2:4.36-1",
+      "url": "https://deb.debian.org/debian/pool/main/n/nspr/libnspr4_4.36-1_riscv64.deb",
+      "sha256": "7ecd58f76e5a028d4fb79cf957b55fe41e80249b24950f24676e54830a1ef865",
+      "bytes": 111296
+    },
+    {
+      "name": "libnss3",
+      "version": "2:3.110-1+deb13u4",
+      "architecture": "riscv64",
+      "source": "nss",
+      "source_version": "2:3.110-1+deb13u4",
+      "url": "https://deb.debian.org/debian/pool/main/n/nss/libnss3_3.110-1+deb13u4_riscv64.deb",
+      "sha256": "fdddbd6e4f1ec751161abc4357e3f69957141483d0c482fb3a48f0b20c4deaaf",
+      "bytes": 1475804
+    },
+    {
+      "name": "libnuma1",
+      "version": "2.0.19-1",
+      "architecture": "riscv64",
+      "source": "numactl",
+      "source_version": "2.0.19-1",
+      "url": "https://deb.debian.org/debian/pool/main/n/numactl/libnuma1_2.0.19-1_riscv64.deb",
+      "sha256": "7aa7b8ab3460bf501fcaa903a6a211f79e21d59a685c0718a27053f7c631b294",
+      "bytes": 23228
+    },
+    {
+      "name": "libp11-kit0",
+      "version": "0.25.5-3",
+      "architecture": "riscv64",
+      "source": "p11-kit",
+      "source_version": "0.25.5-3",
+      "url": "https://deb.debian.org/debian/pool/main/p/p11-kit/libp11-kit0_0.25.5-3_riscv64.deb",
+      "sha256": "e9229b3d60ad109da1304aababf9b762474bf2b6dcba071a3029ca127e93084a",
+      "bytes": 443616
+    },
+    {
+      "name": "libpam-modules-bin",
+      "version": "1.7.0-5",
+      "architecture": "riscv64",
+      "source": "pam",
+      "source_version": "1.7.0-5",
+      "url": "https://deb.debian.org/debian/pool/main/p/pam/libpam-modules-bin_1.7.0-5_riscv64.deb",
+      "sha256": "1d7f08dd204b3f381da56c71c9a2f0a9508aa54d874e39eac7108eec5b62d234",
+      "bytes": 49280
+    },
+    {
+      "name": "libpam-modules",
+      "version": "1.7.0-5",
+      "architecture": "riscv64",
+      "source": "pam",
+      "source_version": "1.7.0-5",
+      "url": "https://deb.debian.org/debian/pool/main/p/pam/libpam-modules_1.7.0-5_riscv64.deb",
+      "sha256": "7f7b549b606fa211798c63ee16f5f396643c23c77963347281b1404eda3fa04d",
+      "bytes": 177272
+    },
+    {
+      "name": "libpam0g",
+      "version": "1.7.0-5",
+      "architecture": "riscv64",
+      "source": "pam",
+      "source_version": "1.7.0-5",
+      "url": "https://deb.debian.org/debian/pool/main/p/pam/libpam0g_1.7.0-5_riscv64.deb",
+      "sha256": "3d3174e530e5c95819ed68ef62d7f1cb51a9a16f512595c70e9443f93962ba4b",
+      "bytes": 70168
+    },
+    {
+      "name": "libpcre2-8-0",
+      "version": "10.46-1~deb13u2",
+      "architecture": "riscv64",
+      "source": "pcre2",
+      "source_version": "10.46-1~deb13u2",
+      "url": "https://deb.debian.org/debian/pool/main/p/pcre2/libpcre2-8-0_10.46-1~deb13u2_riscv64.deb",
+      "sha256": "4c88d7f0b71ca696779681536e55b13761f3860e9add9b274c6f1329b2e28f10",
+      "bytes": 300728
+    },
+    {
+      "name": "libpcsclite1",
+      "version": "2.3.3-1",
+      "architecture": "riscv64",
+      "source": "pcsc-lite",
+      "source_version": "2.3.3-1",
+      "url": "https://deb.debian.org/debian/pool/main/p/pcsc-lite/libpcsclite1_2.3.3-1_riscv64.deb",
+      "sha256": "cf9ca1204a751e80c99552da414fae62092f6aaf23949107819e782936eb1bf7",
+      "bytes": 55792
+    },
+    {
+      "name": "libpixman-1-0",
+      "version": "0.44.0-3",
+      "architecture": "riscv64",
+      "source": "pixman",
+      "source_version": "0.44.0-3",
+      "url": "https://deb.debian.org/debian/pool/main/p/pixman/libpixman-1-0_0.44.0-3_riscv64.deb",
+      "sha256": "b2fe003ffdb7479e126baee88dc50a7980efd6272260c8eea6994298df48cb51",
+      "bytes": 182292
+    },
+    {
+      "name": "libpng16-16t64",
+      "version": "1.6.48-1+deb13u5",
+      "architecture": "riscv64",
+      "source": "libpng1.6",
+      "source_version": "1.6.48-1+deb13u5",
+      "url": "https://deb.debian.org/debian/pool/main/libp/libpng1.6/libpng16-16t64_1.6.48-1+deb13u5_riscv64.deb",
+      "sha256": "cd8970f0b5cf015c4ed58b2fcb43ab5069d2e72a4c520d01cce308e178cc36cd",
+      "bytes": 286852
+    },
+    {
+      "name": "librdmacm1t64",
+      "version": "56.1-1",
+      "architecture": "riscv64",
+      "source": "rdma-core",
+      "source_version": "56.1-1",
+      "url": "https://deb.debian.org/debian/pool/main/r/rdma-core/librdmacm1t64_56.1-1_riscv64.deb",
+      "sha256": "123fd7ffe95700947772a91144846224e69a1f87250bc67163f1628f6c920342",
+      "bytes": 74252
+    },
+    {
+      "name": "libsasl2-2",
+      "version": "2.1.28+dfsg1-9",
+      "architecture": "riscv64",
+      "source": "cyrus-sasl2",
+      "source_version": "2.1.28+dfsg1-9",
+      "url": "https://deb.debian.org/debian/pool/main/c/cyrus-sasl2/libsasl2-2_2.1.28+dfsg1-9_riscv64.deb",
+      "sha256": "5dd5c6c1b32a20ceb6da07e923430d1d91ba3c05049d74ad1ddca0a55f9d2cd5",
+      "bytes": 60892
+    },
+    {
+      "name": "libsasl2-modules-db",
+      "version": "2.1.28+dfsg1-9",
+      "architecture": "riscv64",
+      "source": "cyrus-sasl2",
+      "source_version": "2.1.28+dfsg1-9",
+      "url": "https://deb.debian.org/debian/pool/main/c/cyrus-sasl2/libsasl2-modules-db_2.1.28+dfsg1-9_riscv64.deb",
+      "sha256": "d2c43fefb768a4c1171c6dd67007f2b83e0b855e996930fee740af6391779d9c",
+      "bytes": 20456
+    },
+    {
+      "name": "libseccomp2",
+      "version": "2.6.0-2",
+      "architecture": "riscv64",
+      "source": "libseccomp",
+      "source_version": "2.6.0-2",
+      "url": "https://deb.debian.org/debian/pool/main/libs/libseccomp/libseccomp2_2.6.0-2_riscv64.deb",
+      "sha256": "17f38aef157c29f0b6633c5af9dec711a93aeb0af960ffd649034ee675a14c67",
+      "bytes": 53116
+    },
+    {
+      "name": "libselinux1",
+      "version": "3.8.1-1",
+      "architecture": "riscv64",
+      "source": "libselinux",
+      "source_version": "3.8.1-1",
+      "url": "https://deb.debian.org/debian/pool/main/libs/libselinux/libselinux1_3.8.1-1_riscv64.deb",
+      "sha256": "2d52c10ffed1597ec5a3dee58167f1f482fcb1b36aa9f9a79a1b0fe23a4bf470",
+      "bytes": 88072
+    },
+    {
+      "name": "libsemanage-common",
+      "version": "3.8.1-1",
+      "architecture": "all",
+      "source": "libsemanage",
+      "source_version": "3.8.1-1",
+      "url": "https://deb.debian.org/debian/pool/main/libs/libsemanage/libsemanage-common_3.8.1-1_all.deb",
+      "sha256": "65375d886749c236bd1da4d9990b7c2469d2fe66019a28e5614f6814376d3dcb",
+      "bytes": 7812
+    },
+    {
+      "name": "libsemanage2",
+      "version": "3.8.1-1",
+      "architecture": "riscv64",
+      "source": "libsemanage",
+      "source_version": "3.8.1-1",
+      "url": "https://deb.debian.org/debian/pool/main/libs/libsemanage/libsemanage2_3.8.1-1_riscv64.deb",
+      "sha256": "b9a663d68aca11e827b34cd388b0cda118a797493e99af730f297ff6dc7f4218",
+      "bytes": 94644
+    },
+    {
+      "name": "libsepol2",
+      "version": "3.8.1-1",
+      "architecture": "riscv64",
+      "source": "libsepol",
+      "source_version": "3.8.1-1",
+      "url": "https://deb.debian.org/debian/pool/main/libs/libsepol/libsepol2_3.8.1-1_riscv64.deb",
+      "sha256": "357edde70ccf29f46b641a4381f0e771e57465368ff3c021475f096f41c1fb96",
+      "bytes": 304056
+    },
+    {
+      "name": "libslirp0",
+      "version": "4.8.0-1+deb13u1",
+      "architecture": "riscv64",
+      "source": "libslirp",
+      "source_version": "4.8.0-1+deb13u1",
+      "url": "https://deb.debian.org/debian/pool/main/libs/libslirp/libslirp0_4.8.0-1+deb13u1_riscv64.deb",
+      "sha256": "adadad6bf117d52caf37787814c0f56ca71187e84e424c4e4b3f32b9e765c62e",
+      "bytes": 71164
+    },
+    {
+      "name": "libsqlite3-0",
+      "version": "3.46.1-7+deb13u2",
+      "architecture": "riscv64",
+      "source": "sqlite3",
+      "source_version": "3.46.1-7+deb13u2",
+      "url": "https://deb.debian.org/debian/pool/main/s/sqlite3/libsqlite3-0_3.46.1-7+deb13u2_riscv64.deb",
+      "sha256": "a878475db5df8361879060e65bfc7bc7ac7fa0e44635ac2107cf5bd7e497e330",
+      "bytes": 907260
+    },
+    {
+      "name": "libssl3t64",
+      "version": "3.5.7-1~deb13u2",
+      "architecture": "riscv64",
+      "source": "openssl",
+      "source_version": "3.5.7-1~deb13u2",
+      "url": "https://deb.debian.org/debian/pool/main/o/openssl/libssl3t64_3.5.7-1~deb13u2_riscv64.deb",
+      "sha256": "af87d01b79d4ff71e7d46a53341cbb480a4a72b58679d50bc8dff392ceaef154",
+      "bytes": 2235764
+    },
+    {
+      "name": "libsystemd0",
+      "version": "257.13-1~deb13u1",
+      "architecture": "riscv64",
+      "source": "systemd",
+      "source_version": "257.13-1~deb13u1",
+      "url": "https://deb.debian.org/debian/pool/main/s/systemd/libsystemd0_257.13-1~deb13u1_riscv64.deb",
+      "sha256": "2bd0bcb8e0e2d6996ede77fdb39893de9f8acaeb79d6701b2890a1a50fab644c",
+      "bytes": 470844
+    },
+    {
+      "name": "libtasn1-6",
+      "version": "4.20.0-2+deb13u1",
+      "architecture": "riscv64",
+      "source": "libtasn1-6",
+      "source_version": "4.20.0-2+deb13u1",
+      "url": "https://deb.debian.org/debian/pool/main/libt/libtasn1-6/libtasn1-6_4.20.0-2+deb13u1_riscv64.deb",
+      "sha256": "588d3be1be14a9ccf40cb2f257429840e689798cfc4a85300b9a673ed77439c1",
+      "bytes": 50644
+    },
+    {
+      "name": "libtinfo6",
+      "version": "6.5+20250216-2",
+      "architecture": "riscv64",
+      "source": "ncurses",
+      "source_version": "6.5+20250216-2",
+      "url": "https://deb.debian.org/debian/pool/main/n/ncurses/libtinfo6_6.5+20250216-2_riscv64.deb",
+      "sha256": "9b902c0d5a1561c2e721fb90128281c9957ae6e37817acba2547aba91ff104ea",
+      "bytes": 347128
+    },
+    {
+      "name": "libudev1",
+      "version": "257.13-1~deb13u1",
+      "architecture": "riscv64",
+      "source": "systemd",
+      "source_version": "257.13-1~deb13u1",
+      "url": "https://deb.debian.org/debian/pool/main/s/systemd/libudev1_257.13-1~deb13u1_riscv64.deb",
+      "sha256": "20e69815e1c80172b98e0d2a2db7de4f2fc4af7bc9186f651b2226ccd16748d2",
+      "bytes": 154440
+    },
+    {
+      "name": "libunistring5",
+      "version": "1.3-2",
+      "architecture": "riscv64",
+      "source": "libunistring",
+      "source_version": "1.3-2",
+      "url": "https://deb.debian.org/debian/pool/main/libu/libunistring/libunistring5_1.3-2_riscv64.deb",
+      "sha256": "8075f64a8589ae75d1400625b004f615aac3cd4bd0447680b505dd905e4f5062",
+      "bytes": 474260
+    },
+    {
+      "name": "liburing2",
+      "version": "2.9-1",
+      "architecture": "riscv64",
+      "source": "liburing",
+      "source_version": "2.9-1",
+      "url": "https://deb.debian.org/debian/pool/main/libu/liburing/liburing2_2.9-1_riscv64.deb",
+      "sha256": "77290ae3db74ff141d0522a1d7eb358a9a97a876dcb799f3579d797d6649097b",
+      "bytes": 26644
+    },
+    {
+      "name": "libusb-1.0-0",
+      "version": "2:1.0.28-1",
+      "architecture": "riscv64",
+      "source": "libusb-1.0",
+      "source_version": "2:1.0.28-1",
+      "url": "https://deb.debian.org/debian/pool/main/libu/libusb-1.0/libusb-1.0-0_1.0.28-1_riscv64.deb",
+      "sha256": "7311ef9eba34ef58964f87f0d0dc1e290750372cc1e08ec2013fc9b38dca048f",
+      "bytes": 59184
+    },
+    {
+      "name": "libusbredirparser1t64",
+      "version": "0.15.0-1",
+      "architecture": "riscv64",
+      "source": "usbredir",
+      "source_version": "0.15.0-1",
+      "url": "https://deb.debian.org/debian/pool/main/u/usbredir/libusbredirparser1t64_0.15.0-1_riscv64.deb",
+      "sha256": "8d6271883e452bf32e4426135ff8e89af16af42271036734efa643b02d1f5187",
+      "bytes": 19504
+    },
+    {
+      "name": "libvdeplug2t64",
+      "version": "4.0.1-5.1+b1",
+      "architecture": "riscv64",
+      "source": "vdeplug4",
+      "source_version": "4.0.1-5.1",
+      "url": "https://deb.debian.org/debian/pool/main/v/vdeplug4/libvdeplug2t64_4.0.1-5.1+b1_riscv64.deb",
+      "sha256": "7492263114bc697290a96168e46b70feb42e931b09c4f62cc23d1bb5c3b9a817",
+      "bytes": 28784
+    },
+    {
+      "name": "libzstd1",
+      "version": "1.5.7+dfsg-1",
+      "architecture": "riscv64",
+      "source": "libzstd",
+      "source_version": "1.5.7+dfsg-1",
+      "url": "https://deb.debian.org/debian/pool/main/libz/libzstd/libzstd1_1.5.7+dfsg-1_riscv64.deb",
+      "sha256": "5967f5f97bfb6e7a8036d4e615c0ecd6861a9bb686bd60ee0c81422581faf0ad",
+      "bytes": 360352
+    },
+    {
+      "name": "login.defs",
+      "version": "1:4.17.4-2",
+      "architecture": "all",
+      "source": "shadow",
+      "source_version": "1:4.17.4-2",
+      "url": "https://deb.debian.org/debian/pool/main/s/shadow/login.defs_4.17.4-2_all.deb",
+      "sha256": "b4bbb8242cbf5588de7aafeb9d578a3dee1db2891f444ab454fd30bd80ccf2b4",
+      "bytes": 186124
+    },
+    {
+      "name": "mawk",
+      "version": "1.3.4.20250131-1",
+      "architecture": "riscv64",
+      "source": "mawk",
+      "source_version": "1.3.4.20250131-1",
+      "url": "https://deb.debian.org/debian/pool/main/m/mawk/mawk_1.3.4.20250131-1_riscv64.deb",
+      "sha256": "5275d254ff25e335b1d3f9dd5356d3b2f49e7f5f6fcc11e56c5c0a3851ea1f29",
+      "bytes": 141928
+    },
+    {
+      "name": "opensbi",
+      "version": "1.6-1",
+      "architecture": "all",
+      "source": "opensbi",
+      "source_version": "1.6-1",
+      "url": "https://deb.debian.org/debian/pool/main/o/opensbi/opensbi_1.6-1_all.deb",
+      "sha256": "dc4a43bd21a0ca11771ed8b19ee6fa8476d1d0f4976bd0b27c0357c699d27e1e",
+      "bytes": 204072
+    },
+    {
+      "name": "openssl-provider-legacy",
+      "version": "3.5.7-1~deb13u2",
+      "architecture": "riscv64",
+      "source": "openssl",
+      "source_version": "3.5.7-1~deb13u2",
+      "url": "https://deb.debian.org/debian/pool/main/o/openssl/openssl-provider-legacy_3.5.7-1~deb13u2_riscv64.deb",
+      "sha256": "66420982a650137a3793a47be4b7ddf9a9f2bf6482c2ea7a194fd80511f62139",
+      "bytes": 317056
+    },
+    {
+      "name": "openssl",
+      "version": "3.5.7-1~deb13u2",
+      "architecture": "riscv64",
+      "source": "openssl",
+      "source_version": "3.5.7-1~deb13u2",
+      "url": "https://deb.debian.org/debian/pool/main/o/openssl/openssl_3.5.7-1~deb13u2_riscv64.deb",
+      "sha256": "9e2e1bcfcc33584c73438a1d37575d1a34ca82648d7a78bd118b51ca4999078e",
+      "bytes": 1488056
+    },
+    {
+      "name": "passwd",
+      "version": "1:4.17.4-2",
+      "architecture": "riscv64",
+      "source": "shadow",
+      "source_version": "1:4.17.4-2",
+      "url": "https://deb.debian.org/debian/pool/main/s/shadow/passwd_4.17.4-2_riscv64.deb",
+      "sha256": "b9c5159c2a734797b0e039036057954202c81f291e7caa6938b76279cbf399f2",
+      "bytes": 1228100
+    },
+    {
+      "name": "qemu-system-common",
+      "version": "1:10.0.13+ds-0+deb13u1",
+      "architecture": "riscv64",
+      "source": "qemu",
+      "source_version": "1:10.0.13+ds-0+deb13u1",
+      "url": "https://deb.debian.org/debian/pool/main/q/qemu/qemu-system-common_10.0.13+ds-0+deb13u1_riscv64.deb",
+      "sha256": "e64c64194c5ae8e93cd722e2bf4a7f89ab27d3d5a2f9cdeb7ceb2c4f553316dc",
+      "bytes": 907804
+    },
+    {
+      "name": "qemu-system-data",
+      "version": "1:10.0.13+ds-0+deb13u1",
+      "architecture": "all",
+      "source": "qemu",
+      "source_version": "1:10.0.13+ds-0+deb13u1",
+      "url": "https://deb.debian.org/debian/pool/main/q/qemu/qemu-system-data_10.0.13+ds-0+deb13u1_all.deb",
+      "sha256": "a0e03c526cc09d4c2ab20aa19a8c12e916cdc49a170acb16a6563c28f70eafd3",
+      "bytes": 2144176
+    },
+    {
+      "name": "qemu-system-riscv",
+      "version": "1:10.0.13+ds-0+deb13u1",
+      "architecture": "riscv64",
+      "source": "qemu",
+      "source_version": "1:10.0.13+ds-0+deb13u1",
+      "url": "https://deb.debian.org/debian/pool/main/q/qemu/qemu-system-riscv_10.0.13+ds-0+deb13u1_riscv64.deb",
+      "sha256": "62d786a1fbc6f8ca0d59ec5a929987fb0c769e2341d421d76785fdc3d240461e",
+      "bytes": 7704964
+    },
+    {
+      "name": "zlib1g",
+      "version": "1:1.3.dfsg+really1.3.1-1+b1",
+      "architecture": "riscv64",
+      "source": "zlib",
+      "source_version": "1:1.3.dfsg+really1.3.1-1",
+      "url": "https://deb.debian.org/debian/pool/main/z/zlib/zlib1g_1.3.dfsg+really1.3.1-1+b1_riscv64.deb",
+      "sha256": "38c52eef58e5fc9b13d93f8a7d0a0549c32b4f00402a778d39a135254f554314",
+      "bytes": 85664
+    }
+  ]
+}

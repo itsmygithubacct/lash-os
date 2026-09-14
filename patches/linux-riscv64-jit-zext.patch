@@ -1,0 +1,16 @@
+RV64 already emits zero-extension instructions when verifier_zext is false.
+Use that conservative JIT path to avoid the verifier's repeated array expansion
+while loading large Capsule programs. Verification and CMPXCHG fixups remain
+enabled. RV32 keeps its existing behavior.
+
+--- a/arch/riscv/net/bpf_jit_core.c
++++ b/arch/riscv/net/bpf_jit_core.c
+@@ -38,7 +38,7 @@
+ 
+ bool bpf_jit_needs_zext(void)
+ {
+-	return true;
++	return IS_ENABLED(CONFIG_32BIT);
+ }
+ 
+ struct bpf_prog *bpf_int_jit_compile(struct bpf_prog *prog)

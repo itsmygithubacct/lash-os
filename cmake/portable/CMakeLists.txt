@@ -12,7 +12,10 @@ endif()
 
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(LIBBPF REQUIRED libbpf>=1.4.0)
-add_compile_options(-O2 -Wall -Wextra -march=x86-64 -mtune=generic)
+add_compile_options(-O2 -Wall -Wextra)
+if(CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64")
+    add_compile_options(-march=x86-64 -mtune=generic)
+endif()
 add_link_options(-static -no-pie)
 include_directories("${LINUX_BASH_ROOT}/include" "${CAPSULE_INCLUDE_DIRECTORY}")
 
@@ -22,6 +25,8 @@ add_executable(linux-bash-os
     "${LINUX_BASH_ROOT}/src/host.c"
     "${LINUX_BASH_ROOT}/src/sandbox_host.c"
     "${LINUX_BASH_ROOT}/vendor/capsule-host/bpf_capsule_host.c")
+file(STRINGS "${LINUX_BASH_ROOT}/VERSION" LASHOS_VERSION LIMIT_COUNT 1)
+target_compile_definitions(linux-bash-os PRIVATE LASHOS_VERSION="${LASHOS_VERSION}")
 target_include_directories(linux-bash-os PRIVATE
     "${BASH_SKELETON_DIRECTORY}" ${LIBBPF_STATIC_INCLUDE_DIRS})
 target_compile_options(linux-bash-os PRIVATE ${LIBBPF_STATIC_CFLAGS_OTHER})
@@ -32,9 +37,9 @@ add_executable(sandbox-init "${LINUX_BASH_ROOT}/src/sandbox_init.c")
 
 include(CTest)
 if(BUILD_TESTING)
-    foreach(test queued-signals poll inherited-fds)
+    foreach(test queued-signals poll inherited-fds syscall-abi)
         add_executable(${test}-test "${LINUX_BASH_ROOT}/tests/${test}.c")
-        target_compile_options(${test}-test PRIVATE -Wno-unused-function -Wno-unused-variable)
+        target_compile_options(${test}-test PRIVATE -UNDEBUG -Wno-unused-function -Wno-unused-variable)
         add_test(NAME ${test} COMMAND ${test}-test)
         set_tests_properties(${test} PROPERTIES TIMEOUT 5)
     endforeach()

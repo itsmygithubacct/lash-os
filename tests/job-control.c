@@ -17,7 +17,7 @@ static int terminal;
 static char transcript[65536];
 static size_t used;
 /* A full-profile child must verify its image before resuming Bash. */
-static const long long step_timeout_ms = 60000;
+static long long step_timeout_ms = 60000;
 static long long now_ms(void) {
     struct timespec t;
     clock_gettime(CLOCK_MONOTONIC, &t);
@@ -92,6 +92,15 @@ static int await_job_foreground(pid_t shell) {
 int main(int argc, char **argv) {
     if (argc != 2)
         return 2;
+    const char *timeout = getenv("LASHOS_TEST_STEP_TIMEOUT_MS");
+    if (timeout) {
+        char *end;
+        errno = 0;
+        long long value = strtoll(timeout, &end, 10);
+        if (errno || !*timeout || *end || value < 1000 || value > 1800000)
+            return 2;
+        step_timeout_ms = value;
+    }
     const char *prompt = geteuid() == 0 ? "# " : "$ ";
     int slave;
     if (openpty(&terminal, &slave, NULL, NULL, NULL)) {

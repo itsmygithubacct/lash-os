@@ -24,11 +24,12 @@ export PYTHONDONTWRITEBYTECODE := 1
 DEV := python3 -B scripts/dev.py
 GUEST_HEADERS := $(shell rg --files include vendor/musl-headers)
 PORT_SOURCES := $(wildcard src/* vendor/musl-c/* vendor/capsule-host/*)
-SDK_INPUTS := flake.nix flake.lock $(wildcard patches/*)
-BUILD_CONFIG := scripts/workspace.py CMakeLists.txt $(wildcard cmake/*.cmake)
+SDK_INPUTS := flake.nix flake.lock $(wildcard patches/capsule-*.patch)
+BUILD_CONFIG := scripts/workspace.py CMakeLists.txt $(wildcard VERSION cmake/*.cmake)
 BASH_SOURCE_INPUTS := $(shell python3 -B scripts/source_tree.py list vendor/bash-os)
 HOST_TEST_INPUTS := $(wildcard tests/*.c) tests/source-tree.py tests/workspace.py scripts/source_tree.py
-PORTABLE_INPUTS := $(wildcard cmake/portable/*) scripts/build-portable.py scripts/elf_dependencies.py scripts/dev.py
+PORTABLE_INPUTS := $(wildcard cmake/portable/*) scripts/build-portable.py scripts/elf_dependencies.py scripts/dev.py $(wildcard VERSION)
+KERNEL_JOBS ?= 4
 
 .PHONY: build full pure portable bundle prepare bitcode run demo verify paths test-workspace test-vm test-host test-processes test-portable test-portable-processes test-mount-cwd test-portable-mount-cwd test-sandbox test-mlkem test-sha1dc clean
 build full: $(OUT)/full/linux-bash-os
@@ -38,6 +39,15 @@ build full: $(OUT)/full/linux-bash-os
 	mv -f $(OUT)/bash.bpf.o.tmp $(OUT)/bash.bpf.o
 pure: $(OUT)/pure/linux-bash-os
 portable: $(OUT)/portable/linux-bash-os
+.PHONY: portable-all portable-x86_64 portable-aarch64 portable-riscv64 release-candidates
+release-candidates: portable-all
+	$(DEV) python3 -B scripts/package-release.py
+portable-all: portable-x86_64 portable-aarch64 portable-riscv64
+portable-x86_64 portable-aarch64 portable-riscv64: portable-%: $(BUILD)/kernel-full/linux-bash-os
+	$(DEV) python3 -B scripts/prepare-runtime.py --arch $*
+	$(DEV) python3 -B scripts/build-kernel.py --arch $* --jobs $(KERNEL_JOBS)
+	$(DEV) --shell $(if $(filter x86_64,$*),portable,portable-$*) python3 -B scripts/build-portable.py --arch $*
+	$(DEV) python3 -B scripts/build-sandbox.py --arch $*
 prepare: $(BUILD)/native-full.stamp
 bitcode: $(BUILD)/full-bitcode.stamp
 
@@ -62,7 +72,7 @@ $(BUILD)/portable/linux-bash-os $(BUILD)/portable/sandbox-init &: $(BUILD)/kerne
 	$(DEV) --shell portable python3 -B scripts/build-portable.py
 	touch $(BUILD)/portable/linux-bash-os $(BUILD)/portable/sandbox-init
 
-$(OUT)/full/linux-bash-os $(OUT)/portable/linux-bash-os &: $(BUILD)/kernel-full/linux-bash-os $(BUILD)/portable/linux-bash-os $(BUILD)/portable/sandbox-init scripts/build-sandbox.py config/os-release $(LOCAL_CONFIG)
+$(OUT)/full/linux-bash-os $(OUT)/portable/linux-bash-os &: $(BUILD)/kernel-full/linux-bash-os $(BUILD)/portable/linux-bash-os $(BUILD)/portable/sandbox-init scripts/build-sandbox.py $(wildcard scripts/runtime.py) config/os-release $(LOCAL_CONFIG)
 	python3 -B scripts/build-sandbox.py
 
 bundle: $(BUILD)/kernel-full/linux-bash-os $(BUILD)/portable/linux-bash-os $(BUILD)/portable/sandbox-init

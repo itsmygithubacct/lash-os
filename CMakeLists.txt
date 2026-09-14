@@ -45,19 +45,21 @@ bpf_capsule_object(bash_bpf OUTPUT bash.bpf.o
     INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/include/guest" "${CMAKE_CURRENT_SOURCE_DIR}/include"
     COMPILE_OPTIONS -g -D_GNU_SOURCE -idirafter "${CMAKE_CURRENT_SOURCE_DIR}/vendor/musl-headers"
     LINK_OPTIONS -mcpu=v4 --memory=arena --managed-atomics --allocator-lock=atomic
-                 --inline-limit=${LINUX_BASH_INLINE_LIMIT} --native-shift63 --disable-ldsx --freplace --fiber-stack=${LINUX_BASH_FIBER_STACK}
+                 --inline-limit=${LINUX_BASH_INLINE_LIMIT} --disable-ldsx --freplace --fiber-stack=${LINUX_BASH_FIBER_STACK}
                  ${linux_bash_codegen_options} ${capsule_diagnostics})
 bpf_capsule_skeleton(bash_skeleton OUTPUT bash.skel.h OBJECT "${bash_bpf}" NAME bash)
 add_executable(linux-bash-os src/host.c src/sandbox_host.c vendor/capsule-host/bpf_capsule_host.c)
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" LASHOS_VERSION LIMIT_COUNT 1)
+target_compile_definitions(linux-bash-os PRIVATE LASHOS_VERSION="${LASHOS_VERSION}")
 target_include_directories(linux-bash-os PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_compile_options(linux-bash-os PRIVATE -Wall -Wextra)
 target_link_libraries(linux-bash-os PRIVATE BpfCapsule::host bash_skeleton zstd)
 include(CTest)
 if(BUILD_TESTING)
-    foreach(test queued-signals poll inherited-fds)
+    foreach(test queued-signals poll inherited-fds syscall-abi)
         add_executable(${test}-test tests/${test}.c)
         target_include_directories(${test}-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
-        target_compile_options(${test}-test PRIVATE -Wall -Wextra -Wno-unused-function -Wno-unused-variable)
+        target_compile_options(${test}-test PRIVATE -UNDEBUG -Wall -Wextra -Wno-unused-function -Wno-unused-variable)
         target_link_libraries(${test}-test PRIVATE BpfCapsule::host)
         add_test(NAME ${test} COMMAND ${test}-test)
         set_tests_properties(${test} PROPERTIES TIMEOUT 5)

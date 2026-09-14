@@ -7,7 +7,6 @@
   in {
     devShells = forSystems (system: let
       pkgs = nixpkgs.legacyPackages.${system};
-      musl = pkgs.pkgsCross.musl64;
       sdk = capsule.packages.${system}.default.overrideAttrs (old: {
         patches = (old.patches or []) ++ [
           ./patches/capsule-post-optimization-soft-float.patch
@@ -21,12 +20,36 @@
           ./patches/capsule-large-block-continuations.patch
         ];
       });
+      portableShell = profile: target: let
+        musl = {
+          x86_64 = pkgs.pkgsCross.musl64;
+          aarch64 = pkgs.pkgsCross.aarch64-multiplatform-musl;
+          riscv64 = pkgs.pkgsCross.riscv64-musl;
+        }.${target};
+        portableElf = musl.elfutils.override { enableDebuginfod = false; };
+        portableBpf = musl.libbpf.override { elfutils = portableElf; };
+      in
+        (pkgs.mkShell.override { stdenv = musl.stdenv; }) {
+          nativeBuildInputs = with pkgs; [ cmake gnumake pkg-config python3 binutils ]
+            ++ lib.optionals (system != target + "-linux") [ qemu ];
+          # These musl packages provide archives as well as shared libraries.
+          # The portable loader links their archives with -static.
+          buildInputs = with musl; [
+            portableBpf portableElf
+            zlib zlib.static (zstd.override { static = true; })
+          ];
+          CAPSULE_SDK = "${sdk}";
+          PORTABLE_CC = "${musl.stdenv.cc}/bin/${musl.stdenv.cc.targetPrefix}cc";
+          LINUX_BASH_DEV_SHELL = profile;
+          LASHOS_TARGET_ARCH = target;
+        };
     in {
       default = pkgs.mkShell {
         packages = with pkgs; [
           sdk cmake gnumake pkg-config bpftools libbpf elfutils zlib zstd pcre2 xz bzip2 ncurses
-          python3 bison patch git curl binutils llvmPackages_23.libllvm
+          python3 bison flex bc pahole openssl.dev patch git curl binutils dpkg qemu llvmPackages_23.libllvm
           llvmPackages_23.clang-unwrapped llvmPackages_23.clang-tools
+          llvmPackages_23.lld
         ];
         BZIP2_INCLUDE = "${pkgs.bzip2.dev}/include";
         LINUX_HEADERS = "${pkgs.linuxHeaders}/include";
@@ -34,18 +57,9 @@
         CMAKE_PREFIX_PATH = "${sdk}";
         LINUX_BASH_DEV_SHELL = "default";
       };
-      portable = assert system == "x86_64-linux";
-        (pkgs.mkShell.override { stdenv = musl.stdenv; }) {
-          nativeBuildInputs = with pkgs; [ cmake gnumake pkg-config python3 binutils ];
-          # These musl packages provide archives as well as shared libraries.
-          # The portable loader links their archives with -static.
-          buildInputs = with musl; [
-            libbpf elfutils zlib zlib.static (zstd.override { static = true; })
-          ];
-          CAPSULE_SDK = "${sdk}";
-          PORTABLE_CC = "${musl.stdenv.cc}/bin/${musl.stdenv.cc.targetPrefix}cc";
-          LINUX_BASH_DEV_SHELL = "portable";
-        };
+      portable = portableShell "portable" "x86_64";
+      portable-aarch64 = portableShell "portable-aarch64" "aarch64";
+      portable-riscv64 = portableShell "portable-riscv64" "riscv64";
     });
   };
 }

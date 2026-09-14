@@ -5,13 +5,28 @@ the Linux POSIX process ABI. All 279 selected bash-os builtins are included in
 the build; their existing source-level feature subsets still apply. Runtime
 verification covers the cases in `tests/`, not every option of every builtin.
 
-Hosted launches default to a bundled x86_64 KVM VM. The portable executable
+Hosted launches default to a bundled KVM VM matching the executable's x86_64,
+ARM64 or RISC-V64 architecture. The portable executable
 includes its Linux kernel, userspace, QEMU and runtime libraries. The regular
 outer loader still uses its Nix libraries. Sandbox mode requires KVM access,
 Landlock ABI 6, and an executable temporary filesystem; it does not require
 BPF privileges on the host. Missing isolation facilities fail startup.
 `--host` selects direct execution explicitly; a trusted installed lash-os OS
 identity selects it automatically. See [README.md](README.md) for mode selection.
+
+Cross-architecture guest tests use full-system emulation and execute real eBPF
+inside the target Linux kernel. They do not validate KVM or host confinement on
+physical ARM64 or RISC-V64 machines. The ARM64 arena JIT requires LSE atomics;
+the LL/SC fallback cannot handle arena atomic operations. The RISC-V arena JIT requires Zacas for
+compare-and-exchange atomics; older RISC-V CPUs without that extension cannot
+run this image. KVM must expose the required atomic extension to the guest.
+The pinned ARM64 guest uses 4 KiB pages.
+The RISC-V kernel build omits optional BTF global-variable records because the
+pinned toolchain emits overlapping per-CPU offsets. BTF types, function
+prototypes, kfunc metadata and kernel verification remain enabled.
+Its RV64 JIT emits zero-extension operations directly, avoiding the verifier's
+costly instruction-array expansion on large programs. Its JIT address window
+is expanded to 1 GiB for the image and process snapshots. See [patches/README.md](patches/README.md).
 
 Sandbox mode shares the launch folder read/write as `/home`, uses a temporary
 guest root, and enables outbound NAT without inbound forwards. Internet, LAN,
@@ -53,6 +68,13 @@ native glibc inside the kernel. It translates open/at flags, error numbers,
 clocks, signals and structures where the ABIs differ. Locale is C; the default
 libc local-time implementation is UTC. Some `sysconf`, path-configuration,
 signal-info, ioctl and SysV IPC variants remain limited.
+
+Raw syscall requests carry stable guest identifiers. The host maps its supported
+calls to native syscall numbers after validating pointers and descriptors;
+unknown identifiers return unsupported. Native seccomp profiles still need the
+destination kernel's syscall ABI. The ptrace bridge exposes the x86 register
+layout only on x86_64; architecture-specific register sets are not translated
+for ARM64 or RISC-V64.
 
 Direct `/dev/fd/N`, `/proc/self/fd/N`, and standard stream paths use Bash's
 logical descriptor table. Other `/proc` views describe the native loader;

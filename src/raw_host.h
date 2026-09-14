@@ -36,10 +36,12 @@ static int64_t service_raw(struct bridge_host *h, struct posix_request *request)
     }
     if (request->operation == PX_PTRACE) {
         switch (a[0]) {
+#if defined(__x86_64__)
         case PTRACE_GETREGS:
             if (!memory(h, a[3], sizeof(struct user_regs_struct)))
                 return -1;
             break;
+#endif
         case PTRACE_GETEVENTMSG:
             if (!memory(h, a[3], sizeof(unsigned long)))
                 return -1;
@@ -66,7 +68,12 @@ static int64_t service_raw(struct bridge_host *h, struct posix_request *request)
     uint64_t *in = memory(h, a[0], 7 * sizeof(uint64_t));
     if (!in)
         return -1;
-    uint64_t n = in[0], v[6];
+    long n = native_syscall_number(in[0]);
+    if (n < 0) {
+        errno = ENOTSUP;
+        return -1;
+    }
+    uint64_t v[6];
     memcpy(v, in + 1, sizeof(v));
     switch (n) {
     case SYS_getrandom:

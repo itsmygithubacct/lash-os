@@ -1,5 +1,6 @@
 #pragma once
-/* x86_64 Linux syscall identifiers; calls are marshalled by the bridge. */
+/* Stable guest wire identifiers based on x86-64 Linux. The host bridge maps
+ * supported calls to its native syscall numbers after validating arguments. */
 #define __NR_read				0
 #define __NR_write				1
 #define __NR_open				2

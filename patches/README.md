@@ -1,5 +1,6 @@
 The SDK remains pinned to the revision in SOURCE.json. The Nix derivation
-applies the patches below locally.
+applies the Capsule patches below locally. The runtime kernel recipe applies
+the separately described Linux patches to its pinned source.
 
 GNU awk's aggregate initialization exposed a compiler ordering issue: LLVM O2
 materialized a `store double 0.0` from a constant aggregate after Capsule's
@@ -92,3 +93,20 @@ It moves oversized DNS and service-manager automatic arrays to the managed
 heap. Each allocation uses Bash's unwind frames for normal-return and nonlocal
 exit cleanup. This preserves Capsule's existing 2 MiB fiber-stack limit and
 the reserve used for compiler-generated spills.
+
+`linux-riscv64-jit-zext.patch` selects the RV64 JIT's existing conservative
+zero-extension path. The verifier's optional sub-register optimization inserts
+instructions one at a time and repeatedly shifts large instruction arrays;
+this made loading the full image prohibitively slow under RISC-V emulation.
+With `verifier_zext` false, the RV64 JIT emits the required zero extensions
+itself. RV32 behavior and the verifier's CMPXCHG fixups remain unchanged. The
+upstream `lib/test_bpf` suite exercises arithmetic, jumps, loads, stores and
+atomics, including both zero-extension paths. The matching test module can be
+built and run with the architecture harness documented in [TESTING.md](../docs/TESTING.md).
+
+`linux-riscv64-jit-region.patch` expands RV64's BPF JIT address window from
+128 MiB to 1 GiB for the full image and process snapshots. This stays within
+the existing module area and the JIT's signed 32-bit relative-call reach of
+the pinned kernel. It reserves virtual address space; physical pages are
+allocated on demand. Allocation accounting, memory protections, verification
+and the RV32 limit remain unchanged.

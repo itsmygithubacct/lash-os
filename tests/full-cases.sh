@@ -91,24 +91,6 @@ printf 'hello\n' >&"${worker[1]}"
 read -r response <&"${worker[0]}"
 printf '%s\n' "$response"
 wait "$worker_pid_saved"
-# The HTTP peer is an isolated VM-local test fixture.
-printf 'local-http-ok\n' > index.html
-/bin/busybox httpd -f -p 127.0.0.1:18999 -h . &
-server=$!
-trap 'kill "$server" 2>/dev/null || :; wait "$server" 2>/dev/null || :' EXIT
-# A kernel Bash child verifies its image before executing the HTTP fixture.
-for ((attempt=0;attempt<600;attempt++)); do
-    if curl -fsS http://127.0.0.1:18999/ > response 2>curl-error; then break; fi
-    sleep 0.1
-done
-cmp index.html response
-printf 'HTTP loopback: yes\n'
-post_dns=$(curl -fsS http://localhost:18999/ > child-response && printf 'fork after name lookup')
-[[ $post_dns == 'fork after name lookup' ]]
-cmp index.html child-response
-printf '%s\n' "$post_dns"
-kill "$server"
-wait "$server" 2>/dev/null || :
-trap - EXIT
-rm -r input.json type-result data message renamed data.zst restored bundle.tar extract state.db index.html response child-response curl-error
+source /network-cases.sh
+rm -r input.json type-result data message renamed data.zst restored bundle.tar extract state.db
 printf 'FULL_CASES_PASSED\n'

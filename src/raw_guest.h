@@ -1,3 +1,7 @@
+#include "linux_bash_syscalls.h"
+#define LASH_CHECK_SYSCALL(name, number) _Static_assert(SYS_##name == number, "Guest syscall ABI drift");
+LINUX_BASH_SYSCALLS(LASH_CHECK_SYSCALL)
+#undef LASH_CHECK_SYSCALL
 long linux_bash_syscall(long number, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e,
                         uint64_t f) {
     if (number == SYS_statx) {
