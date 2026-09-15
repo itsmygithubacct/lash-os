@@ -5,6 +5,13 @@ the Linux POSIX process ABI. All 279 selected bash-os builtins are included in
 the build; their existing source-level feature subsets still apply. Runtime
 verification covers the cases in `tests/`, not every option of every builtin.
 
+For 0.1.0, x86_64 is the primary tested target; ARM64 and RISC-V64 are experimental.
+The production sandbox suite passed on x86_64. ARM64 passed native guest process,
+network and terminal job cases, but still needs production sandbox validation
+on a host supporting Landlock ABI 6. RISC-V64 passed emulated kernel/JIT and
+guest smoke checks; native KVM, production host confinement, and complete
+process/job tests remain unverified. See the [release notes](docs/releases/0.1.0.md).
+
 Hosted launches default to a bundled KVM VM matching the executable's x86_64,
 ARM64 or RISC-V64 architecture. The portable executable
 includes its Linux kernel, userspace, QEMU and runtime libraries. The regular

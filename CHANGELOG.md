@@ -16,5 +16,8 @@
 
 This is an experimental release. Native plugins and worker threads remain
 deferred. KVM and Landlock ABI 6 are required for hosted launches. ARM64 requires
-LSE atomics, and RISC-V requires Zacas. See [COMPATIBILITY.md](COMPATIBILITY.md) and the test
-reports accompanying a build for the supported and tested boundaries.
+LSE atomics, and RISC-V requires Zacas. x86_64 is the primary tested target;
+ARM64 and RISC-V64 builds are explicitly experimental. Exact dependency sources,
+patches and build recipes accompany the executables. See
+[COMPATIBILITY.md](COMPATIBILITY.md) and the [release notes](docs/releases/0.1.0.md)
+for the supported and tested boundaries.

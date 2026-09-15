@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Collect the three verified build outputs and checksums as local release candidates."""
 import argparse
+import io
 import json
 import os
 from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import tarfile
 import sys
 sys.dont_write_bytecode = True
 from elf_dependencies import require_arch, require_static
@@ -26,7 +28,9 @@ def publish(source, destination):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.parse_args()
+    parser.add_argument("--with-sources", action="store_true",
+                        help="Require and include both corresponding-source archives and release notes")
+    args = parser.parse_args()
     version = (ROOT / "VERSION").read_text().strip()
     destination = OUT / "releases" / version
     destination.mkdir(parents=True, exist_ok=True)
@@ -50,7 +54,8 @@ def main():
         name = f"lashos-{version}-linux-{arch}"
         publish(binary, destination / name)
         publish(inventory, destination / (name + ".json"))
-        assets.append({"architecture": arch, "file": name, "bytes": binary.stat().st_size,
+        assets.append({"architecture": arch, "status": "primary" if arch == "x86_64" else "experimental",
+                       "file": name, "bytes": binary.stat().st_size,
                        "sha256": sha256, "bpf_sha256": manifest["bpf_sha256"]})
         sums += [f"{sha256}  {name}", f"{digest(inventory)}  {name}.json"]
     if len({asset["bpf_sha256"] for asset in assets}) != 1:
@@ -58,6 +63,33 @@ def main():
     revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
     dirty = bool(subprocess.check_output(["git", "status", "--porcelain"], cwd=ROOT))
     release = {"version": version, "source_revision": revision, "source_dirty": dirty, "assets": assets}
+    if args.with_sources:
+        if dirty:
+            raise ValueError("Commit source changes before collecting the complete public release")
+        project = destination / f"lashos-{version}-source.tar.zst"
+        dependency = destination / f"lashos-{version}-dependency-sources.tar.zst"
+        inventory = dependency.with_suffix(dependency.suffix + ".json")
+        packed_project = subprocess.check_output(["zstd", "-q", "-dc", str(project)])
+        with tarfile.open(fileobj=io.BytesIO(packed_project)) as archive:
+            if archive.pax_headers.get("comment") != revision:
+                raise ValueError("Project source archive does not match the release commit")
+        source_inventory = json.loads(inventory.read_text())
+        if source_inventory["sha256"] != digest(dependency):
+            raise ValueError("Dependency source archive differs from its inventory")
+        for arch in ARCHES:
+            recorded = next(e for e in source_inventory["manifest"]["files"]
+                            if e["archive_path"] == f"provenance/runtime/{arch}.json")
+            if recorded["sha256"] != digest(ROOT / "config/runtime" / (arch + ".json")):
+                raise ValueError(f"Dependency sources were collected for a different {arch} runtime")
+        notes = destination / "RELEASE_NOTES.md"
+        publish(ROOT / "docs/releases" / (version + ".md"), notes)
+        release["source_assets"] = []
+        for path in [project, dependency, inventory, notes]:
+            if path.stat().st_size >= 2 * 1024 ** 3:
+                raise ValueError(f"Asset exceeds GitHub's per-file limit: {path.name}")
+            sha256 = digest(path)
+            release["source_assets"].append({"file": path.name, "bytes": path.stat().st_size, "sha256": sha256})
+            sums.append(f"{sha256}  {path.name}")
     (destination / "release.json").write_text(json.dumps(release, indent=2) + "\n")
     sums.append(f"{digest(destination / 'release.json')}  release.json")
     (destination / "SHA256SUMS").write_text("\n".join(sums) + "\n")

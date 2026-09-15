@@ -1,4 +1,4 @@
-# lashos
+# lash-os
 
 GNU Bash 5.3.15 and the **279 builtins in bash-os's full profile**, compiled to
 eBPF with BPF Capsule. Bash parsing, expansion, evaluation, builtin algorithms,
@@ -8,7 +8,26 @@ loader handles requested operating-system calls and resumes the Bash fiber.
 The project vendors a pinned snapshot of [bash-os](https://github.com/itsmygithubacct/bash-os),
 recorded in [SOURCE.json](SOURCE.json). It follows the architecture described in
 [Doom in the Kernel, or fibers in eBPF](https://ayles.github.io/doom-in-kernel/)
-and uses [BPF Capsule](https://github.com/ayles/bpf-capsule). All required bash-os build inputs are included in this repository.
+and uses [BPF Capsule](https://github.com/ayles/bpf-capsule). The required vendored
+bash-os sources and build recipes are included here; pinned third-party archives
+are fetched into the external workspace.
+
+## Release 0.1.0
+
+Download a portable executable from the [v0.1.0 release](https://github.com/itsmygithubacct/lash-os/releases/tag/v0.1.0),
+verify it with the accompanying `SHA256SUMS`, then run it from the folder to share:
+
+```sh
+chmod +x lashos-0.1.0-linux-x86_64
+cp lashos-0.1.0-linux-x86_64 /path/to/my-folder/lash-os
+cd /path/to/my-folder
+./lash-os
+```
+
+x86_64 is the primary tested target. **ARM64 and RISC-V64 are experimental**;
+their remaining validation gaps are listed in the [release notes](docs/releases/0.1.0.md).
+All three hosted executables require KVM and Landlock ABI 6. The launch folder
+is writable inside the guest, and outbound networking is enabled by default.
 
 ## Workspace and local configuration
 
@@ -66,7 +85,7 @@ LASHOS_OUT="$(python3 -B scripts/workspace.py --get output)"
 "$LASHOS_OUT/linux-bash-os" script.sh arg1
 ```
 
-On another operating system, both published executables default to a bundled
+On another Linux system, the published executables default to a bundled
 KVM virtual machine. The directory you launch from becomes writable `/home`;
 Bash starts there with `HOME=/home`. The remaining guest filesystem is temporary.
 The VM has **2 virtual CPUs, 4 GiB RAM, and outbound networking by default**.
@@ -187,6 +206,11 @@ checked-in locks in [config/runtime](config/runtime).
 inventories and `SHA256SUMS` under `$LASHOS_OUT/releases/0.1.0/`. For existing
 builds, run `scripts/dev.py python3 -B scripts/package-release.py`. This collects
 local files; publishing a tagged release is a separate step.
+
+The release also provides project and dependency source archives. The dependency
+archive includes the exact Debian source packages, Nix source inputs and patches,
+kernel configuration, and build recipes for the bundled components. See
+[source distribution and rebuilding](docs/SOURCES.md).
 
 The adjacent `portable.json` is an optional inventory, not a runtime dependency.
 The regular executable in `$LASHOS_OUT/linux-bash-os` includes the same VM bundle but
