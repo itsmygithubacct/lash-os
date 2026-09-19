@@ -117,6 +117,16 @@ static void log_tail(void) {
     free(log);
 }
 static void socket_policy(void) {
+    if (getenv("LASHOS_TEST_EMULATED")) {
+        /* User-mode emulation cannot install seccomp filters for the target;
+         * check that each program is well formed instead of its behavior. */
+        for (int network = 0; network <= 1; network++) {
+            struct sock_filter program[SB_FILTER_MAX];
+            size_t n = socket_filter(network, program);
+            assert(n > 4 && n <= SB_FILTER_MAX && BPF_CLASS(program[n - 1].code) == BPF_RET);
+        }
+        return;
+    }
     for (int network = 0; network <= 1; network++) {
         pid_t pid = fork();
         assert(pid >= 0);

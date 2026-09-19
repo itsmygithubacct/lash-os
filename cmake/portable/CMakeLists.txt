@@ -52,6 +52,11 @@ if(BUILD_TESTING)
     target_link_libraries(sandbox-test PRIVATE zstd)
     add_test(NAME sandbox COMMAND sandbox-test)
     set_tests_properties(sandbox PROPERTIES TIMEOUT 5)
+    # User-mode emulation cannot install seccomp filters for the target; the
+    # test then checks the filter program but not its installed behavior.
+    if(CMAKE_CROSSCOMPILING_EMULATOR)
+        set_tests_properties(sandbox PROPERTIES ENVIRONMENT LASHOS_TEST_EMULATED=1)
+    endif()
     add_test(NAME source-tree COMMAND ${Python3_EXECUTABLE} "${LINUX_BASH_ROOT}/tests/source-tree.py")
     add_test(NAME workspace COMMAND ${Python3_EXECUTABLE} -B "${LINUX_BASH_ROOT}/tests/workspace.py")
     add_executable(job-control-test "${LINUX_BASH_ROOT}/tests/job-control.c")
