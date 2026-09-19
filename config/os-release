@@ -1,5 +1,5 @@
 NAME="Linux Bash OS"
 ID=linux-bash-os
 PRETTY_NAME="Linux Bash OS (lash-os)"
-VERSION_ID="0.1.0"
-VERSION="0.1.0"
+VERSION_ID="0.1.1"
+VERSION="0.1.1"
