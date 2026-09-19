@@ -41,6 +41,30 @@ def words(value):
     return value if isinstance(value, list) else shlex.split(value or "")
 
 
+def portable_profile(arch):
+    return "portable" if arch == "x86_64" else "portable-" + arch
+
+
+def cmake_roots(build):
+    """Return the Nix roots linked into one portable loader build, and its SDK root."""
+    cache = {}
+    for line in (build / "CMakeCache.txt").read_text().splitlines():
+        match = re.match(r"([^:#/][^:]*):[^=]+=(.*)", line)
+        if match:
+            cache[match[1]] = match[2]
+    paths = {store_root(p) for p in cache["LIBBPF_STATIC_LIBRARY_DIRS"].split(";")}
+    compiler = Path(store_root(cache["CMAKE_C_COMPILER"]))
+    for name in ["orig-libc", "orig-cc"]:
+        paths.add((compiler / "nix-support" / name).read_text().strip())
+    sdk = store_root(cache["CAPSULE_INCLUDE_DIRECTORY"])
+    paths.add(sdk)
+    return sorted(paths), sdk
+
+
+def architecture_roots():
+    return {arch: cmake_roots(BUILD / portable_profile(arch))[0] for arch in ARCHES}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.parse_args()
@@ -77,20 +101,9 @@ def main():
         return recipes[path]
 
     for arch in ARCHES:
-        profile = "portable" if arch == "x86_64" else "portable-" + arch
-        cache = {}
-        for line in (BUILD / profile / "CMakeCache.txt").read_text().splitlines():
-            match = re.match(r"([^:#/][^:]*):[^=]+=(.*)", line)
-            if match:
-                cache[match[1]] = match[2]
-        paths = {store_root(p) for p in cache["LIBBPF_STATIC_LIBRARY_DIRS"].split(";")}
-        compiler = Path(store_root(cache["CMAKE_C_COMPILER"]))
-        for name in ["orig-libc", "orig-cc"]:
-            paths.add((compiler / "nix-support" / name).read_text().strip())
-        sdk = store_root(cache["CAPSULE_INCLUDE_DIRECTORY"])
-        paths.add(sdk)
-        roots[arch] = sorted(paths)
-        for path in sorted(paths):
+        paths, sdk = cmake_roots(BUILD / portable_profile(arch))
+        roots[arch] = paths
+        for path in paths:
             entry = recipe(path, arch + " " + Path(path).name[33:])
             env = dict(entry["recipe"]["env"])
             env.update(json.loads(env.get("__json", "{}")))

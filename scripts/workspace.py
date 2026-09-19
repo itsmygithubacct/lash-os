@@ -5,10 +5,80 @@ import json
 import os
 from pathlib import Path
 import shutil
+import subprocess
 import sys
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
+BUILD_MARKER = ".lashos-build"
+WORK_MARKER = ".lashos-test-work"
+# Characters Make and the recipe shells handle without quoting or escaping.
+MAKE_SAFE = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_./-+@")
+# Entries only a lashos build creates, for trees made before the marker existed.
+LEGACY_BUILD_ENTRIES = ["native-full.stamp", "native.stamp", "full-bitcode.stamp", "bitcode.stamp",
+                        "deps.stamp", "kernel-full/CMakeCache.txt", "portable/portable.json"]
+
+
+def make_safe(text):
+    return all(c in MAKE_SAFE for c in str(text))
+
+
+def git(root, *arguments, data=None):
+    return subprocess.run(["git", *arguments], cwd=root, input=data, capture_output=True, check=True).stdout
+
+
+def committed_blob(root, revision, path):
+    try:
+        return git(root, "rev-parse", "--verify", "--quiet", f"{revision}:{path}").decode().strip()
+    except subprocess.CalledProcessError:
+        return None
+
+
+def source_state(root=ROOT):
+    """Record the checkout revision and the content of every uncommitted path at build time."""
+    try:
+        revision = git(root, "rev-parse", "HEAD").decode().strip()
+        fields = git(root, "status", "--porcelain=v1", "-z", "--untracked-files=all").split(b"\0")
+        changed, index = {}, 0
+        while index < len(fields) and fields[index]:
+            record = os.fsdecode(fields[index])
+            index += 1
+            paths = [record[3:]]
+            if record[0] in "RC" or record[1] in "RC":
+                paths.append(os.fsdecode(fields[index]))
+                index += 1
+            for path in paths:
+                file = Path(root) / path
+                if file.is_symlink():
+                    changed[path] = git(root, "hash-object", "--stdin", data=os.fsencode(os.readlink(file))).decode().strip()
+                elif file.is_file():
+                    changed[path] = git(root, "hash-object", "--", path).decode().strip()
+                else:
+                    changed[path] = None
+    except (OSError, subprocess.CalledProcessError):
+        return {"revision": None, "changed": None}
+    return {"revision": revision, "changed": changed}
+
+
+def documentation(path):
+    return path.endswith(".md") or path.startswith("docs/")
+
+
+def source_differences(state, revision, root=ROOT):
+    """List non-documentation paths whose content at build time differs from a commit."""
+    if not isinstance(state, dict) or not state.get("revision") or not isinstance(state.get("changed"), dict):
+        return ["<build source was not recorded>"]
+    changed = state["changed"]
+    try:
+        names = git(root, "diff", "--name-only", "-z", "--no-renames", state["revision"], revision).split(b"\0")
+    except (OSError, subprocess.CalledProcessError):
+        return [f"<unknown build revision {state['revision']}>"]
+    differences = []
+    for path in sorted(set(changed) | {os.fsdecode(name) for name in names if name}):
+        expected = changed[path] if path in changed else committed_blob(root, state["revision"], path)
+        if expected != committed_blob(root, revision, path) and not documentation(path):
+            differences.append(path)
+    return differences
 
 
 def settings(environment=None, home=None, source=ROOT):
@@ -69,6 +139,55 @@ def prepare_cmake(directory, source):
     print(f"Archived relocated CMake metadata in {archive}")
 
 
+def recognized_build(build):
+    build = Path(build)
+    return (build / BUILD_MARKER).is_file() or any((build / name).exists() for name in LEGACY_BUILD_ENTRIES)
+
+
+def protected_paths(paths):
+    return [p for p in [Path.home().resolve(), ROOT, paths["research"], paths["output"], paths["downloads"],
+                        paths["reports"], paths["config"].parent, paths["source_cache"]] if p is not None]
+
+
+def mark_build(paths):
+    """Create or adopt the build directory, refusing unrelated existing data."""
+    build = paths["build"]
+    if build == Path("/") or any(p == build or p.is_relative_to(build) for p in protected_paths(paths)):
+        raise ValueError(f"The build directory contains source, configuration, or preserved data: {build}")
+    build.mkdir(parents=True, exist_ok=True)
+    if not recognized_build(build) and any(build.iterdir()):
+        raise ValueError(f"{build} is not empty and is not a lashos build tree; choose another build directory")
+    (build / BUILD_MARKER).touch()
+
+
+def clean_build(paths):
+    build = paths["build"]
+    # Avoid broad deletion if a local setting points at a parent directory.
+    if build == Path("/") or any(p == build or p.is_relative_to(build) for p in protected_paths(paths)):
+        raise ValueError(f"Refusing to clean a directory containing source, configuration, or preserved data: {build}")
+    if build.is_dir() and any(build.iterdir()) and not recognized_build(build):
+        raise ValueError(f"Refusing to clean {build}: it is not recognizably a lashos build tree")
+    if build.exists():
+        shutil.rmtree(build)
+
+
+def prepare_work(path, paths=None):
+    """Return a dedicated harness work directory whose fixed subfolders may be replaced."""
+    paths = PATHS if paths is None else paths
+    work = Path(path).expanduser().resolve()
+    protected = protected_paths(paths) + [paths["build"]]
+    if (work == Path("/") or work.is_relative_to(ROOT) or
+            any(p == work or p.is_relative_to(work) for p in protected)):
+        raise ValueError(f"Refusing to use {work} as a test work directory")
+    work.mkdir(parents=True, exist_ok=True)
+    previous = ["result.json", "console.log", "boot.log", "initramfs", "initramfs.cpio.gz"]
+    if (not (work / WORK_MARKER).is_file() and any(work.iterdir()) and
+            not any((work / name).exists() for name in previous)):
+        raise ValueError(f"{work} is not empty and is not a lashos test work directory")
+    (work / WORK_MARKER).touch()
+    return work
+
+
 try:
     PATHS = settings()
 except (OSError, ValueError) as error:
@@ -87,22 +206,26 @@ def main():
     action.add_argument("--make-path", choices=["config", "build", "output", "downloads", "reports"])
     action.add_argument("--prepare-cmake", nargs=2, metavar=("BUILD", "SOURCE"), help="Archive stale CMake metadata after moving a checkout or build")
     action.add_argument("--clean", action="store_true", help="Remove the configured build directory, retaining output, downloads and reports")
+    action.add_argument("--mark-build", action="store_true", help="Create or adopt the configured build directory")
     args = parser.parse_args()
     if args.clean:
-        # Avoid broad deletion if a local setting points at a parent directory.
-        forbidden = [Path.home(), ROOT, RESEARCH, OUT, DOWNLOADS, REPORTS, PATHS["config"].parent]
-        if BUILD == Path("/") or any(p == BUILD or p.is_relative_to(BUILD) for p in forbidden):
-            parser.error(f"Refusing to clean a directory containing source, configuration, or preserved data: {BUILD}")
-        if BUILD.exists():
-            shutil.rmtree(BUILD)
+        try:
+            clean_build(PATHS)
+        except ValueError as error:
+            parser.error(str(error))
         print(f"Cleaned {BUILD}; output, downloads and reports retained")
+    elif args.mark_build:
+        try:
+            mark_build(PATHS)
+        except ValueError as error:
+            parser.error(str(error))
     elif args.prepare_cmake:
         prepare_cmake(*args.prepare_cmake)
     elif args.make_path:
         value = str(PATHS[args.make_path])
         # Make's prerequisite syntax cannot safely represent arbitrary path text.
-        if any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_./-" for c in value):
-            parser.error("Make output paths must contain only letters, digits, underscore, dash, dot and slash")
+        if not make_safe(value):
+            parser.error("Make output paths must contain only letters, digits, underscore, dash, dot, slash, plus and at signs")
         print(value)
     elif args.get:
         if PATHS[args.get] is not None:

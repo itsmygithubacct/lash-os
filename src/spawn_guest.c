@@ -135,9 +135,12 @@ int posix_spawn(pid_t *result, const char *path, const posix_spawn_file_actions_
                 goto failed;
             if ((a->flags & POSIX_SPAWN_RESETIDS) && (setgid(getgid()) || setuid(getuid())))
                 goto failed;
+            /* Like glibc, skip signals that cannot be caught and the two
+             * realtime signals reserved by the C library. */
             if (a->flags & POSIX_SPAWN_SETSIGDEF)
                 for (int i = 1; i < 65; i++)
-                    if (sigismember(&a->defaults, i) == 1 && signal(i, SIG_DFL) == SIG_ERR)
+                    if (i != SIGKILL && i != SIGSTOP && i != 32 && i != 33 &&
+                        sigismember(&a->defaults, i) == 1 && signal(i, SIG_DFL) == SIG_ERR)
                         goto failed;
             if ((a->flags & POSIX_SPAWN_SETSIGMASK) && sigprocmask(SIG_SETMASK, &a->mask, NULL))
                 goto failed;
@@ -148,7 +151,12 @@ int posix_spawn(pid_t *result, const char *path, const posix_spawn_file_actions_
                     errno = ENOTSUP;
                     goto failed;
                 }
-                if (a->type == 1 && dup2(a->fd, a->other) < 0)
+                /* POSIX: duplicating a descriptor onto itself clears FD_CLOEXEC. */
+                if (a->type == 1 && a->fd == a->other) {
+                    int flags = fcntl(a->fd, F_GETFD);
+                    if (flags < 0 || fcntl(a->fd, F_SETFD, flags & ~FD_CLOEXEC) < 0)
+                        goto failed;
+                } else if (a->type == 1 && dup2(a->fd, a->other) < 0)
                     goto failed;
                 if (a->type == 2) {
                     int f = open(a->path, a->flags, a->mode);

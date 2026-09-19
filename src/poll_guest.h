@@ -5,7 +5,12 @@ int ppoll(struct pollfd *fds, nfds_t count, const struct timespec *timeout, cons
         return -1;
     }
     int64_t ns = timeout ? (int64_t)timeout->tv_sec * 1000000000 + timeout->tv_nsec : -1;
-    sigset_t previous = guest_signal_mask;
+    sigset_t previous = guest_signal_mask, effective;
+    /* Signals held by a running handler must not interrupt the host wait. */
+    if (dispatch_blocked) {
+        effective = (mask ? *mask : guest_signal_mask) | dispatch_blocked;
+        mask = &effective;
+    }
     if (mask)
         guest_signal_mask = *mask;
     control.args[3] = mask ? (uintptr_t)mask : 0;

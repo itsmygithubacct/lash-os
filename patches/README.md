@@ -110,3 +110,18 @@ the existing module area and the JIT's signed 32-bit relative-call reach of
 the pinned kernel. It reserves virtual address space; physical pages are
 allocated on demand. Allocation accounting, memory protections, verification
 and the RV32 limit remain unchanged.
+
+`linux-vmalloc-inline-purge.patch` makes `__purge_vmap_area_lazy()` purge lazily
+freed vmap areas inline. Upstream queues `purge_vmap_node()` helpers on the
+system workqueue and waits for them in `flush_work()` while `vmap_purge_lock` is
+held. `bpf_prog_pack_free()` reaches that path through `vfree()` of an emptied
+JIT pack while holding `pack_mutex`, from `bpf_prog_free_deferred()` on the same
+workqueue. A forked shell loads a fresh full image and an exiting child frees
+hundreds of programs, so every worker ahead of the helper can block on
+`pack_mutex`, after which program loading and freeing stop. Captured guest
+stacks showed one events worker in `__flush_work` under `bpf_prog_pack_free`,
+dozens of workers and the forked shell waiting for `pack_mutex`, idle CPUs, and
+no memory reclaim. The same deadlock is reported as Debian bug 1146730. Inline
+purging gives up parallel purging across vmap nodes; lock order, TLB flushing
+and area accounting are unchanged. The patch applies to all three runtime
+kernels. Host kernels used by direct mode keep the upstream behavior.

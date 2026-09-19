@@ -3,18 +3,61 @@
 import sys
 sys.dont_write_bytecode = True
 import concurrent.futures
-import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import shutil
 import subprocess
 import tarfile
-import urllib.request
+import tempfile
+from runtime import digest, fetch
 from workspace import ROOT, BUILD, DOWNLOADS, PATHS, prepare_cmake
 WORK = BUILD / 'deps'
 PACKAGES = json.loads((ROOT / 'vendor/bash-os/config/dependencies.json').read_text())
+
+
+def verified_archive(spec):
+    """Return a checksum-verified archive; corrupt or partial files are replaced."""
+    archive_name = spec['url'].rsplit('/', 1)[1]
+    archive = DOWNLOADS / 'deps' / archive_name
+    if archive.is_file() and digest(archive) == spec['sha256']:
+        return archive
+    archive.unlink(missing_ok=True)
+    cache = PATHS['source_cache'] / 'deps' / archive_name if PATHS['source_cache'] else None
+    if cache and cache.is_file():
+        partial = archive.with_name(archive.name + '.partial')
+        try:
+            shutil.copyfile(cache, partial)
+            if digest(partial) == spec['sha256']:
+                partial.replace(archive)
+                return archive
+            print(f'Ignoring source cache with a different checksum: {cache}', flush=True)
+        finally:
+            partial.unlink(missing_ok=True)
+    return fetch(spec['url'], spec['sha256'], archive)
+
+
+def extracted_source(name, spec, archive):
+    """Extract once per archive checksum, so version changes never reuse an old tree."""
+    sources = WORK / 'source'
+    source = sources / f"{name}-{spec['sha256'][:16]}"
+    if not source.is_dir():
+        (WORK / 'extract').mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix=name + '-', dir=WORK / 'extract') as temporary:
+            with tarfile.open(archive) as bundle:
+                bundle.extractall(temporary, filter='data')
+            children = list(Path(temporary).iterdir())
+            if len(children) != 1 or not children[0].is_dir():
+                raise SystemExit(f'{name}: unexpected archive layout')
+            sources.mkdir(parents=True, exist_ok=True)
+            children[0].rename(source)
+    for stale in sources.iterdir():
+        if stale != source and (stale.name == name or re.fullmatch(re.escape(name) + r'-[0-9a-f]{16}', stale.name)):
+            shutil.rmtree(stale)
+    return source
+
 
 def main():
     WORK.mkdir(parents=True, exist_ok=True)
@@ -24,25 +67,8 @@ def main():
     if not compiler or not ar: raise SystemExit('run inside scripts/dev.py')
     commands=[]
     for name, spec in PACKAGES.items():
-        source = WORK / 'source' / name
-        archive_name = spec['url'].rsplit('/', 1)[1]
-        archive = DOWNLOADS / 'deps' / archive_name
-        if not archive.exists():
-            cache = (PATHS['source_cache'] or DOWNLOADS) / 'deps' / archive_name
-            if cache.exists(): shutil.copyfile(cache, archive)
-            else:
-                with urllib.request.urlopen(spec['url'], timeout=60) as response:
-                    archive.write_bytes(response.read())
-        if hashlib.sha256(archive.read_bytes()).hexdigest() != spec['sha256']:
-            raise SystemExit(f'{name}: archive checksum mismatch')
-        if not source.exists():
-            temporary = WORK / 'extract' / name
-            temporary.mkdir(parents=True, exist_ok=True)
-            with tarfile.open(archive) as bundle: bundle.extractall(temporary, filter='data')
-            children = list(temporary.iterdir())
-            if len(children)!=1 or not children[0].is_dir(): raise SystemExit('unexpected archive')
-            source.parent.mkdir(exist_ok=True)
-            children[0].rename(source)
+        source = extracted_source(name, spec, verified_archive(spec))
+        shutil.rmtree(WORK / 'bitcode' / name, ignore_errors=True)
         build=WORK/'native-config'/name
         build.mkdir(parents=True,exist_ok=True)
         if name=='bzip2':
@@ -80,6 +106,9 @@ def main():
         name,src,flags=item
         obj=WORK/'bitcode'/name/(src.stem+'.bc');obj.parent.mkdir(parents=True,exist_ok=True)
         command=[compiler,'-c','-g','-D_GNU_SOURCE','-D__linux__=1','-D__unix__=1',
+                 # The build machine's directories must not reach __FILE__ or debug records.
+                 f'-ffile-prefix-map={WORK}=/lashos/deps', f'-ffile-prefix-map={ROOT}=/lashos/source',
+                 '-fdebug-compilation-dir=/lashos',
                  '-I'+str(ROOT/'include/guest'),'-idirafter',str(ROOT/'vendor/musl-headers'),
                  '-idirafter',os.environ['LINUX_HEADERS'],*flags,str(src),'-o',str(obj)]
         result=subprocess.run(command,capture_output=True,text=True)

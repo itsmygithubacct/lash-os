@@ -18,7 +18,7 @@ import tempfile
 from elf_dependencies import inspect, require_static, require_arch
 from runtime import ARCHES, rooted
 
-from workspace import ROOT, BUILD, OUT, PATHS
+from workspace import ROOT, BUILD, DOWNLOADS, OUT, PATHS, source_state
 MAGIC = b"LASHOS-VM-v1".ljust(16, b"\0")
 
 
@@ -53,8 +53,17 @@ def newc(stage):
         archive.extend(b"\0" * (-len(archive) % 4))
 
     for path in sorted(stage.rglob("*")):
-        data = os.readlink(path).encode() if path.is_symlink() else path.read_bytes() if path.is_file() else b""
-        entry(str(path.relative_to(stage)), path.lstat().st_mode, data)
+        # Normalize permissions so the archive does not depend on the builder's umask.
+        info = path.lstat()
+        if stat.S_ISLNK(info.st_mode):
+            mode, data = stat.S_IFLNK | 0o777, os.readlink(path).encode()
+        elif stat.S_ISDIR(info.st_mode):
+            mode, data = stat.S_IFDIR | (0o1777 if info.st_mode & stat.S_ISVTX else 0o755), b""
+        elif stat.S_ISREG(info.st_mode):
+            mode, data = stat.S_IFREG | (0o755 if info.st_mode & 0o111 else 0o644), path.read_bytes()
+        else:
+            raise ValueError(f"Unsupported initramfs entry type: {path}")
+        entry(str(path.relative_to(stage)), mode, data)
     entry("dev/console", stat.S_IFCHR | 0o600, major=5, minor=1)
     entry("TRAILER!!!", 0)
     return archive
@@ -149,10 +158,21 @@ def main():
                 command = [str(interpreter), "--library-path", str(sysroot / "usr/lib" / ARCHES[arch]["triplet"]), *command]
         return subprocess.check_output(command, text=True)
 
+    def label(source):
+        # Published inventories name inputs without the maintainer's local directories.
+        source = Path(source)
+        if sysroot and source.is_relative_to(sysroot):
+            return str(source.relative_to(sysroot))
+        for base, name in [(BUILD, "build"), (DOWNLOADS, "downloads"), (ROOT, "source")]:
+            if source.is_relative_to(base):
+                return name + "/" + str(source.relative_to(base))
+        if str(source).startswith(("/usr/", "/lib", "/boot/", "/etc/", "/nix/store/")):
+            return str(source)
+        return "local/" + source.name
+
     def record(source):
         source = Path(source)
-        label = str(source.relative_to(sysroot)) if sysroot and source.is_relative_to(sysroot) else str(source)
-        inventory.append({"source": label, "sha256": digest(source), "bytes": source.stat().st_size})
+        inventory.append({"source": label(source), "sha256": digest(source), "bytes": source.stat().st_size})
         if str(source).startswith(("/usr/", "/lib", "/boot/")):
             query = subprocess.run(["dpkg-query", "-S", str(source)], text=True, capture_output=True)
             if query.returncode:
@@ -325,7 +345,9 @@ def main():
                 shutil.copy2(source, bundle / "licenses" / source.name)
         manifest = {
             "format": "LASHOS-VM-v1", "architecture": arch + "-linux",
-            "kernel": kernel_manifest or str(args.kernel), "qemu_version": qemu_version,
+            "runtime": "pinned" if args.arch else "build-host",
+            "kernel": kernel_manifest or label(args.kernel), "qemu_version": qemu_version,
+            "build_source": source_state(), "loader_build_source": base_manifest.get("build_source"),
             "bpf_sha256": digest(bpf_image),
             "guest_loader_sha256": digest(raw), "guest_init_sha256": digest(init),
             "default_memory_mib": 4096, "default_cpus": 2, "default_network": "user",
@@ -348,11 +370,13 @@ def main():
             output.write(bytes(16))
         compressed = work / "bundle.zst"
         subprocess.run(["zstd", "-q", "-f", "-6", "--check", str(archive), "-o", str(compressed)], check=True)
-        profiles = [(profile, raw)] if args.arch else [("full", BUILD / 'kernel-full/linux-bash-os'), ("portable", raw)]
-        for profile, base in profiles:
+        # Pinned bundles publish to portable*/; the build-host runtime has its own
+        # output so it can never replace a pinned x86_64 release candidate.
+        outputs = [(profile, raw)] if args.arch else [("full", BUILD / 'kernel-full/linux-bash-os'), ("portable-host", raw)]
+        for name, base in outputs:
             if bpf_image.read_bytes() not in base.read_bytes():
-                raise ValueError(f"The {profile} loader embeds a different BPF image; rebuild before bundling")
-            destination = work / (profile + "-linux-bash-os")
+                raise ValueError(f"The {name} loader embeds a different BPF image; rebuild before bundling")
+            destination = work / (name + "-linux-bash-os")
             with destination.open("wb") as output, base.open("rb") as original, compressed.open("rb") as packed:
                 shutil.copyfileobj(original, output)
                 offset = output.tell()
@@ -362,13 +386,13 @@ def main():
             profile_manifest = dict(manifest, loader_sha256=digest(destination), bytes=destination.stat().st_size,
                                     base_loader_sha256=digest(base), bundle_sha256=digest(compressed),
                                     elf=inspect(destination))
-            if profile.startswith("portable"):
+            if name.startswith("portable"):
                 require_static(destination)
-            manifest_path = work / (profile + ".json")
+            manifest_path = work / (name + ".json")
             manifest_path.write_text(json.dumps(profile_manifest, indent=2) + "\n")
-            publish(destination, OUT / profile / "linux-bash-os")
-            publish(manifest_path, OUT / profile / ("portable.json" if profile.startswith("portable") else "sandbox.json"))
-            print(f"Bundled {profile} executable: {destination.stat().st_size:,} bytes", flush=True)
+            publish(destination, OUT / name / "linux-bash-os")
+            publish(manifest_path, OUT / name / ("portable.json" if name.startswith("portable") else "sandbox.json"))
+            print(f"Bundled {name} executable: {destination.stat().st_size:,} bytes", flush=True)
         publish(bpf_image, OUT / (profile if args.arch else "full") / 'bash.bpf.o')
 
 

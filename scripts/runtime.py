@@ -13,6 +13,11 @@ ARCHES = {
 }
 
 
+# Linux patches applied to the pinned runtime kernel for every architecture.
+KERNEL_PATCHES = ["linux-riscv64-jit-zext.patch", "linux-riscv64-jit-region.patch",
+                  "linux-vmalloc-inline-purge.patch"]
+
+
 def digest(path):
     result = hashlib.sha256()
     with Path(path).open("rb") as stream:

@@ -1,23 +1,39 @@
 /* Linux signals are collected by the bridge and dispatched as managed calls. */
 static struct sigaction guest_actions[128];
 static sigset_t guest_signal_mask;
+/* Signals held while guest handlers run: the handler's own signal unless
+ * SA_NODEFER, plus sa_mask. Native delivery keeps being recorded, so a held
+ * signal is dispatched after its handler returns. */
+static sigset_t dispatch_blocked;
+
+/* Called before every guest longjmp. Handlers normally return; when one jumps
+ * out (as Bash's wait and read -t handlers do), its guard must not survive. */
+void linux_bash_signal_longjmp(void) {
+    dispatch_blocked = 0;
+}
 
 void linux_bash_poll_signals(void) {
     int saved_errno = errno;
-    uint64_t ready = control.pending_signals & ~(uint64_t)guest_signal_mask;
     for (unsigned number = 1; number <= 64; number++) {
         uint64_t bit = UINT64_C(1) << (number - 1);
-        if (!(ready & bit))
+        /* Recheck each signal: an earlier handler may have changed the masks. */
+        if (!(control.pending_signals & ~(uint64_t)(guest_signal_mask | dispatch_blocked) & bit))
             continue;
         control.pending_signals &= ~bit;
         struct sigaction action = guest_actions[number];
-        if (action.sa_handler != SIG_DFL && action.sa_handler != SIG_IGN) {
-            if (action.sa_flags & SA_SIGINFO) {
-                siginfo_t info = {.si_signo = (int)number, .si_code = SI_USER};
-                action.sa_sigaction(number, &info, NULL);
-            } else
-                action.sa_handler(number);
-        }
+        if (action.sa_handler == SIG_DFL || action.sa_handler == SIG_IGN)
+            continue;
+        /* Linux already reset the native disposition when it delivered the signal. */
+        if (action.sa_flags & SA_RESETHAND)
+            guest_actions[number].sa_handler = SIG_DFL;
+        sigset_t previous = dispatch_blocked;
+        dispatch_blocked |= action.sa_mask | ((action.sa_flags & SA_NODEFER) ? 0 : bit);
+        if (action.sa_flags & SA_SIGINFO) {
+            siginfo_t info = {.si_signo = (int)number, .si_code = SI_USER};
+            action.sa_sigaction(number, &info, NULL);
+        } else
+            action.sa_handler(number);
+        dispatch_blocked = previous;
     }
     errno = saved_errno;
 }
@@ -88,8 +104,10 @@ int sigpending(sigset_t *set) {
 }
 int sigsuspend(const sigset_t *set) {
     sigset_t previous = guest_signal_mask;
-    guest_signal_mask = *set;
-    int rc = bridge(BR_SIGSUSPEND, *set, 0, 0);
+    /* A signal held by a running handler cannot be dispatched here; waking for
+     * it would only repeat the wait. */
+    guest_signal_mask = *set | dispatch_blocked;
+    int rc = bridge(BR_SIGSUSPEND, guest_signal_mask, 0, 0);
     guest_signal_mask = previous;
     return rc;
 }

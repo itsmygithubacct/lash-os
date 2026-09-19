@@ -89,6 +89,11 @@ def dependency_archive(destination, version):
     if not nix_manifest.is_file():
         raise SystemExit("Run scripts/collect-nix-sources.py after building all three portable loaders")
     nix = json.loads(nix_manifest.read_text())
+    nix_tools = runpy.run_path(str(ROOT / "scripts/collect-nix-sources.py"))
+    # An inventory from an earlier toolchain would ship sources for different binaries.
+    if nix.get("architecture_roots") != nix_tools["architecture_roots"]():
+        raise SystemExit("The Nix source inventory does not match the current portable builds; "
+                         "rerun scripts/collect-nix-sources.py")
     # The public manifest contains archive-relative names and immutable Nix
     # paths, never the maintainer's local download or build directories.
     manifest = {"version": version,
@@ -101,7 +106,6 @@ def dependency_archive(destination, version):
         if previous["manifest"] == manifest and previous["sha256"] == digest(destination):
             print("Verified existing dependency source archive:", destination)
             return
-    nix_tools = runpy.run_path(str(ROOT / "scripts/collect-nix-sources.py"))
     nix_tools["run"](["nix-store", "--verify-path", *[s["store_path"] for s in nix["sources"]]])
     descriptor, temporary = tempfile.mkstemp(prefix=".sources-", suffix=".tar.zst", dir=destination.parent)
     os.close(descriptor)

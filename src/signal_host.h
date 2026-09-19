@@ -7,6 +7,10 @@ static int native_signal(int number) {
 static int guest_signal(int number) {
     return number >= 0 && number <= 64 ? number : 0;
 }
+/* Validate the full 64-bit argument before narrowing it to a signal number. */
+static int bridge_signal_number(uint64_t value) {
+    return value <= 64 ? native_signal((int)value) : -1;
+}
 static void unpack_signal_mask(uint64_t packed, sigset_t *set) {
     sigemptyset(set);
     for (int i = 1; i <= 64; i++) {

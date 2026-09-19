@@ -6,15 +6,15 @@ in that workspace, outside the release Git tree.
 
 | Command | Coverage |
 | --- | --- |
-| `make test-workspace` | Local configuration precedence, external output paths, safe cleanup, relocated CMake metadata, source refresh and Make dependencies |
-| `make test-host` | Signals, polling, inherited descriptors, launcher policies and workspace tests with the regular host libc |
+| `make test-workspace` | Local configuration precedence, external output paths, safe cleanup of recognizable build trees, dedicated harness work directories, relocated CMake metadata, source refresh, rejection of overlapping source trees and untrackable input names, Make dependencies including compiler changes, release provenance checks, and deterministic initramfs metadata |
+| `make test-host` | Signals, polling, inherited descriptors, guest ABI conversions (flag translation, wire records and bounds), launcher policies, sandbox argument, mount reachability, socket filter and log-tail logic, and workspace tests with the regular host libc |
 | `make test-vm` or `make verify` | Native/kernel shell parity, registration of 279 builtins, representative builtin behavior and terminal job control |
 | `make test-processes` | Fork state, resolver allocations, descriptor cleanup and recovery after failed execution |
 | `make test-portable` | Static musl host tests and full direct-mode VM tests with `/nix` removed |
 | `make test-portable-processes` | Process regressions with the portable loader |
 | `make test-mount-cwd` | Direct-mode working-directory mounts inside a dedicated VM |
 | `make test-portable-mount-cwd` | The same mount checks with the portable loader |
-| `make test-sandbox` | The copied, renamed portable executable: shared `/home`, persistence, processes, networking, offline mode, stream transport, terminal jobs, startup policy and cleanup |
+| `make test-sandbox` | The copied, renamed build-host portable executable from `portable-host/`: shared `/home`, persistence, processes, networking, offline mode, stream transport, terminal jobs, startup policy and cleanup |
 | `make test-mlkem` | Deterministic ML-KEM key generation, encapsulation and decapsulation across native and kernel code |
 | `make test-sha1dc` | SHA-1 padding vectors and collision-check continuation behavior |
 | `python3 -B tests/reachability-equivalence.py` | Compiler reachability transformation equivalence |
@@ -52,12 +52,41 @@ BusyBox, `script`, and a C compiler. They run without host disks, networking or
 shared directories. Their installed OS identity selects direct kernel execution.
 The full suite uses 8 GiB RAM, while the smaller compiler regressions use 2 GiB.
 Use `scripts/test-vm.py --help` for explicit kernel, build, report and memory paths.
+Harnesses replace fixed subdirectories of their `--work` directory, so they
+accept only a new or empty directory, a previous report directory, or one they
+marked; they refuse `/`, the home directory, the checkout and directories
+containing the research workspace.
+These suites boot the host's system QEMU unless `LASHOS_QEMU` selects another.
+Direct-mode full-suite runs can intermittently hang in the guest kernel at
+fork-heavy cases such as the first pipeline after command substitution or a
+background `wait`. This is a Linux deadlock rather than a shell failure: a
+worker freeing BPF programs holds `pack_mutex` in `bpf_prog_pack_free()` while
+its `vfree()` waits in `__purge_vmap_area_lazy()` for purge work queued on the
+same system workqueue, and every worker ahead of that work blocks on
+`pack_mutex`. Forked shells load a fresh full image and exiting children free
+hundreds of programs, which makes that backlog likely. The guest reports blocked
+workers and a blocked `kernel-bash`, and the harness stops the VM at its
+timeout. It has been seen with QEMU 10.0.11 and 10.0.13 and in an earlier
+development build, with memory available and no reclaim involved; reruns
+passed. Rerun a suite that hangs this way. See Debian bug 1146730.
 
 The sandbox suite uses the bundled VM and shares its temporary test directory
 at `/home`. It needs the same host KVM, Landlock and temporary-filesystem support
 as an ordinary portable launch. Networking checks use a local HTTP fixture
 through the guest's outbound NAT and an HTTP/DNS request to `example.com`;
-offline tests remove the network adapter.
+offline tests remove the network adapter. It also checks that `-- --version`
+reaches GNU Bash through both the outer and guest loaders and that early Bash
+version output and invalid-option diagnostics reach stdout and stderr.
+It confirms that a guest exit status of 125 prints no VM diagnostics, that the
+caller's shared stdin and terminal stay blocking, that QEMU carries the launcher's
+seccomp filter beneath its own, and that `SIGTSTP` returns the terminal while
+`SIGCONT` restores raw mode. On slower machines,
+`python3 -B scripts/test-sandbox.py --timeout 900` allows more time for shell
+cases that verify several copies of the full image; VM startup, detached-job and
+terminal waits use a fifth of that value, at least 90 seconds. The script tests
+`portable-host/` by default; pass `--binary "$LASHOS_OUT/portable/linux-bash-os"`
+for the pinned release artifact. Timed-out shell cases stop the VM first and then
+retain their partial stdout and stderr in the report directory.
 
 These tests establish behavior for their individual cases. Builtin registration
 does not establish support for every command option. Optional native plugins

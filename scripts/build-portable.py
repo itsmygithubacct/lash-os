@@ -14,7 +14,7 @@ import tempfile
 
 from elf_dependencies import require_static, require_arch
 
-from workspace import ROOT, BUILD, prepare_cmake
+from workspace import ROOT, BUILD, prepare_cmake, source_state
 
 
 def digest(path):
@@ -81,6 +81,8 @@ def main():
         "architecture": args.arch + "-linux", "libc": "musl", "compiler_target": target,
         "loader_sha256": digest(binary), "bpf_sha256": hashlib.sha256(embedded).hexdigest(),
         "bytes": binary.stat().st_size, "elf": dependencies,
+        # Release packaging compares this with the published source revision.
+        "build_source": source_state(),
     }
     (build / "portable.json").write_text(json.dumps(manifest, indent=2) + "\n")
     require_static(build / "sandbox-init")

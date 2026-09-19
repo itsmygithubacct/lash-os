@@ -12,20 +12,20 @@ and uses [BPF Capsule](https://github.com/ayles/bpf-capsule). The required vendo
 bash-os sources and build recipes are included here; pinned third-party archives
 are fetched into the external workspace.
 
-## Release 0.1.0
+## Release 0.1.1
 
-Download a portable executable from the [v0.1.0 release](https://github.com/itsmygithubacct/lash-os/releases/tag/v0.1.0),
+Download a portable executable from the [v0.1.1 release](https://github.com/itsmygithubacct/lash-os/releases/tag/v0.1.1),
 verify it with the accompanying `SHA256SUMS`, then run it from the folder to share:
 
 ```sh
-chmod +x lashos-0.1.0-linux-x86_64
-cp lashos-0.1.0-linux-x86_64 /path/to/my-folder/lash-os
+chmod +x lashos-0.1.1-linux-x86_64
+cp lashos-0.1.1-linux-x86_64 /path/to/my-folder/lash-os
 cd /path/to/my-folder
 ./lash-os
 ```
 
 x86_64 is the primary tested target. **ARM64 and RISC-V64 are experimental**;
-their remaining validation gaps are listed in the [release notes](docs/releases/0.1.0.md).
+their remaining validation gaps are listed in the [release notes](docs/releases/0.1.1.md).
 All three hosted executables require KVM and Landlock ABI 6. The launch folder
 is writable inside the guest, and outbound networking is enabled by default.
 
@@ -66,7 +66,8 @@ precedence: `LASHOS_RESEARCH_DIR`, `LASHOS_BUILD_DIR`, `LASHOS_OUTPUT_DIR`,
 `LASHOS_KERNEL`, `LASHOS_MODULES` and `LASHOS_QEMU`. Use distinct external
 workspaces when building multiple checkouts concurrently. Output directories
 must stay outside the checkout, and Make paths must contain only letters,
-digits, underscores, dots, slashes and dashes.
+digits, underscores, dots, slashes, dashes, plus signs and at signs. `make clean`
+removes only a recognizable lashos build tree.
 
 Editing the local JSON causes the next build to repack the VM bundle. Use
 `make bundle` to explicitly repack after changing environment overrides or
@@ -94,7 +95,8 @@ Run as an ordinary user with access to `/dev/kvm`. Use the binary matching the
 host CPU: x86_64, ARM64 (`aarch64`), or RISC-V64 (`riscv64`). The host needs Linux
 with hardware virtualization, KVM, and Landlock ABI 6 (normally Linux 6.12 or
 later with Landlock enabled). It needs an executable temporary filesystem at
-`/tmp` or `/var/tmp` outside the exported folder. Missing requirements stop
+`/tmp` or `/var/tmp` that the exported folder cannot reach, including through
+bind mounts. Missing requirements stop
 startup. There is no automatic fallback to direct host execution or software
 CPU emulation. For compatibility with earlier commands, `sudo` is accepted when its invoking
 UID and GID match a nonroot passwd entry; the launcher drops to that account
@@ -118,11 +120,17 @@ The launcher starts QEMU without host root privileges or Linux capabilities,
 sets `no_new_privs`, enables [QEMU's seccomp restrictions](https://www.qemu.org/docs/master/system/security.html),
 and applies [Landlock](https://docs.kernel.org/userspace-api/landlock.html)
 rules for the exported folder, private runtime, KVM device, and required system
-information. It exports no host disks or other directories. The guest has its
+information. A launcher seccomp filter also stops QEMU from creating UNIX or
+netlink sockets, and from creating IP sockets with `--sandbox-network=none`.
+It exports no host disks or other directories. The guest has its
 own kernel and process tree; BPF-loading privileges remain inside that VM.
 The VM and its jobs end when the main shell exits. Private runtime files are
-removed on normal exit and handled termination signals. A host crash or
-`SIGKILL` can leave a private `lash-os-*` temporary directory behind.
+removed on normal exit and on handled termination signals, including during
+startup. The caller's standard stream flags are never changed, and `SIGTSTP`
+returns the terminal while the launcher is stopped. A host crash or `SIGKILL`
+can leave a private `lash-os-*` temporary directory, and raw terminal mode,
+behind. VM console and QEMU diagnostics are kept only as bounded in-memory tails
+and printed when the launcher itself fails.
 
 The build uses Nix, pinned LLVM/Capsule sources, and checksum-verified GNU Bash
 and library downloads. Building the VM bundle additionally uses the build
@@ -149,13 +157,13 @@ The verifier remains enabled, and the runtime requires no custom kernel module.
 ```sh
 make portable
 LASHOS_OUT="$(python3 -B scripts/workspace.py --get output)"
-cp "$LASHOS_OUT/portable/linux-bash-os" /path/to/my-folder/lash-os
+cp "$LASHOS_OUT/portable-host/linux-bash-os" /path/to/my-folder/lash-os
 cd /path/to/my-folder
 ./lash-os
 ./lash-os ./script.sh arg1
 ```
 
-`$LASHOS_OUT/portable/linux-bash-os` is a single x86_64 Linux executable. It
+`$LASHOS_OUT/portable-host/linux-bash-os` is a single x86_64 Linux executable. It
 statically links the outer loader with musl, libbpf, libelf, zlib and
 zstd, and includes the VM runtime, its library closure and firmware, Linux,
 and the guest filesystem. The guest contains the same full eBPF Bash image,
@@ -197,13 +205,16 @@ validated on each destination architecture; emulated guest tests alone do not
 establish those properties.
 
 The original `make portable` target still bundles the configured x86_64 build
-host kernel and runtime. Use `make portable-x86_64` for the pinned release runtime.
+host kernel and runtime. It publishes to `$LASHOS_OUT/portable-host/` so it never
+replaces the pinned `portable/` artifact, and it needs an x86_64 build machine;
+elsewhere Make stops immediately and points at the `portable-ARCH` targets.
+Use `make portable-x86_64` for the pinned release runtime.
 Maintainers refresh package locks with `scripts/prepare-runtime.py --arch ARCH
 --update-lock`, using authenticated Debian APT metadata; normal builds use the
 checked-in locks in [config/runtime](config/runtime).
 
 `make release-candidates` builds all three and collects versioned executables,
-inventories and `SHA256SUMS` under `$LASHOS_OUT/releases/0.1.0/`. For existing
+inventories and `SHA256SUMS` under `$LASHOS_OUT/releases/0.1.1/`. For existing
 builds, run `scripts/dev.py python3 -B scripts/package-release.py`. This collects
 local files; publishing a tagged release is a separate step.
 
@@ -225,7 +236,7 @@ and redirected streams use pipes; redirected streams do not retain seekability.
 
 ```sh
 make test-sandbox
-python3 -B scripts/elf_dependencies.py "$LASHOS_OUT/portable/linux-bash-os"
+python3 -B scripts/elf_dependencies.py "$LASHOS_OUT/portable-host/linux-bash-os"
 ```
 
 The sandbox suite copies and renames the actual portable artifact into a folder
@@ -251,8 +262,8 @@ These flags cannot be combined. Sandbox tuning options imply a VM and cannot
 be combined with `--host`.
 
 ```sh
-sudo "$LASHOS_OUT/portable/linux-bash-os" --host -c 'printf "%s\n" "$MACHTYPE"'
-sudo "$LASHOS_OUT/portable/linux-bash-os" --host --mount-cwd
+sudo "$LASHOS_OUT/portable-host/linux-bash-os" --host -c 'printf "%s\n" "$MACHTYPE"'
+sudo "$LASHOS_OUT/portable-host/linux-bash-os" --host --mount-cwd
 ```
 
 In direct mode, `--mount-cwd` retains its earlier behavior: it recursively
@@ -262,8 +273,10 @@ and an existing directory at `/home`. Other host paths remain accessible.
 In sandbox mode the launch directory is already shared at `/home`, so
 `--mount-cwd` is accepted without an additional mount.
 
-Loader options precede Bash arguments. Use `--` to pass a script whose name
-matches a loader option. Bash runs with `--noprofile --norc`; `--stats` reports
+Loader options precede Bash arguments. The loader consumes the first `--` and
+passes everything after it to Bash unparsed, so `-- --version` reaches Bash. To
+run a script whose name starts with `-`, name it by path (`-- ./--stats`) or add
+Bash's own separator (`-- -- --stats`). Bash runs with `--noprofile --norc`; `--stats` reports
 kernel execution statistics. Direct mode retains the caller's environment and
 supplies `LC_ALL=C` and a kernel Bash prompt. Sandbox mode uses its guest environment.
 

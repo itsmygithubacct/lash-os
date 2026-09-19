@@ -17,16 +17,31 @@ ifeq ($(CONFIG),)
 $(error Invalid configuration path; check LASHOS_CONFIG)
 endif
 LOCAL_CONFIG := $(wildcard $(CONFIG))
+# The default image and bundle use the build machine's x86_64 kernel and QEMU.
+BUILD_MACHINE := $(shell uname -m)
+HOST_RUNTIME_GOALS := build full portable bundle run demo verify test-vm test-host test-processes test-portable test-portable-processes test-mount-cwd test-portable-mount-cwd test-sandbox
+ifneq ($(BUILD_MACHINE),x86_64)
+ifneq ($(filter $(HOST_RUNTIME_GOALS),$(or $(MAKECMDGOALS),$(.DEFAULT_GOAL))),)
+$(error These targets bundle the build machine's x86_64 runtime; on $(BUILD_MACHINE) use make portable-x86_64, portable-aarch64 or portable-riscv64)
+endif
+endif
 export LASHOS_BUILD_DIR := $(BUILD)
 export LASHOS_OUTPUT_DIR := $(OUT)
 export LASHOS_REPORTS_DIR := $(REPORTS)
 export PYTHONDONTWRITEBYTECODE := 1
 DEV := python3 -B scripts/dev.py
-GUEST_HEADERS := $(shell rg --files include vendor/musl-headers)
+GUEST_HEADERS := $(shell find include vendor/musl-headers -type f)
+ifneq ($(.SHELLSTATUS),0)
+$(error Cannot list guest headers under include and vendor/musl-headers)
+endif
 PORT_SOURCES := $(wildcard src/* vendor/musl-c/* vendor/capsule-host/*)
 SDK_INPUTS := flake.nix flake.lock $(wildcard patches/capsule-*.patch)
+NATIVE_TOOLCHAIN := flake.nix flake.lock
 BUILD_CONFIG := scripts/workspace.py CMakeLists.txt $(wildcard VERSION cmake/*.cmake)
 BASH_SOURCE_INPUTS := $(shell python3 -B scripts/source_tree.py list vendor/bash-os)
+ifneq ($(.SHELLSTATUS),0)
+$(error Cannot track vendor/bash-os build inputs)
+endif
 HOST_TEST_INPUTS := $(wildcard tests/*.c) tests/source-tree.py tests/workspace.py scripts/source_tree.py
 PORTABLE_INPUTS := $(wildcard cmake/portable/*) scripts/build-portable.py scripts/elf_dependencies.py scripts/dev.py $(wildcard VERSION)
 KERNEL_JOBS ?= 4
@@ -38,7 +53,8 @@ build full: $(OUT)/full/linux-bash-os
 	cp $(OUT)/full/bash.bpf.o $(OUT)/bash.bpf.o.tmp
 	mv -f $(OUT)/bash.bpf.o.tmp $(OUT)/bash.bpf.o
 pure: $(OUT)/pure/linux-bash-os
-portable: $(OUT)/portable/linux-bash-os
+# The build-host runtime bundle never replaces the pinned x86_64 release output in portable/.
+portable: $(OUT)/portable-host/linux-bash-os
 .PHONY: portable-all portable-x86_64 portable-aarch64 portable-riscv64 release-candidates
 release-candidates: portable-all
 	$(DEV) python3 -B scripts/package-release.py
@@ -51,16 +67,17 @@ portable-x86_64 portable-aarch64 portable-riscv64: portable-%: $(BUILD)/kernel-f
 prepare: $(BUILD)/native-full.stamp
 bitcode: $(BUILD)/full-bitcode.stamp
 
-$(BUILD)/native-full.stamp: scripts/prepare-bash.py scripts/workspace.py scripts/source_tree.py scripts/adapt-workspaces.py SOURCE.json $(BASH_SOURCE_INPUTS)
-	mkdir -p $(BUILD)
+$(BUILD)/native-full.stamp: scripts/prepare-bash.py scripts/workspace.py scripts/source_tree.py scripts/adapt-workspaces.py SOURCE.json $(NATIVE_TOOLCHAIN) $(BASH_SOURCE_INPUTS)
+	$(WORKSPACE) --mark-build
 	$(DEV) python3 -B scripts/prepare-bash.py --profile full > $(BUILD)/prepare-full.log 2>&1 || { tail -60 $(BUILD)/prepare-full.log; exit 1; }
 	touch $@
 
-$(BUILD)/full-bitcode.stamp: $(BUILD)/native-full.stamp scripts/compile-bash.py $(GUEST_HEADERS)
+$(BUILD)/full-bitcode.stamp: $(BUILD)/native-full.stamp scripts/compile-bash.py $(GUEST_HEADERS) $(SDK_INPUTS)
 	$(DEV) python3 -B scripts/compile-bash.py --profile full --source $(BUILD)/native-full/source/build/bash-5.3 --output $(BUILD)/full-bitcode
 	touch $@
 
-$(BUILD)/deps.stamp: scripts/compile-deps.py scripts/workspace.py vendor/bash-os/config/dependencies.json $(GUEST_HEADERS)
+$(BUILD)/deps.stamp: scripts/compile-deps.py scripts/workspace.py scripts/runtime.py vendor/bash-os/config/dependencies.json $(GUEST_HEADERS) $(SDK_INPUTS)
+	$(WORKSPACE) --mark-build
 	$(DEV) python3 -B scripts/compile-deps.py
 	touch $@
 
@@ -72,7 +89,7 @@ $(BUILD)/portable/linux-bash-os $(BUILD)/portable/sandbox-init &: $(BUILD)/kerne
 	$(DEV) --shell portable python3 -B scripts/build-portable.py
 	touch $(BUILD)/portable/linux-bash-os $(BUILD)/portable/sandbox-init
 
-$(OUT)/full/linux-bash-os $(OUT)/portable/linux-bash-os &: $(BUILD)/kernel-full/linux-bash-os $(BUILD)/portable/linux-bash-os $(BUILD)/portable/sandbox-init scripts/build-sandbox.py $(wildcard scripts/runtime.py) config/os-release $(LOCAL_CONFIG)
+$(OUT)/full/linux-bash-os $(OUT)/portable-host/linux-bash-os &: $(BUILD)/kernel-full/linux-bash-os $(BUILD)/portable/linux-bash-os $(BUILD)/portable/sandbox-init scripts/build-sandbox.py $(wildcard scripts/runtime.py) config/os-release $(LOCAL_CONFIG)
 	python3 -B scripts/build-sandbox.py
 
 bundle: $(BUILD)/kernel-full/linux-bash-os $(BUILD)/portable/linux-bash-os $(BUILD)/portable/sandbox-init
@@ -82,12 +99,12 @@ bundle: $(BUILD)/kernel-full/linux-bash-os $(BUILD)/portable/linux-bash-os $(BUI
 	cp $(OUT)/full/bash.bpf.o $(OUT)/bash.bpf.o.tmp
 	mv -f $(OUT)/bash.bpf.o.tmp $(OUT)/bash.bpf.o
 
-$(BUILD)/native.stamp: scripts/prepare-bash.py scripts/workspace.py scripts/source_tree.py SOURCE.json $(BASH_SOURCE_INPUTS)
-	mkdir -p $(BUILD)
+$(BUILD)/native.stamp: scripts/prepare-bash.py scripts/workspace.py scripts/source_tree.py SOURCE.json $(NATIVE_TOOLCHAIN) $(BASH_SOURCE_INPUTS)
+	$(WORKSPACE) --mark-build
 	$(DEV) python3 -B scripts/prepare-bash.py > $(BUILD)/prepare.log 2>&1 || { tail -60 $(BUILD)/prepare.log; exit 1; }
 	touch $@
 
-$(BUILD)/bitcode.stamp: $(BUILD)/native.stamp scripts/compile-bash.py $(GUEST_HEADERS)
+$(BUILD)/bitcode.stamp: $(BUILD)/native.stamp scripts/compile-bash.py $(GUEST_HEADERS) $(SDK_INPUTS)
 	$(DEV) python3 -B scripts/compile-bash.py
 	touch $@
 
@@ -130,7 +147,7 @@ test-portable-mount-cwd: portable
 	python3 -B scripts/test-vm.py --build $(BUILD)/portable --portable --work $(REPORTS)/vm-portable-mount-cwd --cases tests/mount-cwd-cases.sh --init tests/mount-cwd-init.sh --memory 8192 --timeout 600
 
 test-sandbox: portable
-	python3 -B scripts/test-sandbox.py
+	python3 -B scripts/test-sandbox.py --binary $(OUT)/portable-host/linux-bash-os
 
 test-mlkem: $(BUILD)/full-bitcode.stamp
 	$(WORKSPACE) --prepare-cmake $(BUILD)/mlkem-test tests/mlkem

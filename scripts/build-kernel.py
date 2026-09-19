@@ -11,7 +11,7 @@ import tarfile
 import tempfile
 import sys
 sys.dont_write_bytecode = True
-from runtime import ARCHES, digest, fetch
+from runtime import ARCHES, KERNEL_PATCHES, digest, fetch
 from workspace import ROOT, BUILD, DOWNLOADS
 
 
@@ -23,8 +23,7 @@ def main():
     parser.add_argument("--jit-selftest", action="store_true", help="Also build the upstream BPF JIT test module")
     args = parser.parse_args()
     specification = json.loads((ROOT / "config/runtime-sources.json").read_text())["linux"]
-    patches = [ROOT / "patches" / name for name in
-               ["linux-riscv64-jit-zext.patch", "linux-riscv64-jit-region.patch"]]
+    patches = [ROOT / "patches" / name for name in KERNEL_PATCHES]
     patch_inventory = {patch.name: digest(patch) for patch in patches}
     source = BUILD / "runtime/source" / ("linux-" + specification["version"])
     source.parent.mkdir(parents=True, exist_ok=True)
@@ -100,6 +99,9 @@ def main():
         (build / "vmlinux").unlink(missing_ok=True)
         (build / "vmlinux.unstripped").unlink(missing_ok=True)
     previous_flags.write_text(pahole_flags)
+    # An interrupted rebuild must not leave the previous manifest describing a new image.
+    manifest_path = build.parent / "kernel.json"
+    manifest_path.unlink(missing_ok=True)
     image = ARCHES[args.arch]["image"]
     subprocess.run(command + [f"-j{args.jobs}", image.split("/")[-1]], env=environment, check=True)
     destination = build.parent / "kernel.bin"
@@ -107,7 +109,9 @@ def main():
     manifest = {"architecture": args.arch, "linux": specification,
                 "sha256": digest(destination), "config_sha256": digest(build / ".config"),
                 "pahole_flags": pahole_flags, "patches": patch_inventory}
-    (build.parent / "kernel.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    temporary = manifest_path.with_name(manifest_path.name + ".partial")
+    temporary.write_text(json.dumps(manifest, indent=2) + "\n")
+    temporary.replace(manifest_path)
     if args.jit_selftest:
         subprocess.run(command + [f"-j{args.jobs}", "CONFIG_TEST_BPF=m", "lib/test_bpf.ko"],
                        env=environment, check=True)

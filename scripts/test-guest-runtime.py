@@ -23,7 +23,7 @@ import sys
 sys.dont_write_bytecode = True
 from elf_dependencies import require_arch, require_static
 from runtime import ARCHES, digest
-from workspace import ROOT, OUT, REPORTS
+from workspace import ROOT, OUT, REPORTS, prepare_work
 
 
 def module(name, filename):
@@ -45,8 +45,11 @@ def main():
     binary = (args.binary or OUT / profile / "linux-bash-os").resolve()
     require_arch(binary, args.arch)
     require_static(binary)
-    work = args.work or REPORTS / "architectures" / args.arch / "guest-runtime"
-    work.mkdir(parents=True, exist_ok=True)
+    try:
+        # Fixed-name subfolders below are replaced, so the directory must be dedicated to this harness.
+        work = prepare_work(args.work or REPORTS / "architectures" / args.arch / "guest-runtime")
+    except ValueError as error:
+        parser.error(str(error))
     runtime, extra, home = (work / name for name in ("runtime", "extra", "home"))
     for directory in (runtime, extra, home):
         if directory.exists():

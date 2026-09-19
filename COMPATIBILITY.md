@@ -33,7 +33,11 @@ pinned toolchain emits overlapping per-CPU offsets. BTF types, function
 prototypes, kfunc metadata and kernel verification remain enabled.
 Its RV64 JIT emits zero-extension operations directly, avoiding the verifier's
 costly instruction-array expansion on large programs. Its JIT address window
-is expanded to 1 GiB for the image and process snapshots. See [patches/README.md](patches/README.md).
+is expanded to 1 GiB for the image and process snapshots. All three runtime
+kernels also purge lazily freed vmalloc areas inline, a defensive fix for a
+Linux deadlock between BPF program freeing and vmap purging that hung
+fork-heavy runs on a 6.12 kernel. Host kernels used by direct mode keep the
+upstream behavior and can hang the same way. See [patches/README.md](patches/README.md).
 
 Sandbox mode shares the launch folder read/write as `/home`, uses a temporary
 guest root, and enables outbound NAT without inbound forwards. Internet, LAN,
@@ -42,7 +46,15 @@ the network adapter. Files in the shared folder retain the host user's access
 permissions. This does not impose a storage quota on that folder. The VM gets
 2 CPUs and 4 GiB RAM by default; QEMU's host address space is also limited.
 Guest root authority is confined by the VM boundary, which depends on the
-bundled QEMU and kernel as well as the host KVM implementation.
+bundled QEMU and kernel as well as the host KVM implementation. QEMU itself runs
+without capabilities under `no_new_privs`, its own seccomp sandbox, Landlock and
+a launcher seccomp filter. It cannot create UNIX or netlink sockets, so a
+compromised QEMU cannot reach host session buses or other named sockets; with
+`--sandbox-network=none` it also cannot create IP sockets or make TCP
+connections. Kernels whose Landlock can restrict pathname UNIX sockets apply
+that restriction as well. The private runtime directory must be on an
+executable filesystem that is not reachable from the launch folder, including
+through bind mounts; startup fails if neither `/tmp` nor `/var/tmp` qualifies.
 
 Only standard input/output/error and terminal settings cross the console
 transport. Extra caller descriptors, host environment variables other than
@@ -62,17 +74,21 @@ and pipelines into `sort` are covered by the regression suites; see
 | Shell language | Real GNU Bash parser/evaluator, arrays, functions, expansions, redirections, Readline/history and job-control code |
 | Starting directory | Sandbox: launch folder shared at `/home` automatically. Direct mode: optional `--mount-cwd` recursively bind-mounts the launch directory at `/home` in a private mount namespace and starts there with `HOME=/home`; children inherit the view, writes affect the original files, and other host paths remain accessible. Requires mount-namespace privileges and an existing directory at `/home`. |
 | Processes | Independent Capsule snapshots and real Linux PIDs, pipes, process groups, signals, waits, and external `execve` |
-| Files | Logical descriptors 0–255, including caller-inherited descriptors and their flags in direct mode; stat/directory ABI conversion; ownership, permissions, links, timestamps, xattrs, advisory locks, and ordinary I/O |
-| Networking | Native socket I/O through the bridge; explicit message/iovec conversion; descriptor translation for SCM_RIGHTS; resolver results allocated in the Capsule arena |
+| Files | Logical descriptors 0–255, including caller-inherited descriptors and their flags in direct mode, and `select`/`pselect` sets covering all of them; stat, statvfs and directory ABI conversion; ownership, permissions, links, timestamps, xattrs, advisory locks, and ordinary I/O. `realpath` into a caller buffer fails with `ENAMETOOLONG` for resolved paths of 1024 bytes or more, and unknown `AT_*` flags return `EINVAL` |
+| Networking | Native socket I/O through the bridge; explicit message/iovec conversion; descriptor translation for SCM_RIGHTS; resolver results allocated in the Capsule arena; converted `epoll` events, at most 1024 per `epoll_wait` call |
 | Libraries | Compiled C implementations of SQLite, mbedTLS/libssh, tree-sitter, PCRE2, zlib, zstd, xz and bzip2 as selected by the original project |
 | Plugins and workers | Native `.so` loading and `pthread_create`/join are deferred; single-thread library mutex primitives remain available |
-| Mappings | Arena-backed anonymous/private mappings and file copies; shared file mappings, executable mappings, and fixed-address remapping are unsupported |
+| Mappings | Arena-backed anonymous/private mappings and file copies, including partial `munmap` and `mremap` shrinking or moving growth; shared file mappings, executable mappings, and fixed-address remapping are unsupported |
 | Device controls | Encoded buffer ioctls and selected terminal/network controls; ioctl interfaces containing further pointers need explicit marshalling and may return unsupported |
 | System controls | Explicitly translated Linux operations; Linux capabilities, namespaces, seccomp, filesystem and device availability still determine whether a call succeeds |
 
 The bridge uses Picolibc plus selected musl headers and portable functions, not
 native glibc inside the kernel. It translates open/at flags, error numbers,
-clocks, signals and structures where the ABIs differ. Locale is C; the default
+clocks, signals and structures where the ABIs differ, including `statvfs`,
+`timeval`, `rusage`, `epoll_event` and SysV semaphore status records whose
+guest and native layouts differ on some architectures. Structures that still
+cross the bridge unconverted have build-time size checks on both sides for
+every target. Locale is C; the default
 libc local-time implementation is UTC. Some `sysconf`, path-configuration,
 signal-info, ioctl and SysV IPC variants remain limited.
 
@@ -101,3 +117,7 @@ plugins are part of the deferred plugin support.
 Signals are delivered to guest callbacks when the main fiber resumes or Bash
 polls for them. Realtime signals are coalesced into pending bits; complete
 `siginfo_t` event queues and all signal-action corner cases are not implemented.
+While a guest handler runs, its own signal (unless `SA_NODEFER`) and its
+`sa_mask` are held and dispatched after the handler returns or leaves by
+`longjmp`. The native signal mask is unchanged, so the loader still records
+those signals. `SA_RESETHAND` restores the default action.

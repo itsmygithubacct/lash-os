@@ -19,7 +19,7 @@ import sys
 sys.dont_write_bytecode = True
 from elf_dependencies import require_arch, require_static
 from runtime import ARCHES, digest
-from workspace import ROOT, BUILD, OUT, REPORTS
+from workspace import ROOT, BUILD, OUT, REPORTS, prepare_work
 
 
 def extract(binary, destination):
@@ -74,8 +74,11 @@ def main():
     require_arch(binary, args.arch)
     require_static(binary)
     group = "jobs" if args.jobs_only else "network" if args.network_only else "full" if args.full else "smoke"
-    work = args.work or REPORTS / "architectures" / args.arch / group
-    work.mkdir(parents=True, exist_ok=True)
+    try:
+        # Fixed-name subfolders below are replaced, so the directory must be dedicated to this harness.
+        work = prepare_work(args.work or REPORTS / "architectures" / args.arch / group)
+    except ValueError as error:
+        parser.error(str(error))
     runtime = work / "runtime"
     if runtime.exists():
         shutil.rmtree(runtime)

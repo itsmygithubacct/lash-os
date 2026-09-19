@@ -5,19 +5,19 @@ sys.dont_write_bytecode = True
 import argparse
 import gzip
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
 import re
 import shutil
-import stat
 import subprocess
 import signal
 import threading
 import time
 from elf_dependencies import require_static
 
-from workspace import ROOT, BUILD, REPORTS, PATHS
+from workspace import ROOT, BUILD, REPORTS, PATHS, prepare_work
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -36,7 +36,10 @@ def main():
     if args.portable:
         require_static(args.build / "linux-bash-os")
         require_static(args.build / "job-control-test")
-    work = args.work.resolve()
+    try:
+        work = prepare_work(args.work)
+    except ValueError as error:
+        parser.error(str(error))
     stage = work / "root"
     # A reused staging tree could hide missing runtime dependencies.
     if stage.is_symlink():
@@ -99,28 +102,16 @@ echo "KERNEL_BASH_TEST_EXIT=$rc"
 /bin/busybox poweroff -f
 ''')
     (stage / "init").chmod(0o755)
-    if (ROOT / "tests/cases.sh").exists():
+    if args.cases.is_file():
         shutil.copyfile(args.cases, stage / "cases.sh")
 
-    # Newc permits encoding the VM's console node without host root access.
-    archive = bytearray()
-    inode = 1
-    def entry(name, mode, data=b"", rmajor=0, rminor=0):
-        nonlocal inode
-        encoded = name.encode() + b"\0"
-        fields = [inode, mode, 0, 0, 1, 0, len(data), 0, 0, rmajor, rminor, len(encoded), 0]
-        archive.extend(b"070701" + b"".join(f"{n:08x}".encode() for n in fields))
-        archive.extend(encoded)
-        archive.extend(b"\0" * (-len(archive) % 4))
-        archive.extend(data)
-        archive.extend(b"\0" * (-len(archive) % 4))
-        inode += 1
-    for path in sorted(stage.rglob("*")):
-        info = path.lstat()
-        data = os.readlink(path).encode() if path.is_symlink() else path.read_bytes() if path.is_file() else b""
-        entry(str(path.relative_to(stage)), info.st_mode, data)
-    entry("dev/console", stat.S_IFCHR | 0o600, rmajor=5, rminor=1)
-    entry("TRAILER!!!", 0)
+    # Share the bundle's newc writer: it encodes the console node without host root
+    # access and normalizes modes, so a group-writable umask cannot make the staged
+    # /etc/os-release untrusted and silently select sandbox mode inside the VM.
+    bundle_spec = importlib.util.spec_from_file_location("bundle", ROOT / "scripts/build-sandbox.py")
+    bundle = importlib.util.module_from_spec(bundle_spec)
+    bundle_spec.loader.exec_module(bundle)
+    archive = bundle.newc(stage)
     initramfs = work / "initramfs.cpio.gz"
     with gzip.open(initramfs, "wb", compresslevel=1) as f:
         f.write(archive)
@@ -131,7 +122,8 @@ echo "KERNEL_BASH_TEST_EXIT=$rc"
     print("Booting kernel tests in an isolated KVM guest", flush=True)
     started = time.monotonic()
     with (work / "console.log").open("w") as log:
-        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True)
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                   errors="replace", start_new_session=True)
         timeout = threading.Timer(args.timeout, lambda: os.killpg(process.pid, signal.SIGKILL))
         timeout.start()
         try:
@@ -142,6 +134,16 @@ echo "KERNEL_BASH_TEST_EXIT=$rc"
             rc = process.wait()
         finally:
             timeout.cancel()
+            # Interrupts and harness errors must not leave a large VM running unattended.
+            if process.poll() is None:
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process.wait()
+                except ProcessLookupError:
+                    process.wait()
     transcript = (work / "console.log").read_text()
     success = rc == 0 and "KERNEL_BASH_TEST_EXIT=0" in transcript
     if args.portable:
@@ -158,7 +160,7 @@ echo "KERNEL_BASH_TEST_EXIT=$rc"
         "native_sha256": digest(args.reference),
         "kernel_sha256": digest(args.kernel),
         "init_sha256": digest(stage / "init"),
-        "cases_sha256": digest(stage / "cases.sh"),
+        "cases_sha256": digest(stage / "cases.sh") if (stage / "cases.sh").is_file() else None,
         "core_cases_sha256": digest(stage / "core-cases.sh"),
         "builtin_names_sha256": digest(stage / "builtin-names"),
         "checks": [line for line in transcript.splitlines() if line.startswith(("PASS:", "FAIL:"))],

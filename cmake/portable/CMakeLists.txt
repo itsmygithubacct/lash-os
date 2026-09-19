@@ -13,6 +13,9 @@ endif()
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(LIBBPF REQUIRED libbpf>=1.4.0)
 add_compile_options(-O2 -Wall -Wextra)
+# Build-machine directories must not reach __FILE__ or debug records in the shipped loader.
+add_compile_options("-ffile-prefix-map=${LINUX_BASH_ROOT}=/lashos/source"
+                    "-ffile-prefix-map=${LASHOS_BUILD_DIR}=/lashos/build")
 if(CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64")
     add_compile_options(-march=x86-64 -mtune=generic)
 endif()
@@ -37,7 +40,7 @@ add_executable(sandbox-init "${LINUX_BASH_ROOT}/src/sandbox_init.c")
 
 include(CTest)
 if(BUILD_TESTING)
-    foreach(test queued-signals poll inherited-fds syscall-abi)
+    foreach(test queued-signals poll inherited-fds syscall-abi bridge-abi)
         add_executable(${test}-test "${LINUX_BASH_ROOT}/tests/${test}.c")
         target_compile_options(${test}-test PRIVATE -UNDEBUG -Wno-unused-function -Wno-unused-variable)
         add_test(NAME ${test} COMMAND ${test}-test)

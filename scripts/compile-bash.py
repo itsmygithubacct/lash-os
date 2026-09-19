@@ -49,7 +49,11 @@ def main():
              "-D_GNU_SOURCE", "-Wno-deprecated-non-prototype", "-Werror=incompatible-pointer-types",
              "-Wno-incompatible-pointer-types-discards-qualifiers",
              "-Werror=implicit-function-declaration", "-Werror=int-conversion", "-Wno-pointer-sign",
-             "-Wno-discarded-qualifiers", "-Wno-unknown-warning-option"]
+             "-Wno-discarded-qualifiers", "-Wno-unknown-warning-option",
+             # Keep the build machine's directories out of __FILE__ and debug
+             # records, which ship inside the image.
+             f"-ffile-prefix-map={SOURCE}=/lashos/bash", f"-ffile-prefix-map={ROOT}=/lashos/source",
+             "-fdebug-compilation-dir=/lashos"]
     for path in [ROOT / "include/guest", ROOT / "include", SOURCE, SOURCE / "include", SOURCE / "lib", SOURCE / "builtins"]:
         flags.append("-I"+str(path))
     flags += ["-idirafter", str(ROOT / "vendor/musl-headers")]

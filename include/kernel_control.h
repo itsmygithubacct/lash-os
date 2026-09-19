@@ -160,3 +160,58 @@ struct bridge_lock {
     int32_t type, whence, pid, pad;
     int64_t start, length;
 };
+
+/* Picolibc's timeval has a 32-bit microsecond field followed by padding. */
+struct bridge_timeval {
+    int64_t sec, usec;
+};
+struct bridge_statvfs {
+    uint64_t bsize, frsize, blocks, bfree, bavail, files, ffree, favail, fsid, flag, namemax;
+};
+/* The guest epoll_event is packed like x86-64; ARM64 and RISC-V64 are not. */
+struct bridge_epoll_event {
+    uint32_t events, pad;
+    uint64_t data;
+};
+#define BRIDGE_EPOLL_EVENTS 1024
+struct bridge_timex {
+    uint32_t modes, pad0;
+    int64_t offset, freq, maxerror, esterror;
+    int32_t status, pad1;
+    int64_t constant, precision, tolerance;
+    struct bridge_timeval time;
+    int64_t tick, ppsfreq, jitter;
+    int32_t shift, pad2;
+    int64_t stabil, jitcnt, calcnt, errcnt, stbcnt;
+    int32_t tai, pad3[11];
+};
+/* The guest uses the x86-64 semid64_ds layout; the generic 64-bit layout omits
+ * the reserved words after each timestamp. */
+struct bridge_semid_ds {
+    uint8_t perm[48];
+    int64_t otime, unused1, ctime, unused2;
+    uint64_t nsems, unused3, unused4;
+};
+
+/* Structures that cross the bridge unchanged have one 64-bit Linux layout on
+ * the guest and on every supported host. Both sides assert these sizes. */
+#define BRIDGE_RAW_LAYOUTS(X)                                                                      \
+    X(struct ipc_perm, 48)                                                                         \
+    X(struct msqid_ds, 120)                                                                        \
+    X(struct shmid_ds, 112)                                                                        \
+    X(struct msginfo, 32)                                                                          \
+    X(struct shminfo, 72)                                                                          \
+    X(struct shm_info, 48)                                                                         \
+    X(struct seminfo, 40)                                                                          \
+    X(struct utsname, 390)                                                                         \
+    X(struct winsize, 8)                                                                           \
+    X(struct pollfd, 8)                                                                            \
+    X(struct ifreq, 40)                                                                            \
+    X(struct sockaddr_in, 16)                                                                      \
+    X(struct sockaddr_in6, 28)                                                                     \
+    X(struct linger, 8)                                                                            \
+    X(struct ucred, 12)                                                                            \
+    X(struct signalfd_siginfo, 128)                                                                \
+    X(struct inotify_event, 16)                                                                    \
+    X(gid_t, 4)
+#define BRIDGE_CHECK_LAYOUT(type, size) _Static_assert(sizeof(type) == size, "Linux ABI layout");

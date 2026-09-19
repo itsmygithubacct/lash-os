@@ -44,6 +44,10 @@ bpf_capsule_object(bash_bpf OUTPUT bash.bpf.o
     LIBRARIES ${guest_libraries}
     INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/include/guest" "${CMAKE_CURRENT_SOURCE_DIR}/include"
     COMPILE_OPTIONS -g -D_GNU_SOURCE -idirafter "${CMAKE_CURRENT_SOURCE_DIR}/vendor/musl-headers"
+                 # Build-machine directories must not reach __FILE__ or debug records.
+                 "-ffile-prefix-map=${CMAKE_CURRENT_SOURCE_DIR}=/lashos/source"
+                 "-ffile-prefix-map=${LASHOS_BUILD_DIR}=/lashos/build"
+                 -fdebug-compilation-dir=/lashos
     LINK_OPTIONS -mcpu=v4 --memory=arena --managed-atomics --allocator-lock=atomic
                  --inline-limit=${LINUX_BASH_INLINE_LIMIT} --disable-ldsx --freplace --fiber-stack=${LINUX_BASH_FIBER_STACK}
                  ${linux_bash_codegen_options} ${capsule_diagnostics})
@@ -56,7 +60,7 @@ target_compile_options(linux-bash-os PRIVATE -Wall -Wextra)
 target_link_libraries(linux-bash-os PRIVATE BpfCapsule::host bash_skeleton zstd)
 include(CTest)
 if(BUILD_TESTING)
-    foreach(test queued-signals poll inherited-fds syscall-abi)
+    foreach(test queued-signals poll inherited-fds syscall-abi bridge-abi)
         add_executable(${test}-test tests/${test}.c)
         target_include_directories(${test}-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
         target_compile_options(${test}-test PRIVATE -UNDEBUG -Wall -Wextra -Wno-unused-function -Wno-unused-variable)

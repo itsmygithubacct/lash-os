@@ -5,8 +5,10 @@ import os
 from pathlib import Path
 import shutil
 import stat
+import sys
 
 EXCLUDED = {".git", "build", "out", "dl", "__pycache__"}
+MAKE_SAFE = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_./-+@")
 
 
 def entries(root):
@@ -26,11 +28,11 @@ def remove(path):
 
 
 def sync_tree(source, destination):
-    source, destination = Path(source), Path(destination)
+    source, destination = Path(source).resolve(), Path(destination).resolve()
     if not source.is_dir():
         raise FileNotFoundError(source)
-    if source.resolve() == destination.resolve():
-        raise ValueError("source and destination must be different trees")
+    if source.is_relative_to(destination) or destination.is_relative_to(source):
+        raise ValueError("source and destination must not overlap")
     wanted = set(entries(source))
     destination.mkdir(parents=True, exist_ok=True)
     # Remove obsolete source files, including deleted builtins and headers.
@@ -73,9 +75,13 @@ def main():
         sync_tree(args.source, args.destination)
     else:
         # Directory mtimes make additions and removals invalidate Make stamps.
-        for path in [args.source, *(args.source / p for p in sorted(entries(args.source)))]:
-            value = str(path).replace("$", "$$").replace("#", r"\#").replace(" ", r"\ ")
-            print(value)
+        paths = [str(args.source), *(str(args.source / p) for p in sorted(entries(args.source)))]
+        # Make cannot represent every file name as a prerequisite; never drop one silently.
+        unsafe = [path for path in paths if any(c not in MAKE_SAFE for c in path)]
+        if unsafe:
+            sys.exit("Rename build inputs that Make cannot track (use letters, digits, _ . / - + @): " +
+                     ", ".join(repr(path) for path in unsafe[:10]))
+        print("\n".join(paths))
 
 
 if __name__ == "__main__":

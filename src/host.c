@@ -144,42 +144,7 @@ static int save_fd(struct bridge_host *h, int real, int minimum) {
     errno = EMFILE;
     return -1;
 }
-static int open_flags(unsigned bits) {
-    int f = bits & 3;
-    if (bits & BO_CREATE)
-        f |= O_CREAT;
-    if (bits & BO_TRUNCATE)
-        f |= O_TRUNC;
-    if (bits & BO_APPEND)
-        f |= O_APPEND;
-    if (bits & BO_EXCLUSIVE)
-        f |= O_EXCL;
-    if (bits & BO_NONBLOCK)
-        f |= O_NONBLOCK;
-    if (bits & BO_CLOEXEC)
-        f |= O_CLOEXEC;
-    if (bits & BO_NOFOLLOW)
-        f |= O_NOFOLLOW;
-    if (bits & BO_DIRECTORY)
-        f |= O_DIRECTORY;
-    if (bits & BO_NOCTTY)
-        f |= O_NOCTTY;
-    return f;
-}
-static int at_flags(unsigned bits) {
-    int flags = bits & ~31u;
-    if (bits & 1)
-        flags |= AT_EACCESS;
-    if (bits & 2)
-        flags |= AT_SYMLINK_NOFOLLOW;
-    if (bits & 4)
-        flags |= AT_SYMLINK_FOLLOW;
-    if (bits & 8)
-        flags |= AT_REMOVEDIR;
-    if (bits & 16)
-        flags |= AT_EMPTY_PATH;
-    return flags;
-}
+#include "abi_host.h"
 static unsigned pack_flags(int flags) {
     unsigned bits = flags & O_ACCMODE;
     if (flags & O_APPEND)
@@ -252,12 +217,15 @@ static int64_t service(struct bridge_host *h, volatile struct kernel_control *c)
         return poll_descriptors(c, h->fds, in, b, (int64_t)n < 0 ? NULL : &timeout, mask);
     }
     case BR_STATX: {
+        int flags = statx_flags(n);
+        if (flags < 0)
+            return -1;
         struct statx *out = memory(h, c->args[4], sizeof(*out));
-        path = path_string_mode(h, b, path_storage, !(n & AT_SYMLINK_NOFOLLOW));
+        path = path_string_mode(h, b, path_storage, !(flags & AT_SYMLINK_NOFOLLOW));
         actual = (int)a == -2 ? AT_FDCWD : fd(h, (int)a);
         if (!out || !path || (actual < 0 && actual != AT_FDCWD))
             return -1;
-        return statx(actual, path, n, c->args[3], out);
+        return statx(actual, path, flags, (unsigned)c->args[3], out);
     }
     case BR_GETPGID:
         return getpgid((int)a);
@@ -323,7 +291,7 @@ static int64_t service(struct bridge_host *h, volatile struct kernel_control *c)
     case BR_ALARM:
         return alarm(a);
     case BR_SIGACTION: {
-        int number = native_signal((int)a);
+        int number = bridge_signal_number(a);
         struct bridge_signal_action *in = b ? memory(h, b, sizeof(*in)) : NULL;
         struct bridge_signal_action *out = n ? memory(h, n, sizeof(*out)) : NULL;
         if (number <= 0 || (b && !in) || (n && !out)) {
@@ -347,12 +315,12 @@ static int64_t service(struct bridge_host *h, volatile struct kernel_control *c)
             return -1;
         if (out) {
             out->mask = pack_signal_mask(&old.sa_mask);
-            out->flags = old.sa_sigaction == record_signal ? installed_signal_flags[a]
+            out->flags = old.sa_sigaction == record_signal ? installed_signal_flags[number]
                                                            : guest_action_flags(old.sa_flags);
             out->mode = old.sa_handler == SIG_DFL ? 0 : old.sa_handler == SIG_IGN ? 1 : 2;
         }
         if (in)
-            installed_signal_flags[a] = in->flags;
+            installed_signal_flags[number] = in->flags;
         return 0;
     }
     case BR_SIGMASK: {
@@ -757,7 +725,7 @@ static int64_t service(struct bridge_host *h, volatile struct kernel_control *c)
     case BR_REALPATH:
         path = path_string(h, a, path_storage);
         buffer = memory(h, b, n);
-        return path && buffer && realpath(path, buffer) ? 0 : -1;
+        return path && buffer ? bounded_realpath(path, buffer, n) : -1;
     case BR_SYNC:
         sync();
         return 0;
@@ -852,7 +820,11 @@ int main(int argc, char **argv) {
     struct sandbox_options sandbox = {.memory_mib = 4096, .cpus = 2, .network = 1};
     int sandbox_tuning = 0;
     while (argc > 1) {
-        if (!strcmp(argv[1], "--stats"))
+        if (!strcmp(argv[1], "--")) {
+            argc--;
+            argv++;
+            break;
+        } else if (!strcmp(argv[1], "--stats"))
             show_stats = 1;
         else if (!strcmp(argv[1], "--mount-cwd"))
             mount_cwd = 1;

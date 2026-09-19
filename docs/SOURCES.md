@@ -1,11 +1,11 @@
 # Source distribution and rebuilding
 
-The [0.1.0 release](https://github.com/itsmygithubacct/lash-os/releases/tag/v0.1.0)
+The [0.1.1 release](https://github.com/itsmygithubacct/lash-os/releases/tag/v0.1.1)
 provides two source archives next to the portable executables:
 
-- `lashos-0.1.0-source.tar.zst`: the project at the release commit, including its
+- `lashos-0.1.1-source.tar.zst`: the project at the release commit, including its
   vendored source, licenses, patches, configuration and build scripts.
-- `lashos-0.1.0-dependency-sources.tar.zst`: exact upstream Bash archives and
+- `lashos-0.1.1-dependency-sources.tar.zst`: exact upstream Bash archives and
   patches, guest libraries, Linux, 75 Debian source packages, and the Nix source
   inputs and evaluated recipes used by the three portable builds.
 
@@ -18,17 +18,17 @@ Project-owned code is distributed under GNU GPL version 3, as supplied in
 ## Rebuild the executables
 
 Install Nix with flakes enabled and the basic host tools used by Make (Python 3,
-GNU Make and ripgrep), plus GNU tar and zstd for extracting the archives.
+GNU Make and GNU findutils), plus GNU tar and zstd for extracting the archives.
 Build from an x86_64 or ARM64 Linux machine. The compiler
 build needs substantial CPU time, memory and disk space. Runtime testing also
 needs the KVM and Landlock requirements described in [README.md](../README.md).
 
 ```sh
 sha256sum --check --ignore-missing SHA256SUMS
-tar --zstd -xf lashos-0.1.0-source.tar.zst
-tar --zstd -xf lashos-0.1.0-dependency-sources.tar.zst
-cd lashos-0.1.0
-export LASHOS_DOWNLOADS_DIR="$(cd ../lashos-0.1.0-dependency-sources/downloads && pwd)"
+tar --zstd -xf lashos-0.1.1-source.tar.zst
+tar --zstd -xf lashos-0.1.1-dependency-sources.tar.zst
+cd lashos-0.1.1
+export LASHOS_DOWNLOADS_DIR="$(cd ../lashos-0.1.1-dependency-sources/downloads && pwd)"
 make portable-all
 make paths
 ```
@@ -69,12 +69,17 @@ store basename so recipe references can be matched directly to `nix/inputs/`.
 
 ## Prepare a source release
 
-After building all three portable executables:
+Commit the project source first, then build all three portable executables
+from that commit with `make portable-all`. Each executable records the source
+state it was built from. Packaging with sources refuses executables whose
+non-documentation content differs from the release commit, a Nix source
+inventory that no longer matches the current builds, and kernel or runtime
+provenance that differs from the executables.
 
 ```sh
 python3 -B scripts/prepare-runtime-sources.py
 python3 -B scripts/collect-nix-sources.py
-# Commit the final project source before packaging it.
+# The checkout must still match the commit the executables were built from.
 scripts/dev.py python3 -B scripts/package-sources.py
 scripts/dev.py python3 -B scripts/package-release.py --with-sources
 ```
@@ -85,4 +90,4 @@ source versions through signed Debian APT metadata in an isolated workspace.
 Normal downloads verify every file against the checked-in SHA256 and size.
 The source packager verifies the Nix store inputs and refuses a dirty project
 checkout when making the project archive. Outputs go under
-`out/releases/0.1.0/` in the external workspace.
+`out/releases/0.1.1/` in the external workspace.

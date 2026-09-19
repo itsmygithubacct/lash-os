@@ -8,6 +8,7 @@
 #include <fcntl.h>
 #include <dirent.h>
 #include <grp.h>
+#include <limits.h>
 #include <pwd.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -83,7 +84,9 @@ static int64_t bridge(unsigned op, uint64_t a, uint64_t b, uint64_t c) {
     int64_t response = control.response;
     if (op != BR_SIGACTION && op != BR_SIGMASK)
         linux_bash_poll_signals();
-    errno = error;
+    /* Like libc, leave errno unchanged when the call reports no error. */
+    if (error)
+        errno = error;
     return response;
 }
 
@@ -464,8 +467,13 @@ int nanosleep(const struct timespec *ts, struct timespec *remaining) {
     return bridge(BR_SLEEP, ts->tv_sec, ts->tv_nsec, (uintptr_t)remaining);
 }
 unsigned sleep(unsigned seconds) {
-    struct timespec ts = {.tv_sec = seconds};
-    return nanosleep(&ts, NULL) < 0 ? seconds : 0;
+    struct timespec ts = {.tv_sec = seconds}, remaining;
+    if (!nanosleep(&ts, &remaining))
+        return 0;
+    if (errno != EINTR)
+        return seconds;
+    /* Round the unslept time as glibc does. */
+    return remaining.tv_sec + (remaining.tv_nsec >= 500000000);
 }
 
 int getresuid(uid_t *r, uid_t *e, uid_t *s) {
@@ -498,12 +506,15 @@ int getdtablesize(void) {
     return 256;
 }
 char *realpath(const char *path, char *buffer) {
+    /* A caller's buffer is only known to hold the guest PATH_MAX. Longer
+     * resolved paths fail with ENAMETOOLONG instead of overrunning it. */
     int allocated = !buffer;
+    size_t size = allocated ? 4096 : PATH_MAX;
     if (!buffer)
-        buffer = malloc(4096);
+        buffer = malloc(size);
     if (!buffer)
         return NULL;
-    if (bridge(BR_REALPATH, (uintptr_t)path, (uintptr_t)buffer, 4096) < 0) {
+    if (bridge(BR_REALPATH, (uintptr_t)path, (uintptr_t)buffer, size) < 0) {
         if (allocated)
             free(buffer);
         return NULL;

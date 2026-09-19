@@ -100,6 +100,9 @@ def main():
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
         downloaded = list(executor.map(download, specification["packages"]))
+    # Invalidate the verification marker before touching the tree, so an
+    # interrupted extraction is never reported as a prepared sysroot.
+    marker.unlink(missing_ok=True)
     if sysroot.exists():
         shutil.rmtree(sysroot)
     sysroot.mkdir(parents=True)
@@ -108,7 +111,9 @@ def main():
         (sysroot / name).symlink_to("usr/" + name)
     for archive in downloaded:
         subprocess.run(["dpkg-deb", "-x", str(archive), str(sysroot)], check=True)
-    marker.write_text(digest(lock) + "\n")
+    temporary = marker.with_name(marker.name + ".partial")
+    temporary.write_text(digest(lock) + "\n")
+    temporary.replace(marker)
     print(f"Prepared {args.arch} runtime: {len(downloaded)} packages in {sysroot}")
 
 

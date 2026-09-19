@@ -173,6 +173,10 @@ static void relay(int channel, int input, int output, int errors, pid_t child, i
             {output, sb_room(tx) >= SB_CHUNK + 8 ? POLLIN : 0, 0},
             {errors, sb_room(tx) >= SB_CHUNK + 8 ? POLLIN : 0, 0},
         };
+        /* Hang-ups are reported even without requested events; skip idle entries. */
+        for (int i = 0; i < 4; i++)
+            if (!fds[i].events)
+                fds[i].fd = -1;
         if (poll(fds, 4, 50) < 0) {
             if (errno == EINTR)
                 continue;

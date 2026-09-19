@@ -46,14 +46,31 @@ cd /tmp/kernel
         if [ "$unchanged" = 4 ]; then
             echo 'DIAGNOSTIC: shell process wait states'
             /bin/busybox ps -o pid,ppid,stat,args
+            # Shell processes and every uninterruptible task, including kernel
+            # workers that may hold a lock the shell is waiting for.
             for task in /proc/[0-9]*; do
                 name=$(/bin/busybox cat "$task/comm" 2>/dev/null)
-                if [ "$name" = kernel-bash ]; then
-                    echo "DIAGNOSTIC: $task"
-                    /bin/busybox cat "$task/wchan" "$task/syscall" "$task/stack"
-                    /bin/busybox ls -l "$task/fd" | /bin/busybox grep -v bpf
+                status=$(/bin/busybox cat "$task/stat" 2>/dev/null) || continue
+                state=${status##*) }
+                state=${state%% *}
+                if [ "$name" = kernel-bash ] || [ "$state" = D ]; then
+                    echo "DIAGNOSTIC: $task $name state=$state"
+                    /bin/busybox cat "$task/wchan" "$task/syscall" "$task/stack" 2>/dev/null
+                    if [ "$name" = kernel-bash ]; then
+                        /bin/busybox ls -l "$task/fd" | /bin/busybox grep -v bpf
+                    fi
                 fi
             done
+            # Blocked tasks with their workqueue functions, and every CPU's
+            # backtrace; quiet hides these at the default console level.
+            printk_levels=$(/bin/busybox cat /proc/sys/kernel/printk)
+            echo 8 > /proc/sys/kernel/printk
+            echo 1 > /proc/sys/kernel/sysrq
+            echo w > /proc/sysrq-trigger
+            echo l > /proc/sysrq-trigger
+            /bin/busybox sleep 2
+            echo "$printk_levels" > /proc/sys/kernel/printk
+            echo 'DIAGNOSTIC: kernel task dump complete'
             /bin/busybox tail -c 8192 /tmp/kernel.err
         fi
     done
