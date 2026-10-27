@@ -12,20 +12,20 @@ and uses [BPF Capsule](https://github.com/ayles/bpf-capsule). The required vendo
 bash-os sources and build recipes are included here; pinned third-party archives
 are fetched into the external workspace.
 
-## Release 0.1.1
+## Release 0.1.2
 
-Download a portable executable from the [v0.1.1 release](https://github.com/itsmygithubacct/lash-os/releases/tag/v0.1.1),
+Download a portable executable from the [v0.1.2 release](https://github.com/itsmygithubacct/lash-os/releases/tag/v0.1.2),
 verify it with the accompanying `SHA256SUMS`, then run it from the folder to share:
 
 ```sh
-chmod +x lashos-0.1.1-linux-x86_64
-cp lashos-0.1.1-linux-x86_64 /path/to/my-folder/lash-os
+chmod +x lashos-0.1.2-linux-x86_64
+cp lashos-0.1.2-linux-x86_64 /path/to/my-folder/lash-os
 cd /path/to/my-folder
 ./lash-os
 ```
 
 x86_64 is the primary tested target. **ARM64 and RISC-V64 are experimental**;
-their remaining validation gaps are listed in the [release notes](docs/releases/0.1.1.md).
+their remaining validation gaps are listed in the [release notes](docs/releases/0.1.2.md).
 All three hosted executables require KVM and Landlock ABI 6. The launch folder
 is writable inside the guest, and outbound networking is enabled by default.
 
@@ -214,7 +214,7 @@ Maintainers refresh package locks with `scripts/prepare-runtime.py --arch ARCH
 checked-in locks in [config/runtime](config/runtime).
 
 `make release-candidates` builds all three and collects versioned executables,
-inventories and `SHA256SUMS` under `$LASHOS_OUT/releases/0.1.1/`. For existing
+inventories and `SHA256SUMS` under `$LASHOS_OUT/releases/0.1.2/`. For existing
 builds, run `scripts/dev.py python3 -B scripts/package-release.py`. This collects
 local files; publishing a tagged release is a separate step.
 

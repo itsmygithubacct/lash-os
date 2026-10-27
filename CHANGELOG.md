@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.1.2
+
+- Interrupt blocking reads and writes for queued guest signals, including native
+  syscall restarts, while preserving completed and partial transfers.
+- Preserve native nonblocking I/O behavior: empty reads and full writes return
+  `EAGAIN` without waiting or changing shared descriptor flags.
+- Preserve POSIX read and write record locks across failed and successful exec.
+  Guest descriptors keep their native numbers, and private loader descriptors
+  close on successful exec without temporary duplicates of guest files.
+- Reserve guest descriptor slots while loading BPF objects and restoring forked
+  processes. Temporarily provide loader descriptor headroom within the caller's
+  hard limit, then restore the original soft limit and clean up on failure.
+- Reject UNIX datagram socket pairs inside the confined QEMU, closing a route to
+  named host sockets. Connected stream and sequenced-packet pairs remain usable.
+- Add regression coverage for queued signals, nonblocking and partial I/O,
+  descriptor limits, contended record locks, successful exec, and socket pairs.
+
 ## 0.1.1
 
 - Forward arguments after the loader's `--` to GNU Bash, including through the
