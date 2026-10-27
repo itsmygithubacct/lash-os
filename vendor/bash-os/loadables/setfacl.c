@@ -82,7 +82,7 @@ static int load_current (const char *path) {
         return 0;
     }
     struct stat st;
-    if (lstat (path, &st) < 0) return -1;
+    if (stat (path, &st) < 0) return -1;
     add_or_replace (ACL_USER_OBJ,  ACL_UNDEFINED_ID, (st.st_mode>>6)&7);
     add_or_replace (ACL_GROUP_OBJ, ACL_UNDEFINED_ID, (st.st_mode>>3)&7);
     add_or_replace (ACL_OTHER,     ACL_UNDEFINED_ID,  st.st_mode    &7);
@@ -220,7 +220,7 @@ setfacl_builtin (WORD_LIST *list)
             continue;
         }
 
-        if (setspec) { nent = 0; if (parse_spec (setspec, 0) < 0) return EXECUTION_FAILURE; }
+        if (setspec) { nent = 0; if (parse_spec (setspec, 0) < 0) return EX_USAGE; }
         else {
             if (load_current (path) < 0) { builtin_error ("%s: %s", path, strerror (errno)); rc = EXECUTION_FAILURE; continue; }
             if (do_b) { /* keep only base entries, then apply -m below */
@@ -229,8 +229,8 @@ setfacl_builtin (WORD_LIST *list)
                     if (ents[i].tag == ACL_USER_OBJ || ents[i].tag == ACL_GROUP_OBJ || ents[i].tag == ACL_OTHER) ents[w++] = ents[i];
                 nent = w;
             }
-            if (del && parse_spec (del, 1) < 0) return EXECUTION_FAILURE;
-            if (mod && parse_spec (mod, 0) < 0) return EXECUTION_FAILURE;
+            if (del && parse_spec (del, 1) < 0) return EX_USAGE;
+            if (mod && parse_spec (mod, 0) < 0) return EX_USAGE;
         }
 
         fix_mask ();

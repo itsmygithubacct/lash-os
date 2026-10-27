@@ -254,12 +254,25 @@ int pb_start(const struct pb_start_options *o,struct pb_status *s) {
     /* The service cannot finish successful startup until this socket accepts
      * the creator's acknowledgement. EOF or timeout cancels the new session. */
     int64_t until=pb_now()+PB_TIMEOUT;
-    if(pb_wait(rd,POLLIN,until)==0) {
+    /* Ride out EINTR only while waiting for this session to become ready.
+     * pb_wait itself still returns EINTR, so a caller trap can interrupt
+     * ptybroker receive. The cleanup wait below uses the same loop. */
+    int waited;
+    do waited=pb_wait(rd,POLLIN,until);
+    while(waited<0 && errno==EINTR && pb_now()<until);
+    if(waited==0) {
         struct pb_ready ready;
-        ssize_t got=recv(rd,&ready,sizeof ready,MSG_TRUNC);
+        ssize_t got;
+        do got=recv(rd,&ready,sizeof ready,MSG_TRUNC);
+        while(got<0 && errno==EINTR && pb_now()<until);
         if(got==(ssize_t)sizeof ready) {
             if(ready.error)errno=ready.error;
-            else if(send(rd,"G",1,MSG_NOSIGNAL)==1){*s=ready.status;result=0;}
+            else {
+                ssize_t sent;
+                do sent=send(rd,"G",1,MSG_NOSIGNAL);
+                while(sent<0 && errno==EINTR && pb_now()<until);
+                if(sent==1){*s=ready.status;result=0;}
+            }
         } else errno=ECHILD;
     }
     e=errno;

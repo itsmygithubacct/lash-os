@@ -1,0 +1,109 @@
+--- a/whoami.c
++++ b/whoami.c
+@@ -22,45 +22,80 @@
+ 
+ #include <config.h>
+ #include <stdio.h>
++#include <pwd.h>
++#include <unistd.h>
++#include <string.h>
+ 
+ #include "../builtins.h"
+ #include "../shell.h"
+ #include "bashgetopt.h"
+ #include "common.h"
+ 
++/* Accept GNU's unique long-option prefixes, without borrowing its banners. */
+ int
+ whoami_builtin (WORD_LIST *list)
+ {
+-  int opt;
++  char *arg, *operand;
++  size_t len;
++  int end_options, posix_options;
++  struct passwd *pwd;
+ 
+-  reset_internal_getopt ();
+-  while ((opt = internal_getopt (list, "")) != -1)
++  operand = 0;
++  end_options = 0;
++  posix_options = getenv ("POSIXLY_CORRECT") != 0;
++  for (; list; list = list->next)
+     {
+-      switch (opt)
+-	{
+-	CASE_HELPOPT;
+-	default:
+-	  builtin_usage ();
+-	  return (EX_USAGE);
+-	}
++      arg = list->word->word;
++      if (end_options == 0 && strcmp (arg, "--") == 0)
++        {
++          end_options = 1;
++          continue;
++        }
++      if (end_options == 0 && arg[0] == '-' && arg[1])
++        {
++          len = strlen (arg + 2);
++          if (arg[1] == '-' && len && len <= 4 &&
++              strncmp ("help", arg + 2, len) == 0)
++            {
++              builtin_help ();
++              return (sh_chkwrite (EXECUTION_SUCCESS));
++            }
++          if (arg[1] == '-' && len && len <= 7 &&
++              strncmp ("version", arg + 2, len) == 0)
++            {
++              printf ("whoami (bash-os builtin, Bash %s)\n", dist_version);
++              return (sh_chkwrite (EXECUTION_SUCCESS));
++            }
++          builtin_error ("%s: invalid option", arg);
++          return (EXECUTION_FAILURE);
++        }
++      if (operand == 0)
++        operand = arg;
++      if (posix_options)
++        end_options = 1;
+     }
+-  list = loptend;
+-  if (list)
++  if (operand)
+     {
+-      builtin_usage ();
+-      return (EX_USAGE);
++      builtin_error ("extra operand: %s", operand);
++      return (EXECUTION_FAILURE);
+     }
+ 
+-  if (current_user.user_name == 0)
+-    get_current_user_info ();
+-  printf ("%s\n", current_user.user_name);
+-  return (EXECUTION_SUCCESS);
++  pwd = getpwuid (geteuid ());
++  if (pwd == 0)
++    {
++      builtin_error ("cannot find name for user ID %lu", (unsigned long) geteuid ());
++      return (EXECUTION_FAILURE);
++    }
++  printf ("%s\n", pwd->pw_name);
++  return (sh_chkwrite (EXECUTION_SUCCESS));
+ }
+ 
+ char *whoami_doc[] = {
+ 	"Print user name",
+ 	"",
+ 	"Display name of current user.",
++	"Use the effective user ID; operands are rejected.",
++	"--help displays help; --version displays the Bash builtin version.",
+ 	(char *)NULL
+ };
+ 
+@@ -69,6 +104,6 @@
+ 	whoami_builtin,
+ 	BUILTIN_ENABLED,
+ 	whoami_doc,
+-	"whoami",
++	"whoami [--help] [--version]",
+ 	0
+ };

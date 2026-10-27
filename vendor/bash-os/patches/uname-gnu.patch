@@ -1,0 +1,276 @@
+--- a/uname.c
++++ b/uname.c
+@@ -1,7 +1,7 @@
+ /*
+  * uname - print system information
+  *
+- * usage: uname [-amnrsv]
++ * usage: uname [-amnrsvpio]
+  *
+  */
+ 
+@@ -25,6 +25,7 @@
+ 
+ #include <config.h>
+ #include <stdio.h>
++#include <string.h>
+ 
+ #include "bashtypes.h"
+ 
+@@ -47,71 +48,121 @@
+ #include "bashgetopt.h"
+ #include "common.h"
+ 
+-#define FLAG_SYSNAME	0x01	/* -s */
+-#define FLAG_NODENAME	0x02	/* -n */
+-#define FLAG_RELEASE	0x04	/* -r */
+-#define FLAG_VERSION	0x08	/* -v */
+-#define FLAG_MACHINE	0x10	/* -m, -p */
+-
+-#define FLAG_ALL	0x1f
++#define FLAG_SYSNAME   0x01
++#define FLAG_NODENAME  0x02
++#define FLAG_RELEASE   0x04
++#define FLAG_VERSION   0x08
++#define FLAG_MACHINE   0x10
++#define FLAG_PROCESSOR 0x20
++#define FLAG_PLATFORM  0x40
++#define FLAG_OS        0x80
++#define FLAG_ALL       0xff
+ 
+ #ifndef errno
+ extern int errno;
+ #endif
+ 
+-static void uprint(int, char *);
+-
+-static int uname_flags;
++static int
++uname_longopt (const char *arg)
++{
++  static const char *names[] = {
++    "all", "kernel-name", "nodename", "kernel-release", "kernel-version",
++    "machine", "processor", "hardware-platform", "operating-system",
++    "help", "version", 0
++  };
++  static const int values[] = { 'a', 's', 'n', 'r', 'v', 'm', 'p', 'i', 'o', 'h', 'V' };
++  int i, match, count;
++  size_t len;
++
++  len = strlen (arg);
++  match = count = 0;
++  for (i = 0; names[i]; i++)
++    {
++      if (strcmp (names[i], arg) == 0)
++        return values[i];
++      if (len && strncmp (names[i], arg, len) == 0)
++        {
++          match = values[i];
++          count++;
++        }
++    }
++  return count == 1 ? match : -1;
++}
+ 
+ int
+ uname_builtin (WORD_LIST *list)
+ {
+-  int opt, r;
++  int option, flags, all, end_options, long_option, i, printed;
++  int posix_options;
++  char *arg, *p, *operand;
++  const char *fields[8];
+   struct utsname uninfo;
+ 
+-  uname_flags = 0;
+-  reset_internal_getopt ();
+-  while ((opt = internal_getopt (list, "amnprsv")) != -1)
+-    {
+-      switch (opt)
+-	{
+-	case 'a':
+-	  uname_flags |= FLAG_ALL;
+-	  break;
+-	case 'm':
+-	case 'p':
+-	  uname_flags |= FLAG_MACHINE;
+-	  break;
+-	case 'n':
+-	  uname_flags |= FLAG_NODENAME;
+-	  break;
+-	case 'r':
+-	  uname_flags |= FLAG_RELEASE;
+-	  break;
+-	case 's':
+-	  uname_flags |= FLAG_SYSNAME;
+-	  break;
+-	case 'v':
+-	  uname_flags |= FLAG_VERSION;
+-	  break;
+-	CASE_HELPOPT;
+-	default:
+-	  builtin_usage ();
+-	  return (EX_USAGE);
+-	}
+-    }
+-  list = loptend;
+-
+-  if (list)
+-    {
+-      builtin_usage ();
+-      return (EX_USAGE);
+-    }
+-
+-  if (uname_flags == 0)
+-    uname_flags = FLAG_SYSNAME;
+-
+-  /* Only ancient systems will not have uname(2). */
++  flags = all = end_options = 0;
++  operand = 0;
++  posix_options = getenv ("POSIXLY_CORRECT") != 0;
++  for (; list; list = list->next)
++    {
++      arg = list->word->word;
++      if (!end_options && strcmp (arg, "--") == 0)
++        {
++          end_options = 1;
++          continue;
++        }
++      if (end_options || arg[0] != '-' || arg[1] == 0)
++        {
++          if (operand == 0)
++            operand = arg;
++          if (posix_options)
++            end_options = 1;
++          continue;
++        }
++      long_option = arg[1] == '-';
++      p = arg + 1;
++      do
++        {
++          option = long_option ? uname_longopt (arg + 2) : (unsigned char)*p++;
++          switch (option)
++            {
++            case 'a': flags |= FLAG_ALL; all = 1; break;
++            case 's': flags |= FLAG_SYSNAME; break;
++            case 'n': flags |= FLAG_NODENAME; break;
++            case 'r': flags |= FLAG_RELEASE; break;
++            case 'v': flags |= FLAG_VERSION; break;
++            case 'm': flags |= FLAG_MACHINE; break;
++            case 'p': flags |= FLAG_PROCESSOR; break;
++            case 'i': flags |= FLAG_PLATFORM; break;
++            case 'o': flags |= FLAG_OS; break;
++            case 'h':
++              if (long_option)
++                {
++                  builtin_help ();
++                  return (sh_chkwrite (EXECUTION_SUCCESS));
++                }
++              goto bad_option;
++            case 'V':
++              if (long_option)
++                {
++                  printf ("uname (bash-os builtin, Bash %s)\n", dist_version);
++                  return (sh_chkwrite (EXECUTION_SUCCESS));
++                }
++              goto bad_option;
++            default:
++            bad_option:
++              builtin_error ("%s: invalid or ambiguous option", arg);
++              return (EXECUTION_FAILURE);
++            }
++        }
++      while (!long_option && *p);
++    }
++  if (operand)
++    {
++      builtin_error ("extra operand: %s", operand);
++      return (EXECUTION_FAILURE);
++    }
++  if (flags == 0)
++    flags = FLAG_SYSNAME;
++
+ #ifdef HAVE_UNAME
+   if (uname (&uninfo) < 0)
+     {
+@@ -123,37 +174,53 @@
+   return (EXECUTION_FAILURE);
+ #endif
+ 
+-  uprint (FLAG_SYSNAME, uninfo.sysname);
+-  uprint (FLAG_NODENAME, uninfo.nodename);
+-  uprint (FLAG_RELEASE, uninfo.release);
+-  uprint (FLAG_VERSION, uninfo.version);
+-  uprint (FLAG_MACHINE, uninfo.machine);
+-
+-  return (EXECUTION_SUCCESS);
++  fields[0] = uninfo.sysname;
++  fields[1] = uninfo.nodename;
++  fields[2] = uninfo.release;
++  fields[3] = uninfo.version;
++  fields[4] = uninfo.machine;
++  /* Linux's uname(2) does not supply processor or hardware-platform strings.
++     GNU uname reports unknown for explicit -p/-i and omits them under -a. */
++  fields[5] = fields[6] = "unknown";
++#if defined (__linux__)
++  fields[7] = "GNU/Linux";
++#else
++  fields[7] = uninfo.sysname;
++#endif
++  if (all)
++    flags &= ~(FLAG_PROCESSOR|FLAG_PLATFORM);
++  printed = 0;
++  for (i = 0; i < 8; i++)
++    if (flags & (1 << i))
++      {
++        if (printed)
++          putchar (' ');
++        fputs (fields[i], stdout);
++        printed = 1;
++      }
++  putchar ('\n');
++  return (sh_chkwrite (EXECUTION_SUCCESS));
+ }
+ 
+-static void
+-uprint (int flag, char *info)
+-{
+-  if (uname_flags & flag)
+-    {
+-      uname_flags &= ~flag;
+-      printf ("%s%c", info, uname_flags ? ' ' : '\n');
+-    }
+-}
+-
+ char *uname_doc[] = {
+-	"Display system information.",
+-	"",
+-	"Display information about the system hardware and OS.",
+-	(char *)NULL
++        "Display system information.",
++        "",
++        "Display information about the system hardware and OS.",
++        "-s, --kernel-name; -n, --nodename; -r, --kernel-release;",
++        "-v, --kernel-version; -m, --machine; -p, --processor;",
++        "-i, --hardware-platform; -o, --operating-system select fields.",
++        "-a, --all prints all available fields in the order listed above.",
++        "On Linux, -p and -i print unknown; -a omits these unknown fields.",
++        "With no selector, print the kernel name. Operands are rejected.",
++        "--help displays help; --version displays the Bash builtin version.",
++        (char *)NULL
+ };
+ 
+ struct builtin uname_struct = {
+-	"uname",
+-	uname_builtin,
+-	BUILTIN_ENABLED,
+-	uname_doc,
+-	"uname [-amnrsv]",
+-	0
++        "uname",
++        uname_builtin,
++        BUILTIN_ENABLED,
++        uname_doc,
++        "uname [-amnrsvpio]",
++        0
+ };

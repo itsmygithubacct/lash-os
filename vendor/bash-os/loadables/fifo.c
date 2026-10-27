@@ -17,7 +17,8 @@
  * size. `push` appends to the tail. `pull` removes from the head.
  * `unget` prepends so the next `pull` returns that value. `peek`
  * advances an independent peek cursor but does not consume data; any
- * mutating operation resets the peek cursor to the current head.
+ * successful mutating operation resets the peek cursor to the current head.
+ * Invalid requests and failed output leave the queue and cursor unchanged.
  */
 
 #include <config.h>
@@ -56,16 +57,47 @@ static int
 bf_parse_int (const char *s, int *out)
 {
   char *end = NULL;
+  const char *p;
   long v;
 
   if (!s || !*s)
     return -1;
+  p = s;
+  if (*p == '+' || *p == '-')
+    p++;
+  if (!*p)
+    return -1;
+  for (; *p; p++)
+    if (*p < '0' || *p > '9')
+      return -1;
   errno = 0;
   v = strtol (s, &end, 10);
   if (errno == ERANGE || end == s || *end != '\0' || v < INT_MIN || v > INT_MAX)
     return -1;
   *out = (int) v;
   return 0;
+}
+
+/* Flush before committing a pull/peek: even a buffered write can fail. */
+static int
+bf_output_status (int failed)
+{
+  if (fflush (stdout) == EOF || ferror (stdout))
+    failed = 1;
+  if (failed)
+    {
+      int saved_errno = errno;
+      clearerr (stdout);
+      builtin_error ("write error: %s", strerror (saved_errno ? saved_errno : EIO));
+      return EXECUTION_FAILURE;
+    }
+  return EXECUTION_SUCCESS;
+}
+
+static int
+bf_print_int (int v)
+{
+  return bf_output_status (printf ("%d\n", v) < 0);
 }
 
 static int
@@ -93,11 +125,12 @@ bf_unget_one (int v)
 }
 
 static int
-bf_pull_one (int *out)
+bf_pull_one (void)
 {
   if (bf_count <= 0)
     return -1;
-  *out = bf_ring[bf_head];
+  if (bf_print_int (bf_ring[bf_head]) != EXECUTION_SUCCESS)
+    return -1;
   bf_head = (bf_head + 1) % BASHFIFO_CAP;
   bf_count--;
   if (bf_count == 0)
@@ -107,11 +140,12 @@ bf_pull_one (int *out)
 }
 
 static int
-bf_peek_one (int *out)
+bf_peek_one (void)
 {
   if (bf_count <= 0 || bf_peek_count >= bf_count)
     return -1;
-  *out = bf_ring[bf_peek];
+  if (bf_print_int (bf_ring[bf_peek]) != EXECUTION_SUCCESS)
+    return -1;
   bf_peek = (bf_peek + 1) % BASHFIFO_CAP;
   bf_peek_count++;
   return 0;
@@ -171,7 +205,6 @@ int
 fifo_builtin (WORD_LIST *list)
 {
   const char *verb;
-  int v;
 
   if (!list)
     {
@@ -195,9 +228,8 @@ fifo_builtin (WORD_LIST *list)
           builtin_error ("pull: unexpected argument: %s", list->word->word);
           return EX_USAGE;
         }
-      if (bf_pull_one (&v) < 0)
+      if (bf_pull_one () < 0)
         return EXECUTION_FAILURE;
-      printf ("%d\n", v);
       return EXECUTION_SUCCESS;
     }
 
@@ -208,9 +240,8 @@ fifo_builtin (WORD_LIST *list)
           builtin_error ("peek: unexpected argument: %s", list->word->word);
           return EX_USAGE;
         }
-      if (bf_peek_one (&v) < 0)
+      if (bf_peek_one () < 0)
         return EXECUTION_FAILURE;
-      printf ("%d\n", v);
       return EXECUTION_SUCCESS;
     }
 
@@ -233,15 +264,24 @@ fifo_builtin (WORD_LIST *list)
           builtin_error ("depth: unexpected argument: %s", list->word->word);
           return EX_USAGE;
         }
-      printf ("%d\n", bf_count);
-      return EXECUTION_SUCCESS;
+      return bf_print_int (bf_count);
     }
 
   if (!strcmp (verb, "-h") || !strcmp (verb, "--help"))
     {
+      int failed = 0;
+      if (list)
+        {
+          builtin_error ("%s: unexpected argument: %s", verb, list->word->word);
+          return EX_USAGE;
+        }
       for (int i = 0; fifo_doc[i]; i++)
-        puts (fifo_doc[i]);
-      return EXECUTION_SUCCESS;
+        if (puts (fifo_doc[i]) == EOF)
+          {
+            failed = 1;
+            break;
+          }
+      return bf_output_status (failed);
     }
 
   builtin_error ("unknown verb: %s", verb);
@@ -250,7 +290,7 @@ fifo_builtin (WORD_LIST *list)
 }
 
 char *fifo_doc[] = {
-  "Shared 64-entry input FIFO for ncurses-input loadables.",
+  "Process-local 64-entry input FIFO of signed int events.",
   "",
   "    fifo push INT [INT...]      append events to tail",
   "    fifo pull                   consume and print head event",
@@ -259,7 +299,13 @@ char *fifo_doc[] = {
   "    fifo clear                  empty the FIFO",
   "    fifo depth                  print queued event count",
   "",
-  "Entries are signed int values. Mutating verbs reset the peek cursor.",
+  "INT is optional + or - followed by decimal digits, within C int bounds.",
+  "push and unget preserve argument order and reject a whole invalid batch.",
+  "Successful push, unget, pull and clear reset the peek cursor to the head.",
+  "depth and failed operations preserve the cursor; exhausted peek returns 1.",
+  "Status: 0 success; 1 empty/exhausted or output error; 2 invalid request.",
+  "Failed output preserves the queue and cursor (partial output is possible).",
+  "State persists in this shell; subshells inherit a private copy.",
   (char *) NULL
 };
 

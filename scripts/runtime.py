@@ -1,5 +1,6 @@
 """Shared metadata and verified downloads for the portable VM builds."""
 import hashlib
+import json
 from pathlib import Path, PurePosixPath
 import urllib.request
 
@@ -16,6 +17,12 @@ ARCHES = {
 # Linux patches applied to the pinned runtime kernel for every architecture.
 KERNEL_PATCHES = ["linux-riscv64-jit-zext.patch", "linux-riscv64-jit-region.patch",
                   "linux-vmalloc-inline-purge.patch"]
+
+
+def guest_dependencies(root):
+    """Libraries linked into the full guest, excluding optional language runtimes."""
+    packages = json.loads((Path(root) / "vendor/bash-os/config/dependencies.json").read_text())
+    return {name: packages[name] for name in ("pcre2", "zlib", "xz", "zstd", "bzip2")}
 
 
 def digest(path):

@@ -4,9 +4,10 @@
  *   zcat [FILE...]
  *
  * Decompresses gzip-format input from FILE(s) (or stdin) to stdout.
- * libz is already linked into bash-os via zlib's EXTRA_LIBS, so
- * this is a thin gzopen/gzread wrapper. POSIX shape — no extension
- * sniffing, gzip-only. For xz/zstd use `zlib -d -f xz` directly.
+ * libz is already linked into bash-os via zlib's EXTRA_LIBS. Use its
+ * streaming inflater to retain output produced before an integrity error.
+ * POSIX shape — no extension sniffing, gzip-only. For xz/zstd use
+ * `zlib -d -f xz` directly.
  *
  * --- LICENSE --- MIT, same boilerplate as binhex.c.
  */
@@ -16,8 +17,6 @@
 #  include <unistd.h>
 #endif
 
-#include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -25,59 +24,19 @@
 
 #include "loadables.h"
 
-#define BZ_GZIP_MIN_HEADER 10
+enum bz_result { BZ_OK, BZ_INPUT_ERROR, BZ_FATAL_ERROR };
 
 static int
-bz_pump (gzFile gf)
-{
-    char buf[8192];
-    int n;
-    while ((n = gzread (gf, buf, sizeof buf)) > 0) {
-        char *p = buf; size_t left = (size_t) n;
-        while (left > 0) {
-            ssize_t w = write (STDOUT_FILENO, p, left);
-            if (w < 0) {
-                if (errno == EINTR) continue;
-                builtin_error ("write: %s", strerror (errno));
-                return -1;
-            }
-            p += w; left -= (size_t) w;
-        }
-    }
-    if (n < 0) {
-        int err;
-        const char *msg = gzerror (gf, &err);
-        builtin_error ("gzread: %s", msg);
-        return -1;
-    }
-    /* gzread returned 0 — either real EOF or zlib gave up early on a
-     * truncated stream. Distinguish via gzerror(): a clean termination
-     * leaves err == Z_OK / Z_STREAM_END; a truncated header or mid-
-     * stream cut leaves Z_BUF_ERROR / Z_DATA_ERROR / etc. Surface that
-     * as a non-zero rc so 267-zcat-stdin.sh case 6 (8-byte truncated
-     * header) is rejected instead of silently returning success. */
-    {
-        int err = Z_OK;
-        const char *msg = gzerror (gf, &err);
-        if (err != Z_OK && err != Z_STREAM_END) {
-            builtin_error ("gzread: %s", msg && *msg ? msg : "truncated stream");
-            return -1;
-        }
-        if (!gzeof (gf)) {
-            builtin_error ("gzread: stream ended before end-of-file marker");
-            return -1;
-        }
-    }
-    return 0;
-}
-
-static int
-bz_write_all_fd (int fd, const char *buf, size_t len)
+bz_write_all (const unsigned char *buf, size_t len)
 {
     while (len > 0) {
-        ssize_t n = write (fd, buf, len);
+        ssize_t n = write (STDOUT_FILENO, buf, len);
         if (n < 0) {
             if (errno == EINTR) continue;
+            return -1;
+        }
+        if (n == 0) {
+            errno = EIO;
             return -1;
         }
         buf += n;
@@ -86,148 +45,144 @@ bz_write_all_fd (int fd, const char *buf, size_t len)
     return 0;
 }
 
-static int
-bz_magic_ok (const unsigned char *buf, size_t n)
+/* Retain unread bytes when a gzip magic number spans two reads. */
+static ssize_t
+bz_read_more (int fd, z_stream *s, unsigned char *buf, size_t size)
 {
-    return n >= 2 && buf[0] == 0x1f && buf[1] == 0x8b;
+    ssize_t n;
+    if (s->avail_in)
+        memmove (buf, s->next_in, s->avail_in);
+    s->next_in = buf;
+    do {
+        n = read (fd, buf + s->avail_in, size - s->avail_in);
+    } while (n < 0 && errno == EINTR);
+    if (n > 0) s->avail_in += (uInt) n;
+    return n;
 }
 
-static gzFile
-bz_gzopen_checked_path (const char *path)
+static enum bz_result
+bz_pump (int fd, const char *name)
 {
-    int fd = open (path, O_RDONLY);
-    if (fd < 0) {
-        builtin_error ("%s: %s", path, strerror (errno));
-        return NULL;
+    z_stream s;
+    unsigned char inbuf[8192], outbuf[8192];
+    int at_header = 1, seen_member = 0, eof = 0;
+    enum bz_result result = BZ_FATAL_ERROR;
+
+    memset (&s, 0, sizeof s);
+    /* Accept gzip only, without zlib autodetection or transparent copying. */
+    int ret = inflateInit2 (&s, MAX_WBITS + 16);
+    if (ret != Z_OK) {
+        builtin_error ("%s: %s", name, zError (ret));
+        return BZ_FATAL_ERROR;
     }
 
-    unsigned char hdr[BZ_GZIP_MIN_HEADER];
-    ssize_t n = read (fd, hdr, sizeof hdr);
-    if (n < 0) {
-        builtin_error ("%s: %s", path, strerror (errno));
-        close (fd);
-        return NULL;
-    }
-    if (!bz_magic_ok (hdr, (size_t) n) || n < BZ_GZIP_MIN_HEADER) {
-        builtin_error ("%s: not in gzip format", path);
-        close (fd);
-        return NULL;
-    }
-    if (lseek (fd, 0, SEEK_SET) < 0) {
-        builtin_error ("%s: %s", path, strerror (errno));
-        close (fd);
-        return NULL;
-    }
-
-    gzFile gf = gzdopen (fd, "rb");
-    if (!gf) {
-        builtin_error ("%s: %s", path, strerror (errno));
-        close (fd);
-    }
-    return gf;
-}
-
-static gzFile
-bz_gzopen_checked_stdin (int *empty)
-{
-    char tmpl[] = "/tmp/zcat.XXXXXX";
-    int fd = mkstemp (tmpl);
-    if (fd < 0) {
-        builtin_error ("mkstemp: %s", strerror (errno));
-        return NULL;
-    }
-    unlink (tmpl);
-
-    unsigned char hdr[BZ_GZIP_MIN_HEADER];
-    size_t got = 0;
-    while (got < sizeof hdr) {
-        ssize_t n = read (STDIN_FILENO, hdr + got, sizeof hdr - got);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            builtin_error ("stdin: %s", strerror (errno));
-            close (fd);
-            return NULL;
-        }
-        if (n == 0) break;
-        got += (size_t) n;
-    }
-
-    if (got == 0) {
-        *empty = 1;
-        close (fd);
-        return NULL;
-    }
-    if (!bz_magic_ok (hdr, got) || got < BZ_GZIP_MIN_HEADER) {
-        builtin_error ("stdin: not in gzip format");
-        close (fd);
-        return NULL;
-    }
-    if (bz_write_all_fd (fd, (const char *) hdr, got) < 0) {
-        builtin_error ("stdin: %s", strerror (errno));
-        close (fd);
-        return NULL;
-    }
-
-    char buf[8192];
     for (;;) {
-        ssize_t n = read (STDIN_FILENO, buf, sizeof buf);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            builtin_error ("stdin: %s", strerror (errno));
-            close (fd);
-            return NULL;
+        if (at_header) {
+            while (s.avail_in < 2 && !eof) {
+                ssize_t n = bz_read_more (fd, &s, inbuf, sizeof inbuf);
+                if (n < 0) goto read_error;
+                if (n == 0) eof = 1;
+            }
+            if (s.avail_in < 2) {
+                if (seen_member) result = BZ_OK;
+                else builtin_error ("%s: unexpected end of file", name);
+                break;
+            }
+            if (s.next_in[0] != 0x1f || s.next_in[1] != 0x8b) {
+                if (!seen_member) {
+                    builtin_error ("%s: not in gzip format", name);
+                    result = BZ_INPUT_ERROR;
+                    break;
+                }
+                /* Preserve gzread's treatment of trailing non-member data.
+                 * Consume it so another '-' starts at the same stdin EOF. */
+                while (!eof) {
+                    s.avail_in = 0;
+                    ssize_t n = bz_read_more (fd, &s, inbuf, sizeof inbuf);
+                    if (n < 0) goto read_error;
+                    if (n == 0) eof = 1;
+                }
+                result = BZ_OK;
+                break;
+            }
+            if (seen_member) {
+                /* inflateReset retains next_in and avail_in. */
+                ret = inflateReset (&s);
+                if (ret != Z_OK) {
+                    builtin_error ("%s: %s", name, zError (ret));
+                    break;
+                }
+            }
+            at_header = 0;
         }
-        if (n == 0) break;
-        if (bz_write_all_fd (fd, buf, (size_t) n) < 0) {
-            builtin_error ("stdin: %s", strerror (errno));
-            close (fd);
-            return NULL;
+
+        if (s.avail_in == 0 && !eof) {
+            ssize_t n = bz_read_more (fd, &s, inbuf, sizeof inbuf);
+            if (n < 0) goto read_error;
+            if (n == 0) eof = 1;
         }
-    }
-    if (lseek (fd, 0, SEEK_SET) < 0) {
-        builtin_error ("stdin: %s", strerror (errno));
-        close (fd);
-        return NULL;
+        uInt available = s.avail_in;
+        s.next_out = outbuf;
+        s.avail_out = sizeof outbuf;
+        ret = inflate (&s, Z_NO_FLUSH);
+        size_t produced = sizeof outbuf - s.avail_out;
+
+        /* Even Z_DATA_ERROR can accompany decoded bytes. Write those bytes
+         * before diagnosing a CRC or length failure, just as gzip does. */
+        if (bz_write_all (outbuf, produced) < 0) {
+            builtin_error ("write: %s", strerror (errno));
+            break;
+        }
+        if (ret == Z_STREAM_END) {
+            seen_member = 1;
+            at_header = 1;
+            continue;
+        }
+        if (ret != Z_OK && ret != Z_BUF_ERROR) {
+            builtin_error ("%s: %s", name, s.msg ? s.msg : zError (ret));
+            break;
+        }
+        if (produced == 0 && s.avail_in == available) {
+            builtin_error ("%s: %s", name,
+                           eof ? "unexpected end of file" : "invalid gzip stream");
+            break;
+        }
     }
 
-    gzFile gf = gzdopen (fd, "rb");
-    if (!gf) {
-        builtin_error ("gzdopen stdin: %s", strerror (errno));
-        close (fd);
-    }
-    return gf;
+done:
+    inflateEnd (&s);
+    return result;
+
+read_error:
+    builtin_error ("%s: %s", name, strerror (errno));
+    goto done;
 }
 
 int
 zcat_builtin (WORD_LIST *list)
 {
-    /* No FILE → read stdin. */
-    if (!list) {
-        int empty = 0;
-        gzFile gf = bz_gzopen_checked_stdin (&empty);
-        if (!gf) return empty ? EXECUTION_SUCCESS : EXECUTION_FAILURE;
-        int rc = bz_pump (gf);
-        gzclose (gf);
-        return rc < 0 ? EXECUTION_FAILURE : EXECUTION_SUCCESS;
-    }
+    if (!list)
+        return bz_pump (STDIN_FILENO, "stdin") == BZ_OK
+               ? EXECUTION_SUCCESS : EXECUTION_FAILURE;
 
     int rc = EXECUTION_SUCCESS;
     for (WORD_LIST *p = list; p; p = p->next) {
         const char *path = p->word->word;
-        gzFile gf;
-        if (!strcmp (path, "-")) {
-            int empty = 0;
-            gf = bz_gzopen_checked_stdin (&empty);
-            if (empty) continue;
-        } else {
-            gf = bz_gzopen_checked_path (path);
-        }
-        if (!gf) {
+        int is_stdin = !strcmp (path, "-");
+        int fd = is_stdin ? STDIN_FILENO : open (path, O_RDONLY);
+        if (fd < 0) {
+            builtin_error ("%s: %s", path, strerror (errno));
             rc = EXECUTION_FAILURE;
             continue;
         }
-        if (bz_pump (gf) < 0) rc = EXECUTION_FAILURE;
-        gzclose (gf);
+        enum bz_result result = bz_pump (fd, is_stdin ? "stdin" : path);
+        if (!is_stdin) close (fd);
+        if (result != BZ_OK) {
+            rc = EXECUTION_FAILURE;
+            /* Missing/non-gzip named inputs are recoverable. Integrity and
+             * stdin failures stop this invocation, without exiting Bash. */
+            if (result == BZ_FATAL_ERROR || is_stdin) break;
+        }
     }
     return rc;
 }

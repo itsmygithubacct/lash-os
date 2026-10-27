@@ -137,6 +137,8 @@ col
 colrm
 expr
 hexdump
+bashclear
+clear
 tput
 tinfo
 strings
@@ -258,6 +260,7 @@ cksum
 obj
 index
 pack
+git
 ssh
 pkg
 ntp
@@ -277,3 +280,7 @@ hl
 sudo
 gpu
 ptybroker
+base64
+sha256sum
+gzip
+tar

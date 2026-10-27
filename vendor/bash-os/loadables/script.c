@@ -32,7 +32,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <ctype.h>
 #include <fcntl.h>
+#include <limits.h>
+#include <math.h>
 #include <termios.h>
 #include <signal.h>
 #include <time.h>
@@ -79,21 +82,23 @@ static long long
 bsc_parse_limit (const char *s)
 {
     char *end = NULL;
-    double v;
+    long double v;
     if (!s || !*s) return -1;
     errno = 0;
-    v = strtod (s, &end);
-    if (errno || end == s || v < 0) return -1;
+    v = strtold (s, &end);
+    if (errno || end == s || !isfinite (v) || v < 0) return -1;
     if (*end) {
         if (end[1] != '\0') return -1;
         switch (*end) {
-        case 'k': case 'K': v *= 1024.0; break;
-        case 'm': case 'M': v *= 1024.0 * 1024.0; break;
-        case 'g': case 'G': v *= 1024.0 * 1024.0 * 1024.0; break;
+        case 'k': case 'K': v *= 1024.0L; break;
+        case 'm': case 'M': v *= 1024.0L * 1024.0L; break;
+        case 'g': case 'G': v *= 1024.0L * 1024.0L * 1024.0L; break;
         default: return -1;
         }
     }
-    if (v > 9223372036854775807.0) return -1;
+    /* LLONG_MAX rounds up in double precision.  Compare against the
+       exclusive upper bound before converting, including after scaling. */
+    if (!isfinite (v) || v >= (long double) LLONG_MAX + 1.0L) return -1;
     return (long long) v;
 }
 
@@ -287,6 +292,14 @@ bsc_record_cmd (WORD_LIST *args)
         builtin_error ("ptsname: %s", strerror (errno));
         close (master); return EXECUTION_FAILURE;
     }
+    /* Configure the private PTY before either process can relay input.
+       Doing this only in the child races the parent's first write and can
+       echo input even when -E never was requested. On Linux the master
+       exposes the paired terminal's termios settings. */
+    if (bsc_apply_echo (master, echo_mode) < 0) {
+        builtin_error ("pty echo: %s", strerror (errno));
+        close (master); return EXECUTION_FAILURE;
+    }
 
     struct winsize ws = {0};
     ioctl (STDIN_FILENO, TIOCGWINSZ, &ws);
@@ -385,7 +398,6 @@ bsc_record_cmd (WORD_LIST *args)
         int slave = open (slave_path, O_RDWR);
         if (slave < 0) _exit (126);
         ioctl (slave, TIOCSCTTY, 0);
-        bsc_apply_echo (slave, echo_mode);
         dup2 (slave, 0); dup2 (slave, 1); dup2 (slave, 2);
         if (slave > 2) close (slave);
         bos_prepare_child ();
@@ -557,6 +569,61 @@ bsc_record_cmd (WORD_LIST *args)
     return w == pid && WIFEXITED (status) ? WEXITSTATUS (status) : 1;
 }
 
+static const char *
+bsc_timing_skip_space (const char *text)
+{
+    while (isspace ((unsigned char) *text)) text++;
+    return text;
+}
+
+/* Every field must consume a complete whitespace-delimited token. Check
+   errno and the destination range before using any converted value. */
+static int
+bsc_timing_delay (const char **text, double *value)
+{
+    const char *start = bsc_timing_skip_space (*text);
+    char *end;
+    errno = 0;
+    double parsed = strtod (start, &end);
+    if (errno || end == start || (*end && !isspace ((unsigned char) *end))
+        || !isfinite (parsed) || parsed < 0)
+        return -1;
+    *value = parsed;
+    *text = bsc_timing_skip_space (end);
+    return 0;
+}
+
+static int
+bsc_timing_bytes (const char **text, long *value)
+{
+    const char *start = bsc_timing_skip_space (*text);
+    char *end;
+    errno = 0;
+    long parsed = strtol (start, &end, 10);
+    if (errno || end == start || (*end && !isspace ((unsigned char) *end))
+        || parsed < 0)
+        return -1;
+    *value = parsed;
+    *text = bsc_timing_skip_space (end);
+    return 0;
+}
+
+static int
+bsc_timing_dimension (const char **text, unsigned *value)
+{
+    const char *start = bsc_timing_skip_space (*text);
+    char *end;
+    if (*start == '-') return -1;
+    errno = 0;
+    unsigned long parsed = strtoul (start, &end, 10);
+    if (errno || end == start || (*end && !isspace ((unsigned char) *end))
+        || parsed > UINT_MAX)
+        return -1;
+    *value = (unsigned) parsed;
+    *text = bsc_timing_skip_space (end);
+    return 0;
+}
+
 static int
 bsc_replay_cmd (WORD_LIST *args)
 {
@@ -566,10 +633,31 @@ bsc_replay_cmd (WORD_LIST *args)
     int npos = 0;
     for (WORD_LIST *p = args; p; p = p->next) {
         const char *w = p->word->word;
-        if (strcmp (w, "-d") == 0 && p->next) { divisor = atof (p->next->word->word); p = p->next; }
+        if (strcmp (w, "-d") == 0 && p->next) {
+            char *end;
+            const char *value = p->next->word->word;
+            errno = 0;
+            divisor = strtod (value, &end);
+            if (errno || end == value || *end || !isfinite (divisor) || divisor <= 0) {
+                builtin_error ("replay: invalid divisor: %s", value);
+                return EX_USAGE;
+            }
+            p = p->next;
+        }
         else if (strcmp (w, "-I") == 0 && p->next) { in = p->next->word->word; p = p->next; }
         else if (strcmp (w, "-x") == 0 && p->next) { streams = p->next->word->word; p = p->next; }
-        else if (strcmp (w, "-F") == 0 && p->next) { out_fd = atoi (p->next->word->word); p = p->next; }
+        else if (strcmp (w, "-F") == 0 && p->next) {
+            char *end;
+            const char *value = p->next->word->word;
+            errno = 0;
+            long fd = strtol (value, &end, 10);
+            if (errno || end == value || *end || fd < 0 || fd > INT_MAX) {
+                builtin_error ("replay: invalid output descriptor: %s", value);
+                return EX_USAGE;
+            }
+            out_fd = (int) fd;
+            p = p->next;
+        }
         else if (w[0] == '-' && w[1] != '\0') {
             builtin_error ("replay: unknown flag %s", w);
             builtin_usage ();
@@ -582,7 +670,6 @@ bsc_replay_cmd (WORD_LIST *args)
         }
     }
     if (!tim || !out) { builtin_error ("replay: TIMING OUT required"); return EX_USAGE; }
-    if (divisor <= 0) divisor = 1.0;
 
     FILE *ft = fopen (tim, "r");
     if (!ft) { builtin_error ("open %s: %s", tim, strerror (errno)); return EXECUTION_FAILURE; }
@@ -594,10 +681,15 @@ bsc_replay_cmd (WORD_LIST *args)
         if (!fi) { builtin_error ("open %s: %s", in, strerror (errno)); fclose (fo); fclose (ft); return EXECUTION_FAILURE; }
     }
 
+    int rc = EXECUTION_SUCCESS;
+    unsigned long line_number = 0;
     char line[512];
     while (fgets (line, sizeof line, ft)) {
+        line_number++;
         double delay = 0.0;
         long bytes = 0;
+        const char *fields = line;
+        int advanced_event = 0;
         char tag = 'O';
         FILE *src = fo;
         int emit = 1;
@@ -606,54 +698,88 @@ bsc_replay_cmd (WORD_LIST *args)
             continue;
         if ((line[0] == 'O' || line[0] == 'I') && line[1] == ' ') {
             tag = line[0];
-            if (sscanf (line + 2, "%lf %ld", &delay, &bytes) != 2)
-                continue;
+            advanced_event = 1;
+            fields = line + 2;
             if (!strchr (streams, tag))
                 emit = 0;
             if (tag == 'I') {
-                if (!fi) continue;
                 src = fi;
             }
         } else {
-            if (sscanf (line, "%lf %ld", &delay, &bytes) != 2)
-                continue;
             if (!strchr (streams, 'O'))
                 emit = 0;
+        }
+        if (bsc_timing_delay (&fields, &delay) < 0) goto timing_error;
+        /* Classic recordings can carry the recorder's resize marker.
+           Advanced H/S metadata keeps its existing skip semantics above. */
+        if (!advanced_event && !strncmp (fields, "RESIZE", 6)
+            && (!fields[6] || isspace ((unsigned char) fields[6]))) {
+            unsigned rows, cols;
+            fields += 6;
+            if (bsc_timing_dimension (&fields, &rows) < 0
+                || bsc_timing_dimension (&fields, &cols) < 0 || *fields)
+                goto timing_error;
+            continue;
+        }
+        if (bsc_timing_bytes (&fields, &bytes) < 0 || *fields
+            || !isfinite (delay / divisor) || delay / divisor > INT_MAX)
+            goto timing_error;
+        if (!src) {
+            if (!emit) continue;
+            builtin_error ("replay: input stream requires -I IN");
+            rc = EXECUTION_FAILURE;
+            goto replay_done;
         }
         if (delay > 0) {
             struct timespec slp;
             slp.tv_sec  = (time_t) (delay / divisor);
             slp.tv_nsec = (long) (((delay / divisor) - (double) slp.tv_sec) * 1e9);
-            nanosleep (&slp, NULL);
-        }
-        if (!emit) {
-            if (fseek (src, bytes, SEEK_CUR) != 0) {
-                char discard[8192];
-                long left = bytes;
-                while (left > 0) {
-                    size_t want = left > (long) sizeof discard ? sizeof discard : (size_t) left;
-                    size_t got = fread (discard, 1, want, src);
-                    if (got == 0) break;
-                    left -= (long) got;
-                }
+            if (nanosleep (&slp, NULL) < 0 && errno != EINTR) {
+                builtin_error ("replay: delay: %s", strerror (errno));
+                rc = EXECUTION_FAILURE;
+                goto replay_done;
             }
-            continue;
         }
         char buf[8192];
         long left = bytes;
         while (left > 0) {
             size_t want = left > (long) sizeof buf ? sizeof buf : (size_t) left;
             size_t got = fread (buf, 1, want, src);
-            if (got == 0) break;
-            if (write (out_fd, buf, got) != (ssize_t) got)
-                break;
+            if (got == 0) {
+                builtin_error ("replay: %s: %s", tag == 'I' ? in : out,
+                               ferror (src) ? "read error" : "short log");
+                rc = EXECUTION_FAILURE;
+                goto replay_done;
+            }
+            if (emit) {
+                size_t offset = 0;
+                while (offset < got) {
+                    ssize_t written = write (out_fd, buf + offset, got - offset);
+                    if (written < 0 && errno == EINTR) continue;
+                    if (written <= 0) {
+                        builtin_error ("replay: write: %s", strerror (written < 0 ? errno : EIO));
+                        rc = EXECUTION_FAILURE;
+                        goto replay_done;
+                    }
+                    offset += (size_t) written;
+                }
+            }
             left -= (long) got;
         }
     }
+    if (ferror (ft)) {
+        builtin_error ("replay: %s: read error", tim);
+        rc = EXECUTION_FAILURE;
+    }
+    goto replay_done;
+timing_error:
+    builtin_error ("replay: %s: invalid timing record at line %lu", tim, line_number);
+    rc = EXECUTION_FAILURE;
+replay_done:
     if (fi) fclose (fi);
     fclose (ft);
     fclose (fo);
-    return EXECUTION_SUCCESS;
+    return rc;
 }
 
 static void
@@ -666,10 +792,13 @@ bsc_print_help (void)
     puts ("                      [-m classic|advanced] [-l LIMIT] [-E auto|never|always]");
     puts ("                      [-f] [-a|--append]");
     puts ("        Spawn CMD on a pty; record streams. At least one of -O/-I/-T/-A.");
+    puts ("        OUT/IN contain raw payload bytes, without util-linux metadata wrappers.");
     puts ("        -a / --append: append to OUT/IN/TIMING/CAST instead of truncating.");
     puts ("        Asciinema v2 header is suppressed when -a is appending to a non-empty CAST.");
     puts ("    script replay TIMING OUT [-I IN] [-x OI] [-F FD] [-d DIVISOR]");
     puts ("        Re-emit OUT pacing per TIMING. -d 2 = 2x speed, 0.5 = 0.5x.");
+    puts ("        Invalid replay data records, short logs and output errors return failure.");
+    puts ("        Advanced H/S metadata is skipped without validation.");
 }
 
 int
@@ -701,10 +830,13 @@ char *script_doc[] = {
     "                      [-m classic|advanced] [-l LIMIT] [-E auto|never|always]",
     "                      [-f] [-a|--append]",
     "        Spawn CMD on a pty; record streams. At least one of -O/-I/-T/-A.",
+    "        OUT/IN contain raw payload bytes, without util-linux metadata wrappers.",
     "        -a / --append mirrors util-linux `script -a`: prior bytes preserved;",
     "        asciinema v2 header suppressed when CAST already non-empty.",
     "    script replay TIMING OUT [-I IN] [-x OI] [-F FD] [-d DIVISOR]",
     "        Re-emit OUT pacing per TIMING. -d 2 = 2× speed, 0.5 = 0.5×.",
+    "        Invalid replay data records, short logs and output errors return failure.",
+    "        Advanced H/S metadata is skipped without validation.",
     (char *)NULL
 };
 

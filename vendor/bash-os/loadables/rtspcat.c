@@ -1,6 +1,6 @@
 /* rtspcat.c — an RTSP/RTP H.264 client as a bash builtin: the demux for bashrtsp.
  *
- *   rtspcat URL [-o FD] [-n COUNT] [-k SECS] [-v]
+ *   rtspcat URL [-o FD] [-n COUNT] [-k SECS] [-t SECS] [-v]
  *
  * Connects to an RTSP camera (or any RTSP server), sets up its H.264 video
  * track over interleaved TCP, and writes each access unit as one framed
@@ -38,12 +38,17 @@
 #  include <config.h>
 #  include "loadables.h"
 #endif
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 #include <stdarg.h>
 #include <errno.h>
+#include <limits.h>
+#include <signal.h>
 #include <unistd.h>
 #include <time.h>
 #include <poll.h>
@@ -127,6 +132,9 @@ static size_t b64_decode(const char *in, size_t n, unsigned char *out) {
 }
 
 /* ---- the session ---------------------------------------------------------- */
+/* Bounds apply independently to an access unit, a fragmented NAL and SDP. */
+#define RC_MAX_UNIT (8u * 1024u * 1024u)
+#define RC_MAX_BODY 65535u
 struct rc {
     int fd, out;
     char host[256], path[512], user[128], pass[128]; int port;
@@ -134,16 +142,19 @@ struct rc {
     char base[1024];                /* Content-Base or the URL, for relative control */
     char control[1024];             /* the video track's control URL */
     char session[128];
-    char realm[128], nonce[256]; int auth; /* 0 none, 1 basic, 2 digest */
-    int cseq, verbose, keepalive_s, chan_rtp;
+    char realm[128], nonce[256], opaque[256]; int auth, qop; unsigned int nc; /* 0 none, 1 basic, 2 digest */
+    int cseq, verbose, keepalive_s, chan_rtp, timeout_ms, streaming;
+    unsigned char input[16384]; size_t input_pos, input_len;
+    unsigned long max_units;
+    int64_t last_keepalive_ms;
     int pt;                         /* the H.264 payload type from the SDP */
     unsigned char *sps; size_t sps_len; unsigned char *pps; size_t pps_len;
     /* access-unit assembly */
     unsigned char *au; size_t au_len, au_cap; int au_has_ps, au_is_idr;
     unsigned char *fu; size_t fu_len, fu_cap; int fu_active;
-    uint32_t ts; int have_ts;
+    uint32_t ts; int have_ts, damaged, have_seq;
+    uint16_t seq; unsigned char fu_header;
     unsigned long units, packets, dropped;
-    time_t last_keepalive;
     char err[256];
 };
 static void rc_err(struct rc *c, const char *fmt, ...) { va_list ap; va_start(ap, fmt); vsnprintf(c->err, sizeof c->err, fmt, ap); va_end(ap); }
@@ -154,6 +165,9 @@ static void rc_log(struct rc *c, const char *fmt, ...) {
 
 static int parse_url(struct rc *c, const char *url) {
     const char *p = url;
+    for (const unsigned char *q = (const unsigned char *)url; *q; q++)
+        if (*q <= 32 || *q == 127 || *q == '"' || *q == '\\') { rc_err(c, "invalid character in URL"); return -1; }
+    if (strlen(url) >= sizeof c->url) { rc_err(c, "URL too long"); return -1; }
     if (strncmp(p, "rtsp://", 7) != 0) { rc_err(c, "URL must start with rtsp://"); return -1; }
     p += 7;
     const char *slash = strchr(p, '/'); const char *at = NULL;
@@ -161,9 +175,9 @@ static int parse_url(struct rc *c, const char *url) {
     if (at) {
         const char *colon = memchr(p, ':', (size_t)(at - p));
         size_t ul = colon ? (size_t)(colon - p) : (size_t)(at - p);
-        if (ul >= sizeof c->user) return -1;
+        if (ul >= sizeof c->user) { rc_err(c, "username too long"); return -1; }
         memcpy(c->user, p, ul); c->user[ul] = 0;
-        if (colon) { size_t pl = (size_t)(at - colon - 1); if (pl >= sizeof c->pass) return -1; memcpy(c->pass, colon + 1, pl); c->pass[pl] = 0; }
+        if (colon) { size_t pl = (size_t)(at - colon - 1); if (pl >= sizeof c->pass) { rc_err(c, "password too long"); return -1; } memcpy(c->pass, colon + 1, pl); c->pass[pl] = 0; }
         p = at + 1;
     }
     const char *hostend = slash ? slash : p + strlen(p);
@@ -171,8 +185,14 @@ static int parse_url(struct rc *c, const char *url) {
     size_t hl = pc ? (size_t)(pc - p) : (size_t)(hostend - p);
     if (hl == 0 || hl >= sizeof c->host) { rc_err(c, "bad host in URL"); return -1; }
     memcpy(c->host, p, hl); c->host[hl] = 0;
-    c->port = pc ? atoi(pc + 1) : 554;
+    c->port = 554;
+    if (pc) {
+        char *end; errno = 0; long port = strtol(pc + 1, &end, 10);
+        if (errno || end != hostend || end == pc + 1 || port < 1 || port > 65535) { rc_err(c, "bad port in URL"); return -1; }
+        c->port = (int)port;
+    }
     if (c->port <= 0 || c->port > 65535) { rc_err(c, "bad port in URL"); return -1; }
+    if (slash && strlen(slash) >= sizeof c->path) { rc_err(c, "URL path too long"); return -1; }
     snprintf(c->path, sizeof c->path, "%s", slash ? slash : "/");
     /* the URL we present to the server carries no credentials */
     snprintf(c->url, sizeof c->url, "rtsp://%s:%d%s", c->host, c->port, c->path);
@@ -201,38 +221,127 @@ static int tcp_connect(struct rc *c) {
 /* ---- RTSP transactions ------------------------------------------------------ */
 static int write_all(int fd, const void *p, size_t n) {
     const unsigned char *b = p; size_t off = 0;
-    while (off < n) { ssize_t w = write(fd, b + off, n - off); if (w < 0) { if (errno == EINTR) continue; return -1; } off += (size_t)w; }
+    while (off < n) { ssize_t w = write(fd, b + off, n - off); if (w < 0) { if (errno == EINTR) continue; return -1; } if (w == 0) { errno = EIO; return -1; } off += (size_t)w; }
     return 0;
 }
-/* Read from the socket with a deadline, retrying on signals. */
-static ssize_t read_wait(struct rc *c, unsigned char *p, size_t n, int timeout_ms) {
-    for (;;) {
+static int keepalive(struct rc *c);
+static int64_t now_ms(void) {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+/* A small read-ahead buffer removes a poll/read pair per RTSP header byte.
+ * Deadlines do not restart on EINTR, short reads or a trickled partial record. */
+static int read_exactly(struct rc *c, unsigned char *p, size_t n, int timeout_ms) {
+    int64_t deadline = now_ms() + timeout_ms;
+    while (n) {
+        if (c->input_pos < c->input_len) {
+            size_t take = c->input_len - c->input_pos; if (take > n) take = n;
+            memcpy(p, c->input + c->input_pos, take); c->input_pos += take; p += take; n -= take;
+            continue;
+        }
+        int64_t now = now_ms();
+        if (c->streaming && c->keepalive_s > 0 && now - c->last_keepalive_ms >= (int64_t)c->keepalive_s * 1000) {
+            if (keepalive(c) != 0) { rc_err(c, "keepalive: %s", strerror(errno)); return -1; }
+            c->last_keepalive_ms = now;
+        }
+        int64_t left = deadline - now;
+        if (left <= 0) { rc_err(c, "server read timeout (%d ms)", timeout_ms); return -1; }
+        if (c->streaming && c->keepalive_s > 0) {
+            int64_t until = c->last_keepalive_ms + (int64_t)c->keepalive_s * 1000 - now;
+            if (until < left) left = until;
+        }
         struct pollfd pf = { .fd = c->fd, .events = POLLIN };
-        int r = poll(&pf, 1, timeout_ms);
+        int r = poll(&pf, 1, (int)left);
         if (r < 0) { if (errno == EINTR) continue; rc_err(c, "poll: %s", strerror(errno)); return -1; }
-        if (r == 0) { rc_err(c, "no data from the server for %d ms", timeout_ms); return -1; }
-        ssize_t got = read(c->fd, p, n);
+        if (r == 0) continue;
+        ssize_t got = read(c->fd, c->input, sizeof c->input);
         if (got < 0) { if (errno == EINTR) continue; rc_err(c, "read: %s", strerror(errno)); return -1; }
         if (got == 0) { rc_err(c, "server closed the connection"); return -1; }
-        return got;
+        c->input_pos = 0; c->input_len = (size_t)got;
+    }
+    return 0;
+}
+/* Header fields are bounded to one line. Reject ambiguous/oversized bodies. */
+static int content_length(struct rc *c, const char *hdrs, size_t *len) {
+    *len = 0; int seen = 0;
+    for (const char *p = hdrs; (p = strchr(p, '\n')) != NULL;) {
+        p++;
+        if (strncasecmp(p, "Content-Length:", 15)) continue;
+        p += 15; while (*p == ' ' || *p == '\t') p++;
+        char *end; errno = 0; unsigned long n = strtoul(p, &end, 10);
+        if (seen++ || *p < '0' || *p > '9' || errno || n > RC_MAX_BODY) goto bad;
+        while (*end == ' ' || *end == '\t') end++;
+        if (*end != '\r' || end[1] != '\n') goto bad;
+        *len = (size_t)n;
+    }
+    return 0;
+bad: rc_err(c, "invalid Content-Length"); return -1;
+}
+static int read_headers(struct rc *c, char *hdrs, size_t cap, int first) {
+    size_t n = 0; int64_t deadline = now_ms() + c->timeout_ms;
+    if (first >= 0) hdrs[n++] = (char)first;
+    for (;;) {
+        unsigned char b;
+        if (n + 1 >= cap) { rc_err(c, "response headers too long"); return -1; }
+        int64_t left = deadline - now_ms();
+        if (left <= 0) { rc_err(c, "server header timeout"); return -1; }
+        if (read_exactly(c, &b, 1, (int)left)) return -1;
+        hdrs[n++] = (char)b; hdrs[n] = 0;
+        if (n >= 4 && !memcmp(hdrs + n - 4, "\r\n\r\n", 4)) return 0;
     }
 }
-static int read_exactly(struct rc *c, unsigned char *p, size_t n, int timeout_ms) {
-    size_t have = 0;
-    while (have < n) { ssize_t g = read_wait(c, p + have, n - have, timeout_ms); if (g < 0) return -1; have += (size_t)g; }
+
+/* Parse a Digest parameter without searching past its quoted value. */
+static int auth_param(const char *header, const char *name, char *out, size_t cap) {
+    size_t name_len = strlen(name); out[0] = 0;
+    const char *p = strchr(header, ' '); if (!p) return 0;
+    while (*p) {
+        while (*p == ' ' || *p == '\t' || *p == ',') p++;
+        const char *key = p; while (*p && *p != '=' && *p != ',') p++;
+        if (*p != '=') break;
+        const char *key_end = p; while (key_end > key && (key_end[-1] == ' ' || key_end[-1] == '\t')) key_end--;
+        p++; while (*p == ' ' || *p == '\t') p++;
+        int quoted = *p == '"'; if (quoted) p++;
+        const char *value = p;
+        while (*p && (quoted ? *p != '"' : *p != ',' && *p != ' ' && *p != '\t')) p++;
+        size_t n = (size_t)(p - value);
+        if (quoted && !*p) return -1;
+        if ((size_t)(key_end - key) == name_len && !strncasecmp(key, name, name_len)) {
+            if (n >= cap || memchr(value, '\\', n)) return -1;
+            memcpy(out, value, n); out[n] = 0; return 1;
+        }
+        if (quoted) p++;
+        while (*p && *p != ',') p++;
+    }
+    return 0;
+}
+static int supports_auth_qop(const char *value) {
+    while (*value) {
+        while (*value == ',' || *value == ' ' || *value == '\t') value++;
+        size_t n = strcspn(value, ", \t");
+        if (n == 4 && !strncasecmp(value, "auth", n)) return 1;
+        value += n;
+    }
     return 0;
 }
 
 static void auth_header(struct rc *c, const char *method, const char *uri, char *out, size_t n) {
     out[0] = 0;
-    if (!c->user[0]) return;
+    if (!c->user[0] || !c->auth) return;
     if (c->auth == 2) {
-        char a1[33], a2[33], resp[33], tmp[1024];
+        char a1[33], a2[33], resp[33], tmp[2048], suffix[512] = "";
         snprintf(tmp, sizeof tmp, "%s:%s:%s", c->user, c->realm, c->pass); md5_str(tmp, a1);
         snprintf(tmp, sizeof tmp, "%s:%s", method, uri); md5_str(tmp, a2);
-        snprintf(tmp, sizeof tmp, "%s:%s:%s", a1, c->nonce, a2); md5_str(tmp, resp);
-        snprintf(out, n, "Authorization: Digest username=\"%s\", realm=\"%s\", nonce=\"%s\", uri=\"%s\", response=\"%s\"\r\n",
-                 c->user, c->realm, c->nonce, uri, resp);
+        if (c->qop) {
+            char cnonce[33]; snprintf(tmp, sizeof tmp, "%s:%ld", c->nonce, (long)getpid()); md5_str(tmp, cnonce);
+            unsigned int nc = ++c->nc;
+            snprintf(tmp, sizeof tmp, "%s:%s:%08x:%s:auth:%s", a1, c->nonce, nc, cnonce, a2);
+            snprintf(suffix, sizeof suffix, ", qop=auth, nc=%08x, cnonce=\"%s\"", nc, cnonce);
+        } else snprintf(tmp, sizeof tmp, "%s:%s:%s", a1, c->nonce, a2);
+        md5_str(tmp, resp);
+        if (c->opaque[0]) { size_t used = strlen(suffix); snprintf(suffix + used, sizeof suffix - used, ", opaque=\"%s\"", c->opaque); }
+        snprintf(out, n, "Authorization: Digest username=\"%s\", realm=\"%s\", nonce=\"%s\", uri=\"%s\", response=\"%s\"%s\r\n",
+                 c->user, c->realm, c->nonce, uri, resp, suffix);
     } else {
         char up[300], b64[420]; snprintf(up, sizeof up, "%s:%s", c->user, c->pass);
         b64_encode((unsigned char *)up, strlen(up), b64);
@@ -246,56 +355,49 @@ static void auth_header(struct rc *c, const char *method, const char *uri, char 
 static int rtsp_do(struct rc *c, const char *method, const char *uri, const char *extra,
                    char *hdrs, size_t hdrs_n, char **body, size_t *body_n) {
     for (int attempt = 0; attempt < 2; attempt++) {
-        char auth[1200]; auth_header(c, method, uri, auth, sizeof auth);
-        char req[2048];
-        int len = snprintf(req, sizeof req, "%s %s RTSP/1.0\r\nCSeq: %d\r\nUser-Agent: rtspcat\r\n%s%s%s%s\r\n",
+        *body = NULL; *body_n = 0;
+        char auth[2048]; auth_header(c, method, uri, auth, sizeof auth);
+        char req[8192];
+        int len = snprintf(req, sizeof req, "%s %s RTSP/1.0\r\nCSeq: %d\r\nUser-Agent: rtspcat\r\n%s%s%s%s%s\r\n",
                            method, uri, ++c->cseq,
                            c->session[0] ? "Session: " : "", c->session[0] ? c->session : "", c->session[0] ? "\r\n" : "",
-                           extra ? extra : "");
+                           extra ? extra : "", auth);
         if (len <= 0 || (size_t)len >= sizeof req) { rc_err(c, "request too long"); return -1; }
-        if (auth[0]) { /* insert before the blank line */
-            char req2[3300]; snprintf(req2, sizeof req2, "%.*s%s\r\n", len - 2, req, auth); strcpy(req, req2); len = (int)strlen(req);
-        }
         rc_log(c, "> %s %s (CSeq %d)", method, uri, c->cseq);
         if (write_all(c->fd, req, (size_t)len) != 0) { rc_err(c, "write: %s", strerror(errno)); return -1; }
 
-        /* headers: read until \r\n\r\n; interleaved '$' data must not appear
-         * here — before PLAY nothing is interleaved, and keepalives are sent
-         * from the packet loop which handles both. */
-        size_t hl = 0;
-        for (;;) {
-            unsigned char ch;
-            if (read_exactly(c, &ch, 1, 10000) != 0) return -1;
-            if (hl + 1 >= hdrs_n) { rc_err(c, "response headers too long"); return -1; }
-            hdrs[hl++] = (char)ch; hdrs[hl] = 0;
-            if (hl >= 4 && memcmp(hdrs + hl - 4, "\r\n\r\n", 4) == 0) break;
-        }
-        int status = 0; sscanf(hdrs, "RTSP/1.0 %d", &status);
-        *body = NULL; *body_n = 0;
-        const char *cl = strcasestr(hdrs, "\nContent-Length:");
-        if (cl) {
-            long n = atol(cl + 16);
-            if (n > 0 && n < 65536) {
-                *body = malloc((size_t)n + 1);
-                if (!*body || read_exactly(c, (unsigned char *)*body, (size_t)n, 10000) != 0) { free(*body); *body = NULL; return -1; }
-                (*body)[n] = 0; *body_n = (size_t)n;
-            }
+        if (read_headers(c, hdrs, hdrs_n, -1)) return -1;
+        int status = 0;
+        if (sscanf(hdrs, "RTSP/1.0 %d", &status) != 1 || status < 100 || status > 599) { rc_err(c, "invalid RTSP response"); return -1; }
+        size_t n;
+        if (content_length(c, hdrs, &n)) return -1;
+        if (n) {
+            *body = malloc(n + 1);
+            if (!*body) { rc_err(c, "oom"); return -1; }
+            if (read_exactly(c, (unsigned char *)*body, n, c->timeout_ms)) { free(*body); *body = NULL; return -1; }
+            (*body)[n] = 0; *body_n = n;
         }
         const char *sess = strcasestr(hdrs, "\nSession:");
         if (sess && !c->session[0]) { sess += 9; while (*sess == ' ') sess++; size_t i = 0; while (sess[i] && sess[i] != ';' && sess[i] != '\r' && i < sizeof c->session - 1) { c->session[i] = sess[i]; i++; } c->session[i] = 0; }
         rc_log(c, "< %d", status);
         if (status == 401 && attempt == 0 && c->user[0]) {
             const char *wa = strcasestr(hdrs, "\nWWW-Authenticate:");
-            if (wa && strcasestr(wa, "Digest")) {
-                const char *r = strcasestr(wa, "realm=\""); const char *nn = strcasestr(wa, "nonce=\"");
-                if (r && nn) {
-                    r += 7; nn += 7; size_t i;
-                    for (i = 0; r[i] && r[i] != '"' && i < sizeof c->realm - 1; i++) c->realm[i] = r[i];
-                    c->realm[i] = 0;
-                    for (i = 0; nn[i] && nn[i] != '"' && i < sizeof c->nonce - 1; i++) c->nonce[i] = nn[i];
-                    c->nonce[i] = 0;
-                    c->auth = 2; free(*body); *body = NULL; continue;
+            char challenge[2048] = "";
+            if (wa) { wa += 18; size_t z = strcspn(wa, "\r\n"); if (z >= sizeof challenge) z = sizeof challenge - 1; memcpy(challenge, wa, z); }
+            wa = challenge;
+            while (*wa == ' ' || *wa == '\t') wa++;
+            if (!strncasecmp(wa, "Digest ", 7)) {
+                char qop[256], algorithm[64];
+                int qr = auth_param(wa, "qop", qop, sizeof qop);
+                int ar = auth_param(wa, "algorithm", algorithm, sizeof algorithm);
+                if (auth_param(wa, "realm", c->realm, sizeof c->realm) != 1 ||
+                    auth_param(wa, "nonce", c->nonce, sizeof c->nonce) != 1 ||
+                    auth_param(wa, "opaque", c->opaque, sizeof c->opaque) < 0 ||
+                    qr < 0 || ar < 0 || (qr && !supports_auth_qop(qop)) || (ar && strcasecmp(algorithm, "MD5"))) {
+                    rc_err(c, "unsupported or malformed Digest challenge"); free(*body); *body = NULL; return -1;
                 }
+                c->qop = qr; c->nc = 0; c->auth = 2;
+                free(*body); *body = NULL; continue;
             }
             if (wa && strcasestr(wa, "Basic")) { c->auth = 1; free(*body); *body = NULL; continue; }
         }
@@ -306,40 +408,66 @@ static int rtsp_do(struct rc *c, const char *method, const char *uri, const char
 
 /* ---- SDP: find the H.264 video track ------------------------------------- */
 static int parse_sdp(struct rc *c, const char *sdp) {
-    const char *line = sdp; int in_video = 0; int found = 0;
+    /* Select a media section only after seeing its H264 rtpmap. Audio and
+     * later sections cannot overwrite the selected track's parameters. */
     c->pt = -1;
-    while (line && *line) {
-        const char *eol = strchr(line, '\n'); size_t ll = eol ? (size_t)(eol - line) : strlen(line);
-        while (ll && (line[ll-1] == '\r')) ll--;
-        if (ll >= 2 && line[0] == 'm' && line[1] == '=') {
-            in_video = (ll > 8 && memcmp(line, "m=video ", 8) == 0) && !found;
-            if (in_video) { int port, pt; char proto[32]; if (sscanf(line, "m=video %d %31s %d", &port, proto, &pt) == 3) c->pt = pt; }
-        } else if (in_video && ll > 10 && memcmp(line, "a=control:", 10) == 0) {
-            char v[1024]; size_t n = ll - 10; if (n >= sizeof v) n = sizeof v - 1; memcpy(v, line + 10, n); v[n] = 0;
-            if (strncmp(v, "rtsp://", 7) == 0) snprintf(c->control, sizeof c->control, "%s", v);
-            else { size_t bl = strlen(c->base); snprintf(c->control, sizeof c->control, "%s%s%s", c->base, (bl && c->base[bl-1] != '/' && v[0] != '/') ? "/" : "", v); }
-            found = 1;
-        } else if (in_video && ll > 9 && memcmp(line, "a=rtpmap:", 9) == 0) {
-            int pt; char enc[64]; if (sscanf(line + 9, "%d %63s", &pt, enc) == 2 && strncasecmp(enc, "H264/", 5) == 0) c->pt = pt;
-        } else if (in_video && ll > 7 && memcmp(line, "a=fmtp:", 7) == 0) {
-            const char *sp = strstr(line, "sprop-parameter-sets=");
-            if (sp && sp < line + ll) {
-                sp += 21; const char *end = sp; while (end < line + ll && *end != ';') end++;
-                const char *comma = memchr(sp, ',', (size_t)(end - sp));
-                size_t l1 = comma ? (size_t)(comma - sp) : (size_t)(end - sp);
-                c->sps = malloc(l1 + 4); c->sps_len = b64_decode(sp, l1, c->sps);
-                if (comma) { size_t l2 = (size_t)(end - comma - 1); c->pps = malloc(l2 + 4); c->pps_len = b64_decode(comma + 1, l2, c->pps); }
+    for (const char *m = sdp; m && *m;) {
+        const char *end = strstr(m + 1, "\nm="); if (end) end++;
+        size_t size = end ? (size_t)(end - m) : strlen(m);
+        if (!strncmp(m, "m=video ", 8)) {
+            char *section = malloc(size + 1); if (!section) { rc_err(c, "oom"); return -1; }
+            memcpy(section, m, size); section[size] = 0;
+            int pt = -1;
+            for (char *line = section; line && *line;) {
+                int v; char enc[64];
+                if (sscanf(line, "a=rtpmap:%d %63s", &v, enc) == 2 && v >= 0 && v <= 127 && !strcasecmp(enc, "H264/90000")) { pt = v; break; }
+                line = strchr(line, '\n'); if (line) line++;
             }
+            if (pt >= 0) {
+                c->pt = pt;
+                for (char *line = section; line && *line;) {
+                    char *nl = strchr(line, '\n'); if (nl) *nl = 0;
+                    size_t ll = strlen(line); if (ll && line[ll-1] == '\r') line[--ll] = 0;
+                    if (!strncmp(line, "a=control:", 10)) {
+                        const char *v = line + 10; int written;
+                        if (!strncmp(v, "rtsp://", 7)) written = snprintf(c->control, sizeof c->control, "%s", v);
+                        else if (v[0] == '/') {
+                            const char *authority = strstr(c->base, "://");
+                            if (!authority) { free(section); rc_err(c, "invalid control base URL"); return -1; }
+                            const char *path = strchr(authority + 3, '/');
+                            size_t prefix = path ? (size_t)(path - c->base) : strlen(c->base);
+                            written = snprintf(c->control, sizeof c->control, "%.*s%s", (int)prefix, c->base, v);
+                        }
+                        else { size_t bl = strlen(c->base); written = snprintf(c->control, sizeof c->control, "%s%s%s", c->base, bl && c->base[bl-1] != '/' && v[0] != '/' ? "/" : "", v); }
+                        if (written < 0 || (size_t)written >= sizeof c->control) { free(section); rc_err(c, "control URL too long"); return -1; }
+                    }
+                    int fp; const char *sp = strstr(line, "sprop-parameter-sets=");
+                    if (sscanf(line, "a=fmtp:%d", &fp) == 1 && fp == pt && sp) {
+                        sp += 21; size_t len = strcspn(sp, ";"); const char *comma = memchr(sp, ',', len);
+                        if (comma) {
+                            size_t l1 = (size_t)(comma - sp), l2 = len - l1 - 1;
+                            unsigned char *sps = malloc(l1 + 1), *pps = malloc(l2 + 1);
+                            if (!sps || !pps) { free(sps); free(pps); free(section); rc_err(c, "oom"); return -1; }
+                            free(c->sps); free(c->pps); c->sps = sps; c->pps = pps;
+                            c->sps_len = b64_decode(sp, l1, sps); c->pps_len = b64_decode(comma + 1, l2, pps);
+                        }
+                    }
+                    line = nl ? nl + 1 : NULL;
+                }
+                free(section);
+                if (!c->control[0]) snprintf(c->control, sizeof c->control, "%s", c->url);
+                return 0;
+            }
+            free(section);
         }
-        line = eol ? eol + 1 : NULL;
+        m = end;
     }
-    if (c->pt < 0) { rc_err(c, "no H.264 video track in the session description"); return -1; }
-    if (!c->control[0]) snprintf(c->control, sizeof c->control, "%s", c->url);
-    return 0;
+    rc_err(c, "no H.264 video track in the session description"); return -1;
 }
 
 /* ---- access units out ---------------------------------------------------- */
 static int au_append(struct rc *c, const unsigned char *nal, size_t n) {
+    if (n > RC_MAX_UNIT - 4 || c->au_len > RC_MAX_UNIT - 4 - n) { rc_err(c, "access unit exceeds 8 MiB"); return -1; }
     size_t need = c->au_len + 4 + n;
     if (need > c->au_cap) {
         size_t cap = c->au_cap ? c->au_cap : (1 << 16); while (cap < need) cap *= 2;
@@ -353,11 +481,13 @@ static int au_append(struct rc *c, const unsigned char *nal, size_t n) {
 static int au_add_nal(struct rc *c, const unsigned char *nal, size_t n) {
     if (n == 0) return 0;
     int type = nal[0] & 0x1F;
-    if (type == 7 || type == 8) c->au_has_ps = 1;
-    if (type == 5 && !c->au_has_ps && c->sps && c->pps) {
+    if (type == 7) c->au_has_ps |= 1;
+    if (type == 8) c->au_has_ps |= 2;
+    if (type == 5 && c->au_has_ps != 3 && c->sps && c->pps) {
         /* a decoder that joins late, or was just reset, needs these */
-        if (au_append(c, c->sps, c->sps_len) != 0 || au_append(c, c->pps, c->pps_len) != 0) return -1;
-        c->au_has_ps = 1;
+        if (!(c->au_has_ps & 1) && au_append(c, c->sps, c->sps_len)) return -1;
+        if (!(c->au_has_ps & 2) && au_append(c, c->pps, c->pps_len)) return -1;
+        c->au_has_ps = 3;
     }
     if (type == 5) c->au_is_idr = 1;
     return au_append(c, nal, n);
@@ -371,95 +501,114 @@ static int au_flush(struct rc *c) {
 }
 
 /* ---- RTP H.264 depacketising (RFC 6184) ---------------------------------- */
+static void damage_unit(struct rc *c) {
+    c->au_len = c->fu_len = 0; c->fu_active = c->au_has_ps = 0;
+    c->damaged = 1; c->dropped++;
+}
 static int rtp_packet(struct rc *c, const unsigned char *p, size_t n) {
-    if (n < 12 || (p[0] >> 6) != 2) return 0;               /* not RTP v2: ignore */
-    int cc = p[0] & 0x0F, ext = p[0] & 0x10, pad = p[0] & 0x20, marker = p[1] & 0x80, pt = p[1] & 0x7F;
+    if (n < 12 || (p[0] >> 6) != 2) { damage_unit(c); if (!c->have_ts) c->damaged = 0; return 0; }
+    int cc = p[0] & 15, ext = p[0] & 16, pad = p[0] & 32, marker = p[1] & 128;
+    if ((p[1] & 127) != c->pt) return 0;
+    uint16_t seq = (uint16_t)((p[2] << 8) | p[3]);
     uint32_t ts = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) | ((uint32_t)p[6] << 8) | p[7];
-    size_t off = 12 + (size_t)cc * 4;
-    if (ext) { if (off + 4 > n) return 0; size_t xl = (((size_t)p[off+2] << 8) | p[off+3]) * 4; off += 4 + xl; }
-    if (pad && n > 0) { size_t pl = p[n-1]; if (pl < n) n -= pl; }
-    if (off >= n) return 0;
-    if (pt != c->pt) return 0;                               /* another track on the same channel */
     c->packets++;
-    /* a new timestamp is a new picture even if the sender never sets the marker */
-    if (c->have_ts && ts != c->ts && c->au_len) { if (au_flush(c) != 0) return -1; }
+    unsigned delta = (uint16_t)(seq - c->seq);
+    /* TCP preserves wire order: do not turn late/duplicate RTP into new NALs.
+     * A forward gap invalidates the old timestamp; resume at the next one. */
+    if (c->have_seq && (delta == 0 || delta >= 32768)) { c->dropped++; return 0; }
+    if (c->have_seq && delta != 1) damage_unit(c);
+    c->seq = seq; c->have_seq = 1;
+    if (c->have_ts && ts != c->ts) {
+        if (c->fu_active) damage_unit(c);
+        if (!c->damaged && au_flush(c)) return -1;
+        c->au_len = c->fu_len = 0; c->fu_active = c->au_has_ps = c->damaged = 0;
+        if (c->max_units && c->units >= c->max_units) return 0;
+    }
     c->ts = ts; c->have_ts = 1;
-
+    size_t off = 12 + (size_t)cc * 4;
+    if (off > n) goto malformed;
+    if (ext) { if (off + 4 > n) goto malformed; size_t xl = (((size_t)p[off+2] << 8) | p[off+3]) * 4; off += 4 + xl; }
+    if (pad) { size_t pl = p[n-1]; if (!pl || pl > n - 12) goto malformed; n -= pl; }
+    if (off >= n) goto malformed;
+    if (c->damaged) return 0;
     const unsigned char *pl = p + off; size_t pn = n - off;
-    int type = pl[0] & 0x1F;
-    if (type >= 1 && type <= 23) {                           /* single NAL unit */
-        if (au_add_nal(c, pl, pn) != 0) return -1;
-    } else if (type == 24) {                                 /* STAP-A: 16-bit size + NAL, repeated */
-        size_t i = 1;
-        while (i + 2 <= pn) {
+    int type = pl[0] & 31;
+    if (pl[0] & 128) goto malformed;
+    if (type >= 1 && type <= 23) {
+        if (c->fu_active) goto malformed;
+        if (au_add_nal(c, pl, pn)) return -1;
+    } else if (type == 24) {
+        if (c->fu_active || pn < 4) goto malformed;
+        /* Validate the entire aggregate before appending any part. */
+        for (size_t i = 1; i < pn;) {
+            if (i + 2 > pn) goto malformed;
             size_t sz = ((size_t)pl[i] << 8) | pl[i+1]; i += 2;
-            if (sz == 0 || i + sz > pn) break;
-            if (au_add_nal(c, pl + i, sz) != 0) return -1;
+            if (!sz || sz > pn - i || (pl[i] & 128) || !(pl[i] & 31) || (pl[i] & 31) > 23) goto malformed;
             i += sz;
         }
-    } else if (type == 28 && pn >= 2) {                      /* FU-A: fragments of one NAL */
-        int s = pl[1] & 0x80, e = pl[1] & 0x40, ntype = pl[1] & 0x1F;
-        if (s) {
-            c->fu_len = 0; c->fu_active = 1;
-            unsigned char hdr = (unsigned char)((pl[0] & 0xE0) | ntype);
-            if (c->fu_cap < 1) { c->fu_cap = 1 << 16; c->fu = malloc(c->fu_cap); if (!c->fu) { rc_err(c, "oom"); return -1; } }
-            c->fu[c->fu_len++] = hdr;
+        for (size_t i = 1; i < pn;) {
+            size_t sz = ((size_t)pl[i] << 8) | pl[i+1]; i += 2;
+            if (au_add_nal(c, pl + i, sz)) return -1;
+            i += sz;
         }
-        if (!c->fu_active) { c->dropped++; return 0; }       /* a middle piece with no start: lost packet */
+    } else if (type == 28) {
+        if (pn < 3 || (pl[1] & 32) || !(pl[1] & 31) || (pl[1] & 31) > 23) goto malformed;
+        int start = pl[1] & 128, end = pl[1] & 64;
+        unsigned char hdr = (unsigned char)((pl[0] & 0xe0) | (pl[1] & 31));
+        if (start && end) goto malformed;
+        if (start) {
+            if (c->fu_active) goto malformed;
+            c->fu_len = 1; c->fu_active = 1; c->fu_header = hdr;
+        } else if (!c->fu_active || hdr != c->fu_header) goto malformed;
         size_t frag = pn - 2;
-        if (c->fu_len + frag > c->fu_cap) {
-            size_t cap = c->fu_cap; while (cap < c->fu_len + frag) cap *= 2;
+        if (frag > RC_MAX_UNIT - c->fu_len) { rc_err(c, "fragmented NAL exceeds 8 MiB"); return -1; }
+        size_t need = c->fu_len + frag;
+        if (need > c->fu_cap) {
+            size_t cap = c->fu_cap ? c->fu_cap : 65536; while (cap < need) cap *= 2;
             unsigned char *np = realloc(c->fu, cap); if (!np) { rc_err(c, "oom"); return -1; }
             c->fu = np; c->fu_cap = cap;
         }
+        if (start) c->fu[0] = hdr;
         memcpy(c->fu + c->fu_len, pl + 2, frag); c->fu_len += frag;
-        if (e) { c->fu_active = 0; if (au_add_nal(c, c->fu, c->fu_len) != 0) return -1; }
-    } else {
-        c->dropped++;                                        /* STAP-B, MTAP, FU-B: not from cameras we care about */
+        if (end) { c->fu_active = 0; if (au_add_nal(c, c->fu, c->fu_len)) return -1; }
+    } else goto malformed;
+    if (marker) {
+        if (c->fu_active) goto malformed;
+        return au_flush(c);
     }
-    if (marker && c->au_len) return au_flush(c);
     return 0;
+malformed: damage_unit(c); return 0;
 }
 
 /* ---- the packet loop -------------------------------------------------------- */
-static int keepalive(struct rc *c) {
-    char req[512];
-    int len = snprintf(req, sizeof req, "GET_PARAMETER %s RTSP/1.0\r\nCSeq: %d\r\nSession: %s\r\n\r\n", c->url, ++c->cseq, c->session);
+static int session_request(struct rc *c, const char *method) {
+    char req[4096], auth[2048]; auth_header(c, method, c->url, auth, sizeof auth);
+    int len = snprintf(req, sizeof req, "%s %s RTSP/1.0\r\nCSeq: %d\r\nSession: %s\r\n%s\r\n", method, c->url, ++c->cseq, c->session, auth);
+    if (len < 0 || (size_t)len >= sizeof req) { errno = EMSGSIZE; return -1; }
     return write_all(c->fd, req, (size_t)len);
 }
+static int keepalive(struct rc *c) { return session_request(c, "GET_PARAMETER"); }
 static int stream_loop(struct rc *c, unsigned long max_units) {
-    unsigned char *buf = malloc(65536 + 4); if (!buf) { rc_err(c, "oom"); return -1; }
-    c->last_keepalive = time(NULL);
+    unsigned char *buf = malloc(65536); if (!buf) { rc_err(c, "oom"); return -1; }
+    c->streaming = 1; c->last_keepalive_ms = now_ms(); c->max_units = max_units;
     int rc = 0;
-    for (;;) {
-        if (max_units && c->units >= max_units) break;
-        if (c->keepalive_s > 0 && time(NULL) - c->last_keepalive >= c->keepalive_s) { if (keepalive(c) != 0) { rc_err(c, "keepalive: %s", strerror(errno)); rc = -1; break; } c->last_keepalive = time(NULL); }
+    while (!max_units || c->units < max_units) {
         unsigned char b;
-        if (read_exactly(c, &b, 1, 15000) != 0) { rc = -1; break; }
+        if (read_exactly(c, &b, 1, c->timeout_ms)) { rc = -1; break; }
         if (b == '$') {
-            unsigned char h[3]; if (read_exactly(c, h, 3, 15000) != 0) { rc = -1; break; }
+            unsigned char h[3]; if (read_exactly(c, h, 3, c->timeout_ms)) { rc = -1; break; }
             size_t len = ((size_t)h[1] << 8) | h[2];
-            if (read_exactly(c, buf, len, 15000) != 0) { rc = -1; break; }
-            if (h[0] == c->chan_rtp) { if (rtp_packet(c, buf, len) != 0) { rc = -1; break; } }
-            /* the RTCP channel is ignored: interleaved TCP is reliable and the camera does not need reports */
+            if (read_exactly(c, buf, len, c->timeout_ms)) { rc = -1; break; }
+            if (h[0] == c->chan_rtp && rtp_packet(c, buf, len)) { rc = -1; break; }
         } else {
-            /* an RTSP message on the control connection: a keepalive reply,
-             * or an announcement. Skip to the blank line and its body. */
-            char line[2048]; size_t l = 0; line[l++] = (char)b;
-            long clen = 0;
-            for (;;) {
-                if (read_exactly(c, &b, 1, 15000) != 0) { rc = -1; goto out; }
-                if (l < sizeof line - 1) line[l++] = (char)b; line[l] = 0;
-                if (l >= 4 && memcmp(line + l - 4, "\r\n\r\n", 4) == 0) break;
-                if (l >= sizeof line - 1) l = 0;   /* absurdly long: keep scanning */
-            }
-            const char *cl = strcasestr(line, "Content-Length:"); if (cl) clen = atol(cl + 15);
-            while (clen-- > 0) { if (read_exactly(c, &b, 1, 15000) != 0) { rc = -1; goto out; } }
+            char headers[8192]; size_t len;
+            if (read_headers(c, headers, sizeof headers, b) || content_length(c, headers, &len)) { rc = -1; break; }
+            int status;
+            if (sscanf(headers, "RTSP/1.0 %d", &status) != 1 || status != 200) { rc_err(c, "keepalive response failed"); rc = -1; break; }
+            if (len && read_exactly(c, buf, len, c->timeout_ms)) { rc = -1; break; }
         }
     }
-out:
-    free(buf);
-    return rc;
+    c->streaming = 0; free(buf); return rc;
 }
 
 static int rtspcat_run(struct rc *c, const char *url, unsigned long max_units) {
@@ -480,77 +629,102 @@ static int rtspcat_run(struct rc *c, const char *url, unsigned long max_units) {
     st = rtsp_do(c, "SETUP", c->control, tr, hdrs, sizeof hdrs, &body, &bn); free(body);
     if (st != 200) { rc_err(c, "SETUP: status %d", st); return -1; }
     if (!c->session[0]) { rc_err(c, "SETUP gave no session"); return -1; }
+    const char *transport = strcasestr(hdrs, "\nTransport:");
+    const char *channels = transport ? strcasestr(transport, "interleaved=") : NULL;
+    if (channels) { int first, second; if (sscanf(channels + 12, "%d-%d", &first, &second) != 2 || first < 0 || first > 254 || second != first + 1) { rc_err(c, "invalid interleaved channels"); return -1; } c->chan_rtp = first; }
     st = rtsp_do(c, "PLAY", c->url, "Range: npt=0.000-\r\n", hdrs, sizeof hdrs, &body, &bn); free(body);
     if (st != 200) { rc_err(c, "PLAY: status %d", st); return -1; }
     rc_log(c, "playing, session %s", c->session);
     int rc = stream_loop(c, max_units);
-    if (c->au_len) au_flush(c);
-    /* best-effort: tell the server we are going */
-    char req[512]; int len = snprintf(req, sizeof req, "TEARDOWN %s RTSP/1.0\r\nCSeq: %d\r\nSession: %s\r\n\r\n", c->url, ++c->cseq, c->session);
-    write_all(c->fd, req, (size_t)len);
+    /* EOF/error cannot establish the end of a partial access unit. */
+    session_request(c, "TEARDOWN");
     return rc;
 }
 
 static void rc_free(struct rc *c) { if (c->fd >= 0) close(c->fd); free(c->sps); free(c->pps); free(c->au); free(c->fu); }
 
+static int number(const char *text, unsigned long limit, unsigned long *value) {
+    char *end; errno = 0;
+    if (!text || *text < '0' || *text > '9') return -1;
+    unsigned long n = strtoul(text, &end, 10);
+    if (errno || *end || n > limit) return -1;
+    *value = n; return 0;
+}
+static int option(struct rc *c, int opt, const char *arg, unsigned long *max_units) {
+    unsigned long n;
+    if (opt == 'v') { c->verbose = 1; return 0; }
+    if (number(arg, opt == 'n' ? ULONG_MAX : opt == 't' ? INT_MAX / 1000 : INT_MAX, &n)) return -1;
+    switch (opt) {
+    case 'o': c->out = (int)n; break;
+    case 'n': *max_units = n; break;
+    case 'k': c->keepalive_s = (int)n; break;
+    case 't': if (!n) return -1; c->timeout_ms = (int)n * 1000; break;
+    default: return -1;
+    }
+    return 0;
+}
+/* A broken output pipe must fail this invocation without killing its shell.
+ * Restore the shell's disposition on every path. */
+static int run_guarded(struct rc *c, const char *url, unsigned long max_units) {
+    struct sigaction old, ignore; memset(&ignore, 0, sizeof ignore);
+    ignore.sa_handler = SIG_IGN; sigemptyset(&ignore.sa_mask);
+    if (sigaction(SIGPIPE, &ignore, &old)) { rc_err(c, "sigaction: %s", strerror(errno)); return -1; }
+    int rc = rtspcat_run(c, url, max_units);
+    sigaction(SIGPIPE, &old, NULL);
+    return rc;
+}
 #ifdef RTSPCAT_STANDALONE
 int main(int argc, char **argv) {
-    struct rc c; memset(&c, 0, sizeof c); c.fd = -1; c.out = 1; c.keepalive_s = 25; c.chan_rtp = 0;
-    unsigned long max_units = 0; const char *url = NULL;
-    for (int i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "-v")) c.verbose = 1;
-        else if (!strcmp(argv[i], "-n") && i + 1 < argc) max_units = strtoul(argv[++i], NULL, 10);
-        else if (!strcmp(argv[i], "-o") && i + 1 < argc) c.out = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "-k") && i + 1 < argc) c.keepalive_s = atoi(argv[++i]);
-        else url = argv[i];
+    struct rc c; memset(&c, 0, sizeof c); c.fd = -1; c.out = 1; c.keepalive_s = 25; c.timeout_ms = 15000;
+    unsigned long max_units = 0;
+    if (argc < 2) return 2;
+    for (int i = 2; i < argc; i++) {
+        if (strlen(argv[i]) != 2 || argv[i][0] != '-') return 2;
+        int opt = argv[i][1]; const char *arg = NULL;
+        if (opt != 'v') { if (++i == argc) return 2; arg = argv[i]; }
+        if (option(&c, opt, arg, &max_units)) return 2;
     }
-    if (!url) { fprintf(stderr, "usage: rtspcat URL [-o FD] [-n COUNT] [-k SECS] [-v]\n"); return 2; }
-    int rc = rtspcat_run(&c, url, max_units);
-    if (rc != 0) fprintf(stderr, "rtspcat: %s\n", c.err);
-    fprintf(stderr, "rtspcat: %lu units, %lu packets, %lu dropped\n", c.units, c.packets, c.dropped);
-    rc_free(&c);
-    return rc == 0 ? 0 : 1;
+    int rc = run_guarded(&c, argv[1], max_units);
+    if (rc) fprintf(stderr, "rtspcat: %s\n", c.err);
+    if (c.verbose) fprintf(stderr, "rtspcat: %lu units, %lu packets, %lu dropped\n", c.units, c.packets, c.dropped);
+    rc_free(&c); return rc == 0 ? 0 : 1;
 }
 #else
 static int rtspcat_builtin(WORD_LIST *list) {
-    struct rc c; memset(&c, 0, sizeof c); c.fd = -1; c.out = 1; c.keepalive_s = 25; c.chan_rtp = 0;
+    struct rc c; memset(&c, 0, sizeof c); c.fd = -1; c.out = 1; c.keepalive_s = 25; c.timeout_ms = 15000;
     unsigned long max_units = 0;
     if (!list) { builtin_usage(); return EX_USAGE; }
     const char *url = list->word->word;
-    reset_internal_getopt();
-    int opt;
-    while ((opt = internal_getopt(list->next, "o:n:k:v")) != -1) {
-        switch (opt) {
-        case 'o': c.out = atoi(list_optarg); break;
-        case 'n': max_units = strtoul(list_optarg, NULL, 10); break;
-        case 'k': c.keepalive_s = atoi(list_optarg); break;
-        case 'v': c.verbose = 1; break;
-        default: builtin_usage(); return EX_USAGE;
-        }
+    reset_internal_getopt(); int opt;
+    while ((opt = internal_getopt(list->next, "o:n:k:t:v")) != -1) {
+        if (option(&c, opt, list_optarg, &max_units)) { builtin_usage(); return EX_USAGE; }
     }
-    int rc = rtspcat_run(&c, url, max_units);
-    if (rc != 0) builtin_error("%s (after %lu units, %lu packets, %lu dropped)", c.err, c.units, c.packets, c.dropped);
+    if (loptend) { builtin_usage(); return EX_USAGE; }
+    int rc = run_guarded(&c, url, max_units);
+    if (rc) builtin_error("%s (after %lu units, %lu packets, %lu dropped)", c.err, c.units, c.packets, c.dropped);
     else if (c.verbose) fprintf(stderr, "rtspcat: done, %lu units, %lu packets, %lu dropped\n", c.units, c.packets, c.dropped);
-    rc_free(&c);
-    return rc == 0 ? EXECUTION_SUCCESS : EXECUTION_FAILURE;
+    rc_free(&c); return rc == 0 ? EXECUTION_SUCCESS : EXECUTION_FAILURE;
 }
 
 char *rtspcat_doc[] = {
     "RTSP/RTP H.264 client: access units out as framed records.",
     "",
-    "    rtspcat URL [-o FD] [-n COUNT] [-k SECS] [-v]",
+    "    rtspcat URL [-o FD] [-n COUNT] [-k SECS] [-t SECS] [-v]",
     "",
     "Connects to rtsp://[user:pass@]host[:port]/path (Basic or Digest), sets up",
     "the H.264 track over interleaved TCP, and writes each access unit to FD",
     "(default 1) as a 4-byte big-endian length followed by the unit in Annex-B",
     "form, with SPS/PPS in front of every IDR. `bashrtsp feed -l` reads one.",
     "Stops after COUNT units, or runs until the server goes away (non-zero, so",
-    "a supervisor restarts it). Keepalive every SECS (default 25). -v logs.",
+    "a supervisor restarts it). Keepalive every SECS (default 25; 0 disables).",
+    "-t sets the read timeout in seconds (default 15). -v logs statistics.",
+    "Drops damaged access units on RTP loss/reordering; buffers at most 8 MiB",
+    "each for an access unit and a fragmented NAL. Incomplete EOF units drop.",
     (char *)NULL
 };
 
 struct builtin rtspcat_struct = {
     "rtspcat", rtspcat_builtin, BUILTIN_ENABLED, rtspcat_doc,
-    "rtspcat URL [-o FD] [-n COUNT] [-k SECS] [-v]", 0
+    "rtspcat URL [-o FD] [-n COUNT] [-k SECS] [-t SECS] [-v]", 0
 };
 #endif

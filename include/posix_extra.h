@@ -26,7 +26,11 @@ enum posix_extra_operation {
     PX_IPCCTL,
     PX_RAW_SYSCALL,
     PX_PRCTL,
-    PX_PTRACE
+    PX_PTRACE,
+    PX_SEM_OPEN,
+    PX_SEM_CLOSE,
+    PX_SEM_UNLINK,
+    PX_GIT_STRFTIME
 };
 struct network_msghdr {
     uint64_t name;
@@ -54,4 +58,10 @@ struct network_ifaddrs {
     uint64_t next, name;
     uint32_t flags, pad;
     uint64_t address, mask, broadcast, data;
+};
+
+struct bridge_calendar {
+    int32_t sec, min, hour, mday, mon, year, wday, yday, isdst, pad;
+    int64_t gmtoff;
+    uint64_t zone;
 };

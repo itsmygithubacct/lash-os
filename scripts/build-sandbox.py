@@ -19,6 +19,7 @@ from elf_dependencies import inspect, require_static, require_arch
 from runtime import ARCHES, rooted
 
 from workspace import ROOT, BUILD, DOWNLOADS, OUT, PATHS, source_state
+from release_version import release_metadata
 MAGIC = b"LASHOS-VM-v1".ljust(16, b"\0")
 
 
@@ -106,6 +107,7 @@ def main():
     parser.add_argument("--modules", type=Path)
     parser.add_argument("--qemu", type=Path)
     args = parser.parse_args()
+    release = release_metadata(ROOT)
     arch = args.arch or os.uname().machine
     if arch not in ARCHES:
         parser.error("Unsupported host architecture")
@@ -131,6 +133,8 @@ def main():
     raw = BUILD / profile / 'linux-bash-os'
     init = BUILD / profile / 'sandbox-init'
     base_manifest = json.loads((BUILD / profile / "portable.json").read_text())
+    if base_manifest.get("bash_os") != release["bash_os"]:
+        raise ValueError("The static loader does not match the selected bash-os release")
     bpf_image = BUILD / profile / "bash.bpf.o"
     if (digest(raw) != base_manifest["loader_sha256"] or
             digest(bpf_image) != base_manifest["bpf_sha256"]):
@@ -322,6 +326,12 @@ def main():
             if source.is_file() and source.name.upper().startswith(("LICENSE", "COPYING", "COPYRIGHT")):
                 name = "__".join(source.relative_to(ROOT).parts)
                 shutil.copy2(source, bundle / "licenses" / name)
+        for entry in json.loads((ROOT / "vendor/bash-os/config/vendored-files.json").read_text())["files"]:
+            source = ROOT / "vendor/bash-os" / entry["notice"]
+            if not source.resolve().is_relative_to((ROOT / "vendor/bash-os").resolve()):
+                raise ValueError("Vendored license notice escapes the source tree")
+            name = "__".join(source.relative_to(ROOT).parts)
+            shutil.copy2(source, bundle / "licenses" / name)
         if package_lock:
             packages = {package["name"] for package in package_lock["packages"]}
             versions = {package["name"]: package["version"] for package in package_lock["packages"]}
@@ -346,6 +356,7 @@ def main():
         manifest = {
             "format": "LASHOS-VM-v1", "architecture": arch + "-linux",
             "runtime": "pinned" if args.arch else "build-host",
+            "bash_os": release["bash_os"],
             "kernel": kernel_manifest or label(args.kernel), "qemu_version": qemu_version,
             "build_source": source_state(), "loader_build_source": base_manifest.get("build_source"),
             "bpf_sha256": digest(bpf_image),

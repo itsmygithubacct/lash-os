@@ -321,7 +321,13 @@ static uint64_t u32_muladd64(uint32_t x, uint32_t y, uint32_t z, uint32_t t)
 
     /* x*y = xl*yl + 2**16 (xh*yl + yl*yh) + 2**32 xh*yh
      *     = lo    + 2**16 (m1    + m2   ) + 2**32 hi    */
-    const uint32_t lo = (uint32_t) xl * yl;
+    /* Materialize the 32-bit product before widening it below. GCC 14.2 on
+     * AArch64 otherwise combines this multiply with the 64-bit accumulation
+     * and drops the uint16_t masks, multiplying x*y instead of xl*yl.
+     * A volatile local prevents that combination without compiler flags or
+     * target-specific assumptions about widening-multiply timing. It adds
+     * only fixed-address accesses; the four products remain 16x16 -> 32. */
+    const volatile uint32_t lo = (uint32_t) xl * yl;
     const uint32_t m1 = (uint32_t) xh * yl;
     const uint32_t m2 = (uint32_t) xl * yh;
     const uint32_t hi = (uint32_t) xh * yh;

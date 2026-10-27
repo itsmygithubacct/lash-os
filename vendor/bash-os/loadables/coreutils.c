@@ -58,9 +58,13 @@
 #include <sys/sysmacros.h>
 #include <time.h>
 #include <sched.h>
+#if defined (__linux__)
+#  include <sys/syscall.h>
+#endif
 
 #include "loadables.h"
 #include "error.h"
+#include "bl-output.h"
 #include <limits.h>
 
 static void *bcu_calloc (size_t n, size_t size)
@@ -170,7 +174,7 @@ bcu_usage (const char *verb)
   else if (strcmp (verb, "numfmt") == 0)
     builtin_error ("usage: coreutils numfmt [--to=iec|iec-i|si] [--from=iec|iec-i|si] N");
   else if (strcmp (verb, "shred") == 0)
-    builtin_error ("usage: coreutils shred [-n N] [-z] [-u] [-s SIZE] FILE...");
+    builtin_error ("usage: coreutils shred [-n N] [-z] [-u] [-x] [-s SIZE] FILE...");
   else if (strcmp (verb, "groups") == 0)
     builtin_error ("usage: coreutils groups [USER...]");
   else if (strcmp (verb, "install") == 0)
@@ -185,54 +189,99 @@ bcu_usage (const char *verb)
  * tac — reverse lines.
  * =================================================================== */
 
+/* Coalesce small records while retaining stdio ordering with other Bash
+   builtins. A large record goes directly to stdout without another copy. */
+typedef struct {
+  char bytes[65536];
+  size_t used;
+  int failed;
+} BCU_OUTPUT;
+
+static void
+bcu_output_flush (BCU_OUTPUT *out)
+{
+  if (!out->failed && out->used &&
+      fwrite (out->bytes, 1, out->used, stdout) != out->used)
+    out->failed = 1;
+  out->used = 0;
+}
+
+static void
+bcu_output_append (BCU_OUTPUT *out, const char *bytes, size_t len)
+{
+  if (out->failed || !len) return;
+  if (len > sizeof out->bytes - out->used) bcu_output_flush (out);
+  if (out->failed) return;
+  if (len >= sizeof out->bytes)
+    {
+      if (fwrite (bytes, 1, len, stdout) != len) out->failed = 1;
+    }
+  else
+    {
+      memcpy (out->bytes + out->used, bytes, len);
+      out->used += len;
+    }
+}
+
+/* Read the descriptor rather than Bash's persistent stdin FILE: its EOF
+   indicator and read-ahead buffer can survive shell redirections. */
+static ssize_t
+bcu_tac_slurp (int fd, char **out)
+{
+  size_t cap = 65536, len = 0;
+  char *buf = xmalloc (cap);
+  for (;;)
+    {
+      if (len == cap)
+        {
+          if (cap > (size_t) SSIZE_MAX / 2)
+            { free (buf); errno = EOVERFLOW; return -1; }
+          cap *= 2;
+          buf = xrealloc (buf, cap);
+        }
+      ssize_t n = read (fd, buf + len, cap - len);
+      if (n < 0 && errno == EINTR) continue;
+      if (n < 0) { int e = errno; free (buf); errno = e; return -1; }
+      if (!n) break;
+      len += (size_t) n;
+    }
+  *out = buf;
+  return (ssize_t) len;
+}
+
 static int
-bcu_tac_stream (FILE *fp, const char *sep)
+bcu_tac_stream (FILE *fp, const char *sep, bl_output *out)
 {
   char *buf = NULL;
-  ssize_t len = bcu_slurp (fp, &buf);
-  if (len < 0) return EXECUTION_FAILURE;
-  if (len == 0) { free (buf); return EXECUTION_SUCCESS; }
-
+  ssize_t len = bcu_tac_slurp (fileno (fp), &buf);
+  if (len < 0)
+    { builtin_error ("tac: read: %s", strerror (errno)); return EXECUTION_FAILURE; }
+  /* GNU selects NUL for an empty separator. Search from the right so
+     overlapping literal separators consume the rightmost match first.
+     Emit each record immediately, avoiding a per-record offset array. */
   size_t seplen = strlen (sep);
-
-  /* Split into records the way GNU tac does: the separator is attached
-   * AFTER the text it follows, so a record runs from one record-start up
-   * to (and including) the next separator. Collect record start offsets,
-   * then emit the records in reverse. A trailing record that is NOT
-   * separator-terminated is emitted first, as-is (no separator is added —
-   * `printf 'a\nb\nc' | tac` => "cb\na\n", not "c\nb\na\n"). */
-  size_t *starts = NULL, n = 0, cap = 0;
-  #define BCU_TAC_PUSH(o) do { \
-      if (n == cap) { cap = cap ? cap * 2 : 64; \
-                      starts = xrealloc (starts, cap * sizeof *starts); \
-                      if (!starts) { free (buf); builtin_error ("tac: oom"); return EXECUTION_FAILURE; } } \
-      starts[n++] = (o); } while (0)
-  BCU_TAC_PUSH (0);
-  if (seplen > 0)
+  if (!seplen) seplen = 1;
+  size_t search_end = (size_t) len, record_end = (size_t) len;
+  while (search_end >= seplen && !out->error)
     {
-      ssize_t i = 0;
-      while (i + (ssize_t) seplen <= len)
+      size_t limit = search_end - seplen + 1;
+      const char *found = NULL;
+      while (limit)
         {
-          if (memcmp (buf + i, sep, seplen) == 0)
-            {
-              size_t next = (size_t) i + seplen;
-              if ((ssize_t) next < len) BCU_TAC_PUSH (next);
-              i += (ssize_t) seplen;
-            }
-          else
-            i++;
+          found = memrchr (buf, (unsigned char) sep[0], limit);
+          if (!found || seplen == 1 || memcmp (found, sep, seplen) == 0) break;
+          limit = (size_t) (found - buf);
+          found = NULL;
         }
+      if (!found) break;
+      size_t start = (size_t) (found - buf), boundary = start + seplen;
+      bl_output_write (out, buf + boundary, record_end - boundary);
+      record_end = boundary;
+      search_end = start;
     }
-  #undef BCU_TAC_PUSH
-  for (ssize_t k = (ssize_t) n - 1; k >= 0; k--)
-    {
-      size_t s = starts[k];
-      size_t e = (k + 1 < (ssize_t) n) ? starts[k + 1] : (size_t) len;
-      fwrite (buf + s, 1, e - s, stdout);
-    }
-  free (starts);
+  if (record_end) bl_output_write (out, buf, record_end);
   free (buf);
-  return EXECUTION_SUCCESS;
+  return out->error ? EXECUTION_FAILURE : EXECUTION_SUCCESS;
 }
 
 static int
@@ -251,22 +300,25 @@ bcu_tac_cmd (WORD_LIST *list)
         }
       if (!strncmp (w, "-s", 2))            { sep = w + 2; list = list->next; continue; }
       if (!strncmp (w, "--separator=", 12)) { sep = w + 12; list = list->next; continue; }
-      break;   /* unknown dash-word: treat as a filename operand (e.g. "-") */
+      builtin_error ("tac: unknown option: %s", w);
+      return EX_USAGE;
     }
-  if (!sep[0]) sep = "\n";   /* empty separator: fall back to newline, as GNU */
-
-  if (!list)
-    return bcu_tac_stream (stdin, sep);
-
+  bl_output out;
+  bl_output_init (&out, stdout);
   int rc = EXECUTION_SUCCESS;
-  for (WORD_LIST *w = list; w; w = w->next)
+  if (!list)
+    rc = bcu_tac_stream (stdin, sep, &out);
+  for (WORD_LIST *w = list; w && !out.error; w = w->next)
     {
       FILE *fp = bcu_open_input (w->word->word);
       if (!fp) { rc = EXECUTION_FAILURE; continue; }
-      if (bcu_tac_stream (fp, sep) != EXECUTION_SUCCESS)
+      if (bcu_tac_stream (fp, sep, &out) != EXECUTION_SUCCESS)
         rc = EXECUTION_FAILURE;
       if (fp != stdin) fclose (fp);
     }
+  bl_output_flush (&out);
+  if (out.error)
+    { builtin_error ("tac: write: %s", strerror (out.error)); rc = EXECUTION_FAILURE; }
   return rc;
 }
 
@@ -288,21 +340,24 @@ bcu_tac_cmd (WORD_LIST *list)
  * shuf's intent of "random for human-scale enumeration." */
 static uint64_t bcu_shuf_state = 0;
 
-static void
+static int
 bcu_shuf_seed (const char *source)
 {
   uint64_t s = 0;
   if (source)
     {
       FILE *fp = fopen (source, "rb");
-      if (fp)
-        {
-          unsigned char b[8] = {0};
-          fread (b, 1, 8, fp);
-          fclose (fp);
-          for (int i = 0; i < 8; i++)
-            s = (s << 8) | b[i];
-        }
+      if (!fp)
+        { builtin_error ("shuf: %s: %s", source, strerror (errno)); return 0; }
+      unsigned char b[8] = {0};
+      size_t count = fread (b, 1, sizeof b, fp);
+      int failed = ferror (fp);
+      fclose (fp);
+      if (failed)
+        { builtin_error ("shuf: %s: read error", source); return 0; }
+      for (size_t i = 0; i < count; i++) s = (s << 8) | b[i];
+      bcu_shuf_state = s ? s : 0x9E3779B97F4A7C15ULL;
+      return 1;
     }
   if (s == 0)
     {
@@ -319,6 +374,7 @@ bcu_shuf_seed (const char *source)
   if (s == 0)
     s = ((uint64_t) time (NULL) << 16) ^ (uint64_t) getpid ();
   bcu_shuf_state = s ? s : 0x9E3779B97F4A7C15ULL;
+  return 1;
 }
 
 static uint64_t
@@ -397,7 +453,7 @@ bcu_shuf_cmd (WORD_LIST *list)
       filename = a;
     }
 
-  bcu_shuf_seed (source);
+  if (!bcu_shuf_seed (source)) return EXECUTION_FAILURE;
 
   size_t n = 0, cap = 0;
   char **items = NULL;
@@ -602,9 +658,7 @@ typedef long int BCU_COST;
 #define BCU_LINE_CREDIT   BCU_EQUIV (3)
 
 typedef struct bcu_word {
-  const char *text;        /* the text of the word. */
   int length;              /* length of this word. */
-  int space;               /* size of the following space (1 or 2). */
   unsigned int paren:1;    /* starts with open paren. */
   unsigned int period:1;   /* ends in [.?!])* */
   unsigned int punct:1;    /* ends in punctuation. */
@@ -633,9 +687,8 @@ typedef struct {
 
 /* GNU check_punctuation: set paren/punct/period flags for word W. */
 static void
-bcu_fmt_check_punctuation (BCU_WORD *w)
+bcu_fmt_check_punctuation (BCU_WORD *w, const char *start)
 {
-  const char *start = w->text;
   const char *finish = start + (w->length - 1);
   unsigned char fin = (unsigned char) *finish;
 
@@ -734,7 +787,7 @@ bcu_fmt_paragraph (BCU_FMTCTX *ctx)
           if (w == ctx->word_limit)
             break;
 
-          len += (w - 1)->space + w->length;  /* w > start >= word. */
+          len += 1 + w->length;  /* Parsing collapses every gap to one space. */
         }
       while (len <= ctx->max_width);
       start->best_cost = best + bcu_fmt_base_cost (ctx, start);
@@ -746,33 +799,11 @@ bcu_fmt_paragraph (BCU_FMTCTX *ctx)
 /* Emit one paragraph's words with GNU-optimal line breaks. Re-emits the
  * paragraph prefix at the start of each output line. */
 static void
-bcu_fmt_emit_para (char **words, size_t n, const char *prefix, int width)
+bcu_fmt_emit_para (char *text, BCU_WORD *word, size_t n,
+                   const char *prefix, int width, BCU_OUTPUT *out)
 {
   if (!n) return;
   size_t prefixlen = prefix ? strlen (prefix) : 0;
-
-  /* Build the WORD array: n words plus a sentinel slot (GNU style). */
-  BCU_WORD *word = bcu_calloc (n + 1, sizeof *word);
-  if (!word)
-    {
-      /* Out of memory: degrade to one-word-per-line so we still emit. */
-      for (size_t i = 0; i < n; i++)
-        {
-          if (prefix) fputs (prefix, stdout);
-          fputs (words[i], stdout);
-          putchar ('\n');
-        }
-      return;
-    }
-
-  for (size_t i = 0; i < n; i++)
-    {
-      word[i].text = words[i];
-      word[i].length = (int) strlen (words[i]);
-      bcu_fmt_check_punctuation (&word[i]);   /* sets paren/punct/period. */
-      word[i].final = 0;
-      word[i].space = 1;
-    }
 
   /* GNU sets a word's 'final' flag only when its period is followed by
    * end-of-line or >1 space in the SOURCE. The stream feeding us has
@@ -796,33 +827,28 @@ bcu_fmt_emit_para (char **words, size_t n, const char *prefix, int width)
 
   bcu_fmt_paragraph (&ctx);
 
-  /* put_paragraph + put_line (GNU): the outer loop iterates the line-start
-   * words via the next_break chain; each line emits its words up to (but
-   * not including) the next break, separated by w->space. A distinct inner
-   * cursor is used so the chain pointer is never clobbered. */
+  /* Word text and its single-space gaps are contiguous. The optimizer's
+     line length already gives the span to emit, excluding the prefix. */
+  char *line_text = text;
   for (BCU_WORD *line = word; line != ctx.word_limit; line = line->next_break)
     {
-      if (prefix) fputs (prefix, stdout);
-      BCU_WORD *endline = line->next_break - 1;
-      BCU_WORD *w = line;
-      for (; w != endline; w++)
-        {
-          fwrite (w->text, 1, (size_t) w->length, stdout);
-          for (int s = 0; s < w->space; s++) putchar (' ');
-        }
-      fwrite (w->text, 1, (size_t) w->length, stdout);
-      putchar ('\n');
+      if (prefix) bcu_output_append (out, prefix, prefixlen);
+      size_t len = (size_t) line->line_length - prefixlen;
+      line_text[len] = '\n';
+      bcu_output_append (out, line_text, len + 1);
+      line_text += len + 1;
     }
-
-  free (word);
 }
 
 static int
 bcu_fmt_stream (FILE *fp, int width)
 {
   char *line = NULL; size_t llen = 0; ssize_t r;
-  char **words = NULL; size_t n = 0, cap = 0;
+  BCU_WORD *word = NULL; size_t n = 0, cap = 0;
+  char *text = NULL; size_t textlen = 0, textcap = 0;
   char *prefix = NULL;
+  BCU_OUTPUT out;
+  out.used = 0; out.failed = 0;
 
   while ((r = getline (&line, &llen, fp)) != -1)
     {
@@ -832,10 +858,9 @@ bcu_fmt_stream (FILE *fp, int width)
         if (!isspace ((unsigned char) line[i])) { blank = 0; break; }
       if (blank)
         {
-          bcu_fmt_emit_para (words, n, prefix, width);
-          if (n) putchar ('\n');
-          for (size_t i = 0; i < n; i++) free (words[i]);
-          n = 0;
+          bcu_fmt_emit_para (text, word, n, prefix, width, &out);
+          if (n) bcu_output_append (&out, "\n", 1);
+          n = 0; textlen = 0;
           free (prefix); prefix = NULL;
           continue;
         }
@@ -860,17 +885,41 @@ bcu_fmt_stream (FILE *fp, int width)
           char *start = p;
           while (*p && !isspace ((unsigned char) *p)) p++;
           size_t wlen = (size_t) (p - start);
-          if (n == cap) { cap = cap ? cap * 2 : 64; words = xrealloc (words, cap * sizeof (*words)); }
-          char *w = xmalloc (wlen + 1);
-          memcpy (w, start, wlen);
-          w[wlen] = '\0';
-          words[n++] = w;
+          if (n == cap) {
+            if (cap > (SIZE_MAX / sizeof *word - 1) / 2) {
+              fatal_error ("coreutils fmt: allocation too large"); abort ();
+            }
+            cap = cap ? cap * 2 : 64;
+            word = xrealloc (word, (cap + 1) * sizeof *word);
+          }
+          if (wlen == SIZE_MAX || textlen > SIZE_MAX - wlen - 1) {
+            fatal_error ("coreutils fmt: allocation too large"); abort ();
+          }
+          size_t need = textlen + wlen + 1;
+          if (need > textcap) {
+            size_t grow = textcap ? textcap : 4096;
+            while (grow < need) {
+              if (grow > SIZE_MAX / 2) { grow = need; break; }
+              grow *= 2;
+            }
+            text = xrealloc (text, grow);
+            textcap = grow;
+          }
+          word[n].length = (int) wlen;
+          word[n].final = 0;
+          bcu_fmt_check_punctuation (&word[n], start);
+          n++;
+          /* The final slot remains available for the optimizer's sentinel. */
+          word[n].length = 0;
+          memcpy (text + textlen, start, wlen);
+          text[textlen + wlen] = ' ';
+          textlen = need;
         }
     }
-  bcu_fmt_emit_para (words, n, prefix, width);
-  for (size_t i = 0; i < n; i++) free (words[i]);
-  free (words); free (prefix); free (line);
-  return EXECUTION_SUCCESS;
+  bcu_fmt_emit_para (text, word, n, prefix, width, &out);
+  bcu_output_flush (&out);
+  free (word); free (text); free (prefix); free (line);
+  return (out.failed || ferror (fp)) ? EXECUTION_FAILURE : EXECUTION_SUCCESS;
 }
 
 static int
@@ -1038,54 +1087,74 @@ bcu_tsort_cmd (WORD_LIST *list)
  * nproc — processors available to this process; --all is every configured one
  * =================================================================== */
 
-/* Processors this process may actually run on. GNU nproc's default counts the
-   affinity mask, not the online CPUs, so under `taskset -c 3` it prints 1 while
-   _SC_NPROCESSORS_ONLN still says 12. Returns 0 when the mask is unavailable so
-   the caller can fall back.
-
-   Scope: GNU also lets OMP_NUM_THREADS and OMP_THREAD_LIMIT override the
-   default. That is deliberately not implemented here -- this is not an OpenMP
-   runtime host -- and is recorded as a scope difference, not parity. */
-static long
+/* Count the current affinity mask; zero requests a sysconf fallback. */
+static unsigned long
 bcu_nproc_available (void)
 {
   cpu_set_t set;
-  if (sched_getaffinity (0, sizeof set, &set) != 0)
-    return 0;
+  if (sched_getaffinity (0, sizeof set, &set) != 0) return 0;
   return CPU_COUNT (&set);
+}
+
+/* OpenMP permits surrounding whitespace and lists of nesting levels.
+   Only the first level affects nproc. Invalid/zero values are ignored;
+   strtoul saturation matches GNU for values larger than ULONG_MAX. */
+static unsigned long
+bcu_nproc_omp (const char *value)
+{
+  if (!value) return 0;
+  while (isspace ((unsigned char) *value)) value++;
+  if (*value < '0' || *value > '9') return 0;
+  char *end;
+  unsigned long n = strtoul (value, &end, 10);
+  while (isspace ((unsigned char) *end)) end++;
+  return !*end || *end == ',' ? n : 0;
 }
 
 static int
 bcu_nproc_cmd (WORD_LIST *list)
 {
-  /* GNU nproc accepts --all and --ignore=N; --all reports every configured
-   * processor, the default reports the ones this process may run on, and
-   * --ignore=N subtracts from the count (floored at 1). */
-  long ignore = 0;
+  unsigned long ignore = 0;
   int use_all = 0;
   for (WORD_LIST *w = list; w; w = w->next)
     {
-      const char *a = w->word->word;
-      if (strcmp (a, "--all") == 0) { use_all = 1; continue; }
-      if (strncmp (a, "--ignore=", 9) == 0)
+      const char *a = w->word->word, *value = NULL;
+      if (!strcmp (a, "--all")) { use_all = 1; continue; }
+      if (!strcmp (a, "--") && !w->next) break;
+      if (!strncmp (a, "--ignore=", 9)) value = a + 9;
+      else if (!strcmp (a, "--ignore") && w->next)
+        { w = w->next; value = w->word->word; }
+      if (value)
         {
-          ignore = strtol (a + 9, NULL, 10);
-          if (ignore < 0) ignore = 0;
-          continue;
+          while (isspace ((unsigned char) *value)) value++;
+          char *end;
+          errno = 0;
+          ignore = strtoul (value, &end, 10);
+          if (*value && *value != '-' && end != value && !*end)
+            continue;
+          builtin_error ("nproc: invalid number: %s", value);
+          return EXECUTION_FAILURE;
         }
       builtin_error ("nproc: unknown flag: %s", a);
       bcu_usage ("nproc");
       return EX_USAGE;
     }
-  long n = 0;
+  unsigned long n = 0, limit = ULONG_MAX;
   if (!use_all)
-    n = bcu_nproc_available ();
-  if (n < 1)
-    n = sysconf (use_all ? _SC_NPROCESSORS_CONF : _SC_NPROCESSORS_ONLN);
-  if (n < 1) n = 1;
-  n -= ignore;
-  if (n < 1) n = 1;
-  printf ("%ld\n", n);
+    {
+      n = bcu_nproc_omp (getenv ("OMP_NUM_THREADS"));
+      unsigned long v = bcu_nproc_omp (getenv ("OMP_THREAD_LIMIT"));
+      if (v) limit = v;
+      if (!n) n = bcu_nproc_available ();
+    }
+  if (!n)
+    {
+      long configured = sysconf (use_all ? _SC_NPROCESSORS_CONF : _SC_NPROCESSORS_ONLN);
+      n = configured > 0 ? (unsigned long) configured : 1;
+    }
+  if (n > limit) n = limit;
+  n = ignore < n ? n - ignore : 1;
+  printf ("%lu\n", n);
   return EXECUTION_SUCCESS;
 }
 
@@ -1252,6 +1321,7 @@ bcu_numfmt_cmd (WORD_LIST *list)
  *   -n N    pass count (default 3)
  *   -z      add a final zero-fill pass
  *   -u      unlink after writing
+ *   -x      exact size (also the default; no block-size rounding)
  *   -s SZ   treat file as SZ bytes long (rare; default = current size)
  * =================================================================== */
 
@@ -1271,30 +1341,38 @@ bcu_shred_one (const char *path, int passes, int zero_pass, int unlink_after, lo
   unsigned char *buf = xmalloc (BUFSZ);
   if (!buf) { close (fd); return EXECUTION_FAILURE; }
 
-  FILE *rnd = fopen ("/dev/urandom", "rb");
-  for (int pass = 0; pass < passes + (zero_pass ? 1 : 0); pass++)
+  int error = 0;
+  FILE *rnd = passes ? fopen ("/dev/urandom", "rb") : NULL;
+  if (passes && !rnd) error = errno;
+  for (int pass = 0; !error && pass < passes + (zero_pass ? 1 : 0); pass++)
     {
-      if (lseek (fd, 0, SEEK_SET) < 0) break;
-      int is_zero_pass = (pass == passes); /* zero pass is appended */
+      if (lseek (fd, 0, SEEK_SET) < 0) { error = errno; break; }
+      int is_zero_pass = (pass == passes);
       off_t remaining = sz;
-      while (remaining > 0)
+      while (remaining > 0 && !error)
         {
-          size_t chunk = (remaining < BUFSZ) ? (size_t) remaining : (size_t) BUFSZ;
-          if (is_zero_pass)
-            memset (buf, 0, chunk);
-          else if (rnd)
-            { if (fread (buf, 1, chunk, rnd) != chunk) memset (buf, 0xa5, chunk); }
-          else
-            memset (buf, 0xa5, chunk);
-          ssize_t wn = write (fd, buf, chunk);
-          if (wn < 0) { remaining = -1; break; }
-          remaining -= wn;
+          size_t chunk = remaining < BUFSZ ? (size_t) remaining : (size_t) BUFSZ;
+          if (is_zero_pass) memset (buf, 0, chunk);
+          else if (fread (buf, 1, chunk, rnd) != chunk)
+            { error = errno ? errno : EIO; break; }
+          size_t written = 0;
+          while (written < chunk)
+            {
+              ssize_t n = write (fd, buf + written, chunk - written);
+              if (n < 0 && errno == EINTR) continue;
+              if (n <= 0) { error = n < 0 ? errno : EIO; break; }
+              written += (size_t) n;
+            }
+          remaining -= (off_t) written;
         }
-      fsync (fd);
+      if (!error && fsync (fd) < 0) error = errno;
     }
   if (rnd) fclose (rnd);
   free (buf);
-  close (fd);
+  if (close (fd) < 0 && !error) error = errno;
+  /* Never unlink a file after an unsuccessful overwrite. */
+  if (error)
+    { builtin_error ("shred: %s: %s", path, strerror (error)); return EXECUTION_FAILURE; }
   if (unlink_after && unlink (path) < 0)
     { builtin_error ("shred: unlink %s: %s", path, strerror (errno)); return EXECUTION_FAILURE; }
   return EXECUTION_SUCCESS;
@@ -1312,6 +1390,8 @@ bcu_shred_cmd (WORD_LIST *list)
       const char *a = w->word->word;
       if (strcmp (a, "-n") == 0 && w->next)
         { w = w->next; long long v; if (!bcu_parse_ll (w->word->word, &v) || v < 0 || v >= INT_MAX) { builtin_error ("shred: bad -n"); bcu_usage ("shred"); return EX_USAGE; } passes = (int) v; continue; }
+      /* This implementation always writes the exact requested/current size. */
+      if (strcmp (a, "-x") == 0 || strcmp (a, "--exact") == 0) continue;
       if (strcmp (a, "-z") == 0) { zero_pass = 1; continue; }
       if (strcmp (a, "-u") == 0) { unlink_after = 1; continue; }
       if (strcmp (a, "-s") == 0 && w->next)
@@ -1413,44 +1493,173 @@ bcu_groups_cmd (WORD_LIST *list)
  *   install -d [-m MODE] DIR...         mkdir -p style
  *   install -D [-m MODE] SRC DST        make parent dirs of DST first
  *
- * Owner/group flags (-o/-g) parse but only attempt the chown when
- * geteuid() == 0; non-root silently keeps the running uid/gid (this
- * matches GNU install behavior on non-root invocations).
+ * Owner/group flags (-o/-g) accept names or numeric IDs. Validate them
+ * before modifying destinations, and report any ownership-change failure.
  * =================================================================== */
+
+/* Whether two paths name one directory entry: the same last component in
+   the same parent directory, however either path is spelled. An answer that
+   cannot be established counts as the same entry, so the caller refuses
+   instead of removing the source's only name. */
+static int
+bcu_install_same_entry (const char *a, const char *b)
+{
+  const char *paths[2] = { a, b };
+  char parents[2][PATH_MAX];
+  struct stat dirs[2];
+  const char *sa = strrchr (a, '/'), *sb = strrchr (b, '/');
+  if (strcmp (sa ? sa + 1 : a, sb ? sb + 1 : b))
+    return 0;
+  for (int i = 0; i < 2; i++)
+    {
+      const char *slash = strrchr (paths[i], '/');
+      size_t len = slash ? (size_t) (slash - paths[i]) : 0;
+      if (len >= PATH_MAX)
+        return 1;
+      if (!slash)
+        strcpy (parents[i], ".");
+      else if (len == 0)
+        strcpy (parents[i], "/");
+      else
+        {
+          memcpy (parents[i], paths[i], len);
+          parents[i][len] = '\0';
+        }
+      if (stat (parents[i], &dirs[i]) < 0)
+        return 1;
+    }
+  return dirs[0].st_dev == dirs[1].st_dev && dirs[0].st_ino == dirs[1].st_ino;
+}
+
+/* Handle a destination that already names the source's inode as GNU install
+   does. The same directory entry, or a source that reaches the destination
+   through a symbolic link, is refused. Another hard link or a symbolic link
+   to the source is removed, so a fresh file takes its name and the source
+   keeps its data. Returns -1 after reporting a refusal or failure. */
+static int
+bcu_install_same_file (const char *src, const char *dst, const struct stat *src_st)
+{
+  struct stat st;
+  if (stat (dst, &st) < 0 || st.st_dev != src_st->st_dev || st.st_ino != src_st->st_ino)
+    return 0;
+  int replace;
+  if (lstat (dst, &st) == 0 && S_ISLNK (st.st_mode))
+    replace = 1;
+  else
+    replace = !(lstat (src, &st) == 0 && S_ISLNK (st.st_mode)) &&
+              !bcu_install_same_entry (src, dst);
+  if (!replace)
+    {
+      builtin_error ("install: '%s' and '%s' are the same file", src, dst);
+      return -1;
+    }
+  if (unlink (dst) < 0)
+    {
+      builtin_error ("install: cannot remove %s: %s", dst, strerror (errno));
+      return -1;
+    }
+  return 0;
+}
 
 static int
 bcu_install_copyfile (const char *src, const char *dst, mode_t mode, uid_t uid, gid_t gid)
 {
   int rfd = open (src, O_RDONLY);
   if (rfd < 0) { builtin_error ("install: %s: %s", src, strerror (errno)); return EXECUTION_FAILURE; }
-  int wfd = open (dst, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-  if (wfd < 0) { close (rfd); builtin_error ("install: %s: %s", dst, strerror (errno)); return EXECUTION_FAILURE; }
-  char buf[BUFSZ];
-  ssize_t n;
-  while ((n = read (rfd, buf, sizeof buf)) > 0)
+  struct stat src_st, dst_st;
+  if (fstat (rfd, &src_st) < 0)
+    { int e = errno; close (rfd); builtin_error ("install: stat %s: %s", src, strerror (e)); return EXECUTION_FAILURE; }
+  if (S_ISDIR (src_st.st_mode))
+    { close (rfd); builtin_error ("install: %s is a directory", src); return EXECUTION_FAILURE; }
+  if (bcu_install_same_file (src, dst, &src_st) < 0)
+    { close (rfd); return EXECUTION_FAILURE; }
+  /* GNU install replaces the directory entry. Other hard links keep their
+     contents, and a destination symlink is replaced rather than followed.
+     Open the source and reject same-file operands before removing anything. */
+  if (unlink (dst) < 0 && errno != ENOENT)
+    { int e = errno; close (rfd); builtin_error ("install: cannot remove %s: %s", dst, strerror (e)); return EXECUTION_FAILURE; }
+  int wfd = open (dst, O_WRONLY | O_CREAT | O_EXCL, 0600);
+  if (wfd < 0)
+    { int e = errno; close (rfd); builtin_error ("install: %s: %s", dst, strerror (e)); return EXECUTION_FAILURE; }
+  if (fstat (wfd, &dst_st) < 0)
+    { int e = errno; close (rfd); close (wfd); builtin_error ("install: stat %s: %s", dst, strerror (e)); return EXECUTION_FAILURE; }
+  if (dst_st.st_dev == src_st.st_dev && dst_st.st_ino == src_st.st_ino)
     {
+      close (rfd); close (wfd);
+      builtin_error ("install: '%s' and '%s' are the same file", src, dst);
+      return EXECUTION_FAILURE;
+    }
+  int write_error = 0, read_error = 0;
+#if defined (__linux__) && defined (SYS_copy_file_range)
+  /* Unsupported filesystems (or a short kernel copy) continue through
+     read/write at the descriptors' current offsets. */
+  if (S_ISREG (src_st.st_mode) && S_ISREG (dst_st.st_mode))
+    while (syscall (SYS_copy_file_range, rfd, NULL, wfd, NULL,
+                    (size_t) 1024 * 1024 * 1024, 0) > 0)
+      ;
+  /* Always finish with read, including after a zero return: some virtual
+     regular files report zero size yet still yield data when read. */
+#endif
+  /* Amortize read/write calls for streams and portable fallback copies.
+     Short reads still emit at once. */
+  char buf[128 * 1024];
+  ssize_t n;
+  while (1)
+    {
+      n = read (rfd, buf, sizeof buf);
+      if (n < 0 && errno == EINTR) continue;
+      if (n <= 0) { if (n < 0) read_error = errno; break; }
       ssize_t off = 0;
       while (off < n)
         {
           ssize_t w = write (wfd, buf + off, (size_t) (n - off));
-          if (w < 0) { close (rfd); close (wfd); builtin_error ("install: write: %s", strerror (errno)); return EXECUTION_FAILURE; }
+          if (w < 0 && errno == EINTR) continue;
+          if (w <= 0) { write_error = w < 0 ? errno : EIO; goto copy_done; }
           off += w;
         }
     }
+copy_done:
   close (rfd);
-  if (fchmod (wfd, mode) < 0)
-    { close (wfd); builtin_error ("install: chmod %s: %s", dst, strerror (errno)); return EXECUTION_FAILURE; }
-  if (geteuid () == 0 && (uid != (uid_t) -1 || gid != (gid_t) -1))
+  if (read_error)
+    {
+      close (wfd);
+      builtin_error ("install: read %s: %s", src, strerror (read_error));
+      return EXECUTION_FAILURE;
+    }
+  if (write_error)
+    {
+      close (wfd);
+      builtin_error ("install: write: %s", strerror (write_error));
+      return EXECUTION_FAILURE;
+    }
+  if (uid != (uid_t) -1 || gid != (gid_t) -1)
     {
       if (fchown (wfd, uid, gid) < 0)
         { close (wfd); builtin_error ("install: chown %s: %s", dst, strerror (errno)); return EXECUTION_FAILURE; }
     }
+  /* Ownership changes may clear set-ID bits. Apply the requested mode last. */
+  if (fchmod (wfd, mode) < 0)
+    { close (wfd); builtin_error ("install: chmod %s: %s", dst, strerror (errno)); return EXECUTION_FAILURE; }
   close (wfd);
   return EXECUTION_SUCCESS;
 }
 
 static int
-bcu_install_mkdir_p (const char *path, mode_t mode)
+bcu_install_mkdir_unmasked (const char *path, mode_t mode)
+{
+  /* mkdir itself preserves inherited setgid/default directory metadata.
+     Creating with the final permissions avoids a chmod that clears setgid. */
+  mode_t mask = umask (0);
+  int rc = mkdir (path, mode);
+  int error = errno;
+  umask (mask);
+  errno = error;
+  return rc;
+}
+
+static int
+bcu_install_mkdir_p (const char *path, mode_t mode, uid_t uid, gid_t gid,
+                     int adjust_existing)
 {
   char *tmp = bcu_strdup (path);
   if (!tmp) return EXECUTION_FAILURE;
@@ -1458,17 +1667,80 @@ bcu_install_mkdir_p (const char *path, mode_t mode)
     if (*p == '/')
       {
         *p = '\0';
-        if (mkdir (tmp, 0755) < 0 && errno != EEXIST)
+        if (bcu_install_mkdir_unmasked (tmp, 0755) < 0 && errno != EEXIST)
           { builtin_error ("install: mkdir %s: %s", tmp, strerror (errno)); free (tmp); return EXECUTION_FAILURE; }
         *p = '/';
       }
-  if (mkdir (tmp, mode) < 0 && errno != EEXIST)
-    { builtin_error ("install: mkdir %s: %s", tmp, strerror (errno)); free (tmp); return EXECUTION_FAILURE; }
+  int made = adjust_existing ? mkdir (tmp, mode) : bcu_install_mkdir_unmasked (tmp, mode);
+  if (made < 0)
+    {
+      if (errno != EEXIST)
+        { builtin_error ("install: mkdir %s: %s", tmp, strerror (errno)); free (tmp); return EXECUTION_FAILURE; }
+      struct stat st;
+      if (stat (tmp, &st) < 0 || !S_ISDIR (st.st_mode))
+        { builtin_error ("install: %s is not a directory", tmp); free (tmp); return EXECUTION_FAILURE; }
+    }
+  /* -D only creates missing parents; -d explicitly sets their mode. */
+  if (!adjust_existing) { free (tmp); return EXECUTION_SUCCESS; }
+  if ((uid != (uid_t) -1 || gid != (gid_t) -1) && chown (tmp, uid, gid) < 0)
+    { builtin_error ("install: chown %s: %s", tmp, strerror (errno)); free (tmp); return EXECUTION_FAILURE; }
   /* Make sure the final component honors mode even if it already existed. */
   if (chmod (tmp, mode) < 0)
     { builtin_error ("install: chmod %s: %s", tmp, strerror (errno)); free (tmp); return EXECUTION_FAILURE; }
   free (tmp);
   return EXECUTION_SUCCESS;
+}
+
+static int
+bcu_install_id (const char *name, int group, uintmax_t *id)
+{
+#if defined (BASHOS_STATIC) && defined (__GLIBC__)
+  /* Static glibc cannot safely load arbitrary host NSS modules. Restrict
+     named install identities to the local account files in this build. */
+  FILE *accounts = fopen (group ? "/etc/group" : "/etc/passwd", "r");
+  if (accounts)
+    {
+      int found = 0;
+      if (group)
+        {
+          struct group *gr;
+          while ((gr = fgetgrent (accounts)) != NULL)
+            if (!strcmp (gr->gr_name, name)) { *id = gr->gr_gid; found = 1; break; }
+        }
+      else
+        {
+          struct passwd *pw;
+          while ((pw = fgetpwent (accounts)) != NULL)
+            if (!strcmp (pw->pw_name, name)) { *id = pw->pw_uid; found = 1; break; }
+        }
+      fclose (accounts);
+      if (found) return 0;
+    }
+#else
+  if (group)
+    {
+      struct group *gr = getgrnam (name);
+      if (gr) { *id = gr->gr_gid; return 0; }
+    }
+  else
+    {
+      struct passwd *pw = getpwnam (name);
+      if (pw) { *id = pw->pw_uid; return 0; }
+    }
+#endif
+  const char *number = name;
+  while (isspace ((unsigned char) *number)) number++;
+  char *end;
+  errno = 0;
+  uintmax_t value = strtoumax (number, &end, 10);
+  if (*number == '-' || end == number || *end || errno == ERANGE ||
+      (group ? (uintmax_t) (gid_t) value : (uintmax_t) (uid_t) value) != value)
+    {
+      builtin_error ("install: invalid %s '%s'", group ? "group" : "user", name);
+      return -1;
+    }
+  *id = value;
+  return 0;
 }
 
 static int
@@ -1496,10 +1768,16 @@ bcu_install_cmd (WORD_LIST *list)
         }
       if (strcmp (a, "-d") == 0) { dir_only = 1; continue; }
       if (strcmp (a, "-D") == 0) { parents = 1; continue; }
-      if (strcmp (a, "-o") == 0 && w->next)
-        { w = w->next; struct passwd *pw = getpwnam (w->word->word); if (pw) uid = pw->pw_uid; continue; }
-      if (strcmp (a, "-g") == 0 && w->next)
-        { w = w->next; struct group *gr = getgrnam (w->word->word); if (gr) gid = gr->gr_gid; continue; }
+      if ((strcmp (a, "-o") == 0 || strcmp (a, "-g") == 0) && w->next)
+        {
+          int group = a[1] == 'g';
+          uintmax_t id;
+          w = w->next;
+          if (bcu_install_id (w->word->word, group, &id) < 0) return EXECUTION_FAILURE;
+          if (group) gid = (gid_t) id;
+          else uid = (uid_t) id;
+          continue;
+        }
       if (a[0] == '-' && a[1] != '\0') { builtin_error ("install: unknown flag: %s", a); bcu_usage ("install"); return EX_USAGE; }
       WORD_LIST *nw = bcu_calloc (1, sizeof (*nw));
       nw->word = w->word;
@@ -1512,7 +1790,7 @@ bcu_install_cmd (WORD_LIST *list)
     {
       if (!pos) { builtin_error ("install: -d requires DIR..."); bcu_usage ("install"); return EX_USAGE; }
       for (WORD_LIST *w = pos; w; w = w->next)
-        if (bcu_install_mkdir_p (w->word->word, mode) != EXECUTION_SUCCESS)
+        if (bcu_install_mkdir_p (w->word->word, mode, uid, gid, 1) != EXECUTION_SUCCESS)
           rc = EXECUTION_FAILURE;
       goto cleanup;
     }
@@ -1533,7 +1811,11 @@ bcu_install_cmd (WORD_LIST *list)
       char *tmp = bcu_strdup (dst);
       char *slash = strrchr (tmp, '/');
       if (slash && slash != tmp)
-        { *slash = '\0'; bcu_install_mkdir_p (tmp, 0755); }
+        {
+          *slash = '\0';
+          if (bcu_install_mkdir_p (tmp, 0755, (uid_t) -1, (gid_t) -1, 0) != EXECUTION_SUCCESS)
+            { free (tmp); return EXECUTION_FAILURE; }
+        }
       free (tmp);
     }
 
@@ -1569,7 +1851,8 @@ cleanup:
 static int
 bcu_mknod_cmd (WORD_LIST *list)
 {
-  mode_t mode = 0644;
+  mode_t mode = 0666;
+  int explicit_mode = 0;
   WORD_LIST *pos __attribute__((cleanup(bcu_free_nodes))) = NULL;
   WORD_LIST *pos_tail = NULL;
   for (WORD_LIST *w = list; w; w = w->next)
@@ -1582,6 +1865,7 @@ bcu_mknod_cmd (WORD_LIST *list)
           unsigned long m = strtoul (w->word->word, &end, 8);
           if (end == w->word->word || *end != '\0' || m > 07777) { builtin_error ("mknod: bad -m"); bcu_usage ("mknod"); return EX_USAGE; }
           mode = (mode_t) m;
+          explicit_mode = 1;
           continue;
         }
       if (a[0] == '-' && a[1] != '\0') { builtin_error ("mknod: unknown flag: %s", a); bcu_usage ("mknod"); return EX_USAGE; }
@@ -1601,7 +1885,14 @@ bcu_mknod_cmd (WORD_LIST *list)
 
   if (strcmp (type, "p") == 0)
     {
-      if (mkfifo (path, mode) < 0)
+      /* An explicit FIFO mode is independent of the caller's umask. Apply
+         it at creation, without chmod on a pathname that may already exist. */
+      mode_t saved_mask = explicit_mode ? umask (0) : 0;
+      int result = mkfifo (path, mode);
+      int saved_errno = errno;
+      if (explicit_mode) umask (saved_mask);
+      errno = saved_errno;
+      if (result < 0)
         { builtin_error ("mknod: %s: %s", path, strerror (errno)); rc = EXECUTION_FAILURE; }
     }
   else if (strcmp (type, "b") == 0 || strcmp (type, "c") == 0)
@@ -1627,8 +1918,8 @@ mknod_out:
  * Bash builtin dispatch.
  * =================================================================== */
 
-int
-coreutils_builtin (WORD_LIST *list)
+static int
+bcu_dispatch (WORD_LIST *list)
 {
   if (!list) { builtin_usage (); return EX_USAGE; }
   const char *verb = list->word->word;
@@ -1650,6 +1941,19 @@ coreutils_builtin (WORD_LIST *list)
   return EX_USAGE;
 }
 
+int
+coreutils_builtin (WORD_LIST *list)
+{
+  int rc = bcu_dispatch (list);
+  if (fflush (stdout) == EOF || ferror (stdout))
+    {
+      builtin_error ("write: %s", strerror (errno ? errno : EIO));
+      clearerr (stdout);
+      rc = EXECUTION_FAILURE;
+    }
+  return rc;
+}
+
 char *coreutils_doc[] = {
   "Bundle of 12 small POSIX coreutils as a single bash loadable.",
   "",
@@ -1661,7 +1965,7 @@ char *coreutils_doc[] = {
   "    coreutils tsort  [FILE]",
   "    coreutils nproc  [--all] [--ignore=N]",
   "    coreutils numfmt [--to=iec|iec-i|si] [--from=iec|iec-i|si] N",
-  "    coreutils shred  [-n N] [-z] [-u] [-s SIZE] FILE...",
+  "    coreutils shred  [-n N] [-z] [-u] [-x] [-s SIZE] FILE...",
   "    coreutils groups [USER...]",
   "    coreutils install [-m MODE] [-o OWNER] [-g GROUP] [-d|-D] SRC... DST",
   "    coreutils mknod  [-m MODE] PATH {b|c|p} [MAJ MIN]",

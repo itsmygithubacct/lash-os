@@ -50,6 +50,9 @@ netstat_builtin (WORD_LIST *list)
   memset (&o, 0, sizeof o);
   o.numeric = 1;
   o.legacy_columns = 1;
+  /* stdio belongs to the persistent shell. A previous redirected call can
+   * leave its error indicator set even after Bash restores stdout. */
+  clearerr (stdout);
 
   int explicit_family = 0;
   for (WORD_LIST *p = list; p; p = p->next)
@@ -61,7 +64,8 @@ netstat_builtin (WORD_LIST *list)
         {
           printf ("bashnetstat — netstat(8) surface "
                   "(legacy headers over bashss)\n");
-          return EXECUTION_SUCCESS;
+          return fflush (stdout) == 0 && !ferror (stdout)
+                 ? EXECUTION_SUCCESS : EXECUTION_FAILURE;
         }
       /* net-tools long-option aliases, so `bashnetstat --tcp --listening`
        * works like the real netstat(8) instead of being mis-parsed as a
@@ -120,7 +124,12 @@ netstat_builtin (WORD_LIST *list)
   if (!o.listen_only && !o.all_states)
     o.all_states = 1;
 
-  return bss_run (&o) == 0 ? EXECUTION_SUCCESS : EXECUTION_FAILURE;
+  int rc = bss_run (&o);
+  /* bss_run writes through stdio, so detect both buffered and immediate
+   * output failures before Bash restores a caller's redirection. */
+  if (fflush (stdout) == EOF || ferror (stdout))
+    rc = -1;
+  return rc == 0 ? EXECUTION_SUCCESS : EXECUTION_FAILURE;
 }
 
 char *netstat_doc[] = {

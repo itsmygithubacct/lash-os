@@ -226,6 +226,7 @@ bashos_sudoedit_atomic_copyback (const char *target, int src_fd,
   if (rename (tmpl, target) != 0)
     goto out;
 
+  close (tfd);
   tfd = -1;                       /* renamed away; do not unlink below */
   free (tmpl);
   tmpl = NULL;

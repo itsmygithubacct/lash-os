@@ -25,8 +25,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
-#include <ctype.h>
-#include <locale.h>
+#include <poll.h>
 #include <netdb.h>
 #include <signal.h>
 #include <stdio.h>
@@ -63,15 +62,15 @@ bsd_on_signal (int sig)
     bsd_stop = 1;
 }
 
-static void
-bsd_install_signal (int sig)
+static int
+bsd_install_signal (int sig, struct sigaction *old)
 {
   struct sigaction sa;
 
   memset (&sa, 0, sizeof sa);
   sa.sa_handler = bsd_on_signal;
   sigemptyset (&sa.sa_mask);
-  sigaction (sig, &sa, NULL);
+  return sigaction (sig, &sa, old);
 }
 
 static int
@@ -151,7 +150,13 @@ bsd_open_socket (const char *path, mode_t mode)
       close (fd);
       return -1;
     }
-  chmod (path, mode);
+  if (chmod (path, mode) < 0)
+    {
+      builtin_error ("chmod %s: %s", path, strerror (errno));
+      close (fd);
+      unlink (path);
+      return -1;
+    }
   return fd;
 }
 
@@ -161,8 +166,11 @@ bsd_stamp (char *buf, size_t cap)
   time_t now = time (NULL);
   struct tm tmv;
 
+  static const char *months[] = { "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                  "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
   if (localtime_r (&now, &tmv))
-    strftime (buf, cap, "%b %e %H:%M:%S", &tmv);
+    snprintf (buf, cap, "%s %2d %02d:%02d:%02d", months[tmv.tm_mon],
+              tmv.tm_mday, tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
   else
     snprintf (buf, cap, "Jan  1 00:00:00");
 }
@@ -173,6 +181,8 @@ bsd_append_line (const char *log_path, const char *msg, ssize_t len)
   char ts[32];
   char host[128];
   FILE *fp;
+  int failed;
+  char clean[BSD_RECV_BUFSZ];
 
   fp = fopen (log_path, "a");
   if (!fp)
@@ -186,24 +196,20 @@ bsd_append_line (const char *log_path, const char *msg, ssize_t len)
     snprintf (host, sizeof host, "bash-os");
   host[sizeof host - 1] = '\0';
 
-  fprintf (fp, "%s %s ", ts, host);
   for (ssize_t i = 0; i < len; i++)
     {
       unsigned char c = (unsigned char) msg[i];
-      /* Defang all C0 controls (and DEL) except TAB. Covers NUL/LF/CR
-       * plus ESC (0x1b) / BEL (0x07) / BS (0x08) / other C0 codes that
-       * would otherwise reach a sysadmin's terminal verbatim when they
-       * `cat` /var/log/messages — see LOG-PARSER-AUDIT.md Wave 1 #1. */
-      if (c == '\t')
-        fputc ((int) c, fp);
-      else if (c == '\0' || c == '\n' || c == '\r' || iscntrl (c) || c == 0x7f)
-        fputc (' ', fp);
-      else
-        fputc ((int) c, fp);
+      clean[i] = (c < 0x20 && c != '\t') || c == 0x7f ? ' ' : (char) c;
     }
-  fputc ('\n', fp);
-  fclose (fp);
-  return 0;
+  failed = fprintf (fp, "%s %s ", ts, host) < 0;
+  if (fwrite (clean, 1, (size_t) len, fp) != (size_t) len
+      || fputc ('\n', fp) == EOF)
+    failed = 1;
+  if (fclose (fp) != 0)
+    failed = 1;
+  if (failed)
+    builtin_error ("write %s: %s", log_path, strerror (errno));
+  return failed ? -1 : 0;
 }
 
 /* Sanitiser for the UDP forward path. Writes a defanged copy of MSG
@@ -226,7 +232,7 @@ bsd_msg_scrub (const char *msg, ssize_t len, char *out, size_t out_cap)
       unsigned char c = (unsigned char) msg[i];
       if (c == '\t')
         out[i] = (char) c;
-      else if (c == '\0' || c == '\n' || c == '\r' || iscntrl (c) || c == 0x7f)
+      else if (c == '\0' || c == '\n' || c == '\r' || c < 0x20 || c == 0x7f)
         out[i] = ' ';
       else
         out[i] = (char) c;
@@ -266,7 +272,7 @@ bsd_parse_pri (const char *msg, ssize_t len)
             return -1;
           return pri;
         }
-      if (!isdigit (c))
+      if (c < '0' || c > '9')
         return -1;
       pri = pri * 10 + (c - '0');
       if (++digits > 3)
@@ -329,7 +335,7 @@ bsd_derive_stream_path (const char *log_path, const char *base,
     snprintf (out, cap, "%s", base);
 }
 
-static void
+static int
 bsd_route_local (const char *messages_path, const char *syslog_path,
                  const char *auth_path, const char *kern_path,
                  const char *msg, ssize_t len)
@@ -337,9 +343,11 @@ bsd_route_local (const char *messages_path, const char *syslog_path,
   const char *stream_path = bsd_stream_path (msg, len, syslog_path,
                                             auth_path, kern_path);
 
-  bsd_append_line (messages_path, msg, len);
-  if (stream_path && strcmp (stream_path, messages_path) != 0)
-    bsd_append_line (stream_path, msg, len);
+  int failed = bsd_append_line (messages_path, msg, len) < 0;
+  if (stream_path && strcmp (stream_path, messages_path) != 0
+      && bsd_append_line (stream_path, msg, len) < 0)
+    failed = 1;
+  return failed ? -1 : 0;
 }
 
 /* Parse a HOST:PORT forward target. Accepts two forms:
@@ -514,13 +522,14 @@ bsd_hex_decode_line (const char *line, ssize_t *out_len)
   char *out;
 
   if (!line || !out_len)
-    return NULL;
+    { errno = EINVAL; return NULL; }
   len = strcspn (line, "\r\n");
-  if (len == 0 || (len % 2) != 0)
-    return NULL;
+  if (len == 0 || len > BSD_RECV_BUFSZ * 2 || (len % 2) != 0
+      || line[len] != '\n' || line[len + 1] != '\0')
+    { errno = EINVAL; return NULL; }
   out = malloc (len / 2);
   if (!out)
-    return NULL;
+    { errno = ENOMEM; return NULL; }
   for (size_t i = 0; i < len; i += 2)
     {
       int hi = bsd_hex_value ((unsigned char) line[i]);
@@ -528,6 +537,7 @@ bsd_hex_decode_line (const char *line, ssize_t *out_len)
       if (hi < 0 || lo < 0)
         {
           free (out);
+          errno = EINVAL;
           return NULL;
         }
       out[i / 2] = (char) ((hi << 4) | lo);
@@ -550,8 +560,9 @@ bsd_queue_forward (const char *queue_path, size_t queue_max_bytes,
   if (!line)
     return -1;
   need = strlen (line);
-  if (need > queue_max_bytes
-      || (off_t) need + bsd_file_size (queue_path) > (off_t) queue_max_bytes)
+  off_t current = bsd_file_size (queue_path);
+  if (current < 0 || need > queue_max_bytes
+      || (size_t) current > queue_max_bytes - need)
     {
       free (line);
       return -1;
@@ -564,10 +575,11 @@ bsd_queue_forward (const char *queue_path, size_t queue_max_bytes,
       free (line);
       return -1;
     }
-  fputs (line, fp);
-  fclose (fp);
+  int failed = fputs (line, fp) == EOF;
+  if (fclose (fp) != 0)
+    failed = 1;
   free (line);
-  return 0;
+  return failed ? -1 : 0;
 }
 
 /* UDP forward path. Defangs the datagram via bsd_msg_scrub before
@@ -585,57 +597,102 @@ bsd_forward_udp (int fd, const struct sockaddr_storage *addr,
   slen = bsd_msg_scrub (msg, len, scrub_buf, sizeof scrub_buf);
   if (slen <= 0)
     return -1;
-  return sendto (fd, scrub_buf, (size_t) slen, 0,
+  return sendto (fd, scrub_buf, (size_t) slen, MSG_DONTWAIT,
                  (const struct sockaddr *) addr, addrlen) == slen ? 0 : -1;
 }
 
-static void
-bsd_drain_queue (const char *queue_path, size_t queue_max_bytes, int fd,
+/* Consume one complete queue record, even when it contains NUL or exceeds
+ * the receive cap. Malformed records must not hide the following record. */
+static int
+bsd_queue_line (FILE *in, char *line, size_t cap)
+{
+  size_t n = 0;
+  int c, bad = 0, any = 0;
+  while ((c = fgetc (in)) != EOF)
+    {
+      any = 1;
+      if (c == 0 || n + 1 >= cap)
+        bad = 1;
+      else
+        line[n++] = (char) c;
+      if (c == '\n')
+        break;
+    }
+  line[bad ? 0 : n] = '\0';
+  return any;
+}
+
+/* Rewrite only after every retained record has reached the temporary file.
+ * A disk error preserves the original queue (already sent entries may repeat).
+ * After a failed send, retain the remaining valid entries in FIFO order.
+ * Existing queues are never shrunk to a newly lowered admission limit. */
+static int
+bsd_drain_queue (const char *queue_path, int fd,
                  const struct sockaddr_storage *addr, socklen_t addrlen)
 {
-  char tmp[640];
-  char line[20000];
-  FILE *in, *out = NULL;
-  int kept = 0;
+  char *tmp;
+  char line[BSD_RECV_BUFSZ * 2 + 2];
+  FILE *in, *out;
+  int tmpfd, failed = 0, blocked = 0, kept = 0;
 
   if (!queue_path || !*queue_path || fd < 0 || bsd_file_size (queue_path) <= 0)
-    return;
-
+    return 0;
   in = fopen (queue_path, "r");
   if (!in)
-    return;
-  snprintf (tmp, sizeof tmp, "%s.tmp.%ld", queue_path, (long) getpid ());
-
-  while (fgets (line, sizeof line, in))
+    return -1;
+  tmp = malloc (strlen (queue_path) + 16);
+  if (!tmp)
+    { fclose (in); return -1; }
+  sprintf (tmp, "%s.tmp.XXXXXX", queue_path);
+  tmpfd = mkstemp (tmp);
+  out = tmpfd < 0 ? NULL : fdopen (tmpfd, "w");
+  if (!out)
+    {
+      if (tmpfd >= 0) { close (tmpfd); unlink (tmp); }
+      fclose (in);
+      free (tmp);
+      return -1;
+    }
+  while (bsd_queue_line (in, line, sizeof line))
     {
       ssize_t msg_len = 0;
-      char *msg = bsd_hex_decode_line (line, &msg_len);
+      char *msg;
+      msg = bsd_hex_decode_line (line, &msg_len);
       if (!msg)
-        continue;
-      if (bsd_forward_udp (fd, addr, addrlen, msg, msg_len) < 0)
         {
-          if (!out)
-            out = fopen (tmp, "w");
-          if (out && (queue_max_bytes == 0
-                      || bsd_file_size (tmp) + (off_t) strlen (line)
-                         <= (off_t) queue_max_bytes))
-            {
-              fputs (line, out);
-              kept = 1;
-            }
+          if (errno == ENOMEM)
+            { failed = 1; break; }
+          continue;
+        }
+      if (blocked || bsd_forward_udp (fd, addr, addrlen, msg, msg_len) < 0)
+        {
+          blocked = kept = 1;
+          if (fputs (line, out) == EOF)
+            failed = 1;
         }
       free (msg);
+      if (failed)
+        break;
     }
-  fclose (in);
-  if (out)
-    fclose (out);
-  if (kept)
-    rename (tmp, queue_path);
-  else
+  if (ferror (in)) failed = 1;
+  if (fclose (in) != 0) failed = 1;
+  if (fclose (out) != 0) failed = 1;
+  if (!failed)
     {
-      unlink (tmp);
-      unlink (queue_path);
+      if (kept)
+        failed = rename (tmp, queue_path) < 0;
+      else
+        failed = unlink (queue_path) < 0;
     }
+  unlink (tmp);
+  free (tmp);
+  return failed ? -1 : 0;
+}
+
+static int
+bsd_space (unsigned char c)
+{
+  return c == ' ' || (c >= '\t' && c <= '\r');
 }
 
 static char *
@@ -643,10 +700,10 @@ bsd_trim (char *s)
 {
   char *end;
 
-  while (*s && isspace ((unsigned char) *s))
+  while (*s && bsd_space ((unsigned char) *s))
     s++;
   end = s + strlen (s);
-  while (end > s && isspace ((unsigned char) end[-1]))
+  while (end > s && bsd_space ((unsigned char) end[-1]))
     *--end = '\0';
   return s;
 }
@@ -655,41 +712,54 @@ static int
 bsd_read_config_forward (const char *config_path, char *out, size_t out_cap)
 {
   FILE *fp;
-  char line[512];
+  char *line = NULL;
+  size_t cap = 0;
   int found = 0;
+  ssize_t line_len;
 
   if (!config_path || !*config_path || !out || out_cap == 0)
     return 0;
   fp = fopen (config_path, "r");
   if (!fp)
     return errno == ENOENT ? 0 : -1;
-  while (fgets (line, sizeof line, fp))
+  while ((line_len = getline (&line, &cap, fp)) >= 0)
     {
-      char *s = bsd_trim (line);
-      char *eq;
+      if (memchr (line, 0, (size_t) line_len))
+        { found = -1; break; }
+      char *s = bsd_trim (line), *value, *end;
       char quote = 0;
-
-      if (*s == '\0' || *s == '#')
-        continue;
       if (strncmp (s, "BASHSYSLOGD_FORWARD", 19) != 0)
         continue;
       s += 19;
-      s = bsd_trim (s);
-      if (*s != '=')
+      if (*s && *s != '=' && !bsd_space ((unsigned char) *s))
         continue;
-      eq = bsd_trim (s + 1);
-      if (*eq == '"' || *eq == '\'')
-        quote = *eq++;
-      s = eq;
-      while (*eq && ((quote && *eq != quote)
-                     || (!quote && !isspace ((unsigned char) *eq)
-                         && *eq != '#')))
-        eq++;
-      *eq = '\0';
-      snprintf (out, out_cap, "%s", s);
+      s = bsd_trim (s);
+      if (*s++ != '=')
+        { found = -1; break; }
+      value = bsd_trim (s);
+      if (*value == '"' || *value == '\'')
+        quote = *value++;
+      end = value;
+      while (*end && (quote ? *end != quote
+                     : !bsd_space ((unsigned char) *end) && *end != '#'))
+        end++;
+      s = end;
+      if (quote && *s++ != quote)
+        { found = -1; break; }
+      if (!quote && *s == '#')
+        s += strlen (s);
+      s = bsd_trim (s);
+      if ((*s && *s != '#') || (size_t) (end - value) >= out_cap)
+        { found = -1; break; }
+      *end = '\0';
+      snprintf (out, out_cap, "%s", value);
       found = 1;
     }
+  if (ferror (fp)) found = -1;
+  free (line);
   fclose (fp);
+  if (found < 0)
+    builtin_error ("invalid forwarding configuration: %s", config_path);
   return found;
 }
 
@@ -700,7 +770,7 @@ bsd_reload_forward (const char *config_path, char *forward_buf,
                     socklen_t *udp_addrlen)
 {
   char next[256];
-  int rc;
+  int rc, next_fd = -1;
 
   rc = bsd_read_config_forward (config_path, next, sizeof next);
   if (rc <= 0)
@@ -708,14 +778,16 @@ bsd_reload_forward (const char *config_path, char *forward_buf,
   if (strcmp (next, forward_buf) == 0 && *udp_fd >= 0)
     return;
 
-  if (*udp_fd >= 0)
+  if (next[0] != '\0')
     {
-      close (*udp_fd);
-      *udp_fd = -1;
+      next_fd = bsd_open_udp_forward (next, udp_addr, udp_addrlen);
+      if (next_fd < 0)
+        return;
     }
+  if (*udp_fd >= 0)
+    close (*udp_fd);
+  *udp_fd = next_fd;
   snprintf (forward_buf, forward_cap, "%s", next);
-  if (forward_buf[0] != '\0')
-    *udp_fd = bsd_open_udp_forward (forward_buf, udp_addr, udp_addrlen);
 }
 
 static int
@@ -725,93 +797,121 @@ bsd_run (const char *sock_path, const char *log_path, mode_t mode, int once,
          const char *config_path, const char *queue_path,
          size_t queue_max_bytes)
 {
-  int fd = bsd_open_socket (sock_path, mode);
-  int udp_fd = -1;
+  int fd = -1, udp_fd = -1, result = EXECUTION_SUCCESS, installed = 0;
+  int have_owned = 0;
+  const int signals[] = { SIGTERM, SIGINT, SIGHUP };
+  struct sigaction saved[3];
+  struct stat owned, current;
   struct sockaddr_storage udp_addr;
   socklen_t udp_addrlen = 0;
-  char forward_buf[256];
-  char buf[BSD_RECV_BUFSZ];
+  char forward_buf[256], buf[BSD_RECV_BUFSZ];
+  int warned_truncation = 0;
+  struct timespec tick;
+  time_t retry_at = 0;
 
-  bsd_stop = 0;
-  bsd_reload = 0;
+  bsd_stop = bsd_reload = 0;
   memset (&udp_addr, 0, sizeof udp_addr);
+  if (forward && strlen (forward) >= sizeof forward_buf)
+    { builtin_error ("forward target too long"); return EX_USAGE; }
   snprintf (forward_buf, sizeof forward_buf, "%s", forward ? forward : "");
-
-  if (fd < 0)
-    return EXECUTION_FAILURE;
-  if (config_path && *config_path && !forward_buf[0])
-    bsd_read_config_forward (config_path, forward_buf, sizeof forward_buf);
-  if (forward_buf[0])
-    {
-      udp_fd = bsd_open_udp_forward (forward_buf, &udp_addr, &udp_addrlen);
-      if (udp_fd < 0)
-        builtin_error ("forward target offline; local logging continues");
-    }
-
-  bsd_install_signal (SIGTERM);
-  bsd_install_signal (SIGINT);
-  bsd_install_signal (SIGHUP);
-  bsd_drain_queue (queue_path, queue_max_bytes, udp_fd, &udp_addr, udp_addrlen);
+  for (; installed < 3; installed++)
+    if (bsd_install_signal (signals[installed], &saved[installed]) < 0)
+      { result = EXECUTION_FAILURE; goto cleanup; }
+  if (config_path && *config_path && !forward_buf[0]
+      && bsd_read_config_forward (config_path, forward_buf,
+                                  sizeof forward_buf) < 0)
+    { result = EXECUTION_FAILURE; goto cleanup; }
+  fd = bsd_open_socket (sock_path, mode);
+  if (fd < 0 || lstat (sock_path, &owned) < 0)
+    { result = EXECUTION_FAILURE; goto cleanup; }
+  have_owned = 1;
 
   while (!bsd_stop)
     {
-      ssize_t n = recv (fd, buf, sizeof buf, 0);
+      struct pollfd input = { fd, POLLIN, 0 };
+      ssize_t n;
+      int ready;
+      clock_gettime (CLOCK_MONOTONIC, &tick);
+      if (bsd_reload || tick.tv_sec >= retry_at)
+        {
+          if (bsd_reload)
+            {
+              bsd_reload = 0;
+              bsd_reload_forward (config_path, forward_buf, sizeof forward_buf,
+                                  &udp_fd, &udp_addr, &udp_addrlen);
+            }
+          if (forward_buf[0] && udp_fd < 0)
+            udp_fd = bsd_open_udp_forward (forward_buf, &udp_addr, &udp_addrlen);
+          if (forward_buf[0]
+              && bsd_drain_queue (queue_path, udp_fd, &udp_addr, udp_addrlen) < 0)
+            {
+              builtin_error ("queue replay failed: %s", queue_path);
+              result = EXECUTION_FAILURE;
+            }
+          retry_at = tick.tv_sec + 1;
+        }
+      /* Finite polling also closes the signal-before-recv race: a stop or
+       * reload delivered just before poll is serviced within 250 ms. */
+      ready = poll (&input, 1, 250);
+      if (ready < 0 && errno == EINTR)
+        continue;
+      if (ready == 0)
+        continue;
+      if (ready < 0 || (input.revents & (POLLERR | POLLNVAL)))
+        { builtin_error ("poll %s: %s", sock_path, strerror (errno));
+          result = EXECUTION_FAILURE; break; }
+      n = recv (fd, buf, sizeof buf, MSG_DONTWAIT);
       if (n < 0)
         {
-          if (errno == EINTR)
-            {
-              if (bsd_reload)
-                {
-                  bsd_reload = 0;
-                  bsd_reload_forward (config_path, forward_buf,
-                                      sizeof forward_buf, &udp_fd,
-                                      &udp_addr, &udp_addrlen);
-                  bsd_drain_queue (queue_path, queue_max_bytes, udp_fd,
-                                   &udp_addr, udp_addrlen);
-                }
-              continue;
-            }
+          if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
+            continue;
           builtin_error ("recv %s: %s", sock_path, strerror (errno));
-          close (fd);
-          unlink (sock_path);
-          return EXECUTION_FAILURE;
+          result = EXECUTION_FAILURE;
+          break;
         }
       if (n > 0)
         {
-          /* recv() into a fixed buffer silently truncates datagrams
-           * above BSD_RECV_BUFSZ. When recv returns the full buffer
-           * size, the datagram either fit exactly or was truncated.
-           * Emit a one-shot warning so an operator notices oversized
-           * inputs — closes LOG-PARSER-AUDIT.md Wave 1 #3. */
-          if ((size_t) n == sizeof buf)
+          if ((size_t) n == sizeof buf && !warned_truncation)
             {
-              static int warned_truncation = 0;
-              if (!warned_truncation)
-                {
-                  builtin_warning ("datagram filled %d-byte recv buffer; "
-                                   "oversized syslog messages truncated "
-                                   "(further warnings suppressed)",
-                                   (int) sizeof buf);
-                  warned_truncation = 1;
-                }
+              builtin_warning ("datagram filled %d-byte recv buffer; "
+                               "oversized syslog messages truncated "
+                               "(further warnings suppressed)",
+                               (int) sizeof buf);
+              warned_truncation = 1;
             }
-          bsd_route_local (log_path, syslog_path, auth_path, kern_path, buf, n);
+          if (bsd_route_local (log_path, syslog_path, auth_path, kern_path,
+                               buf, n) < 0)
+            result = EXECUTION_FAILURE;
+          /* Pending records precede new arrivals. A failed destination is
+           * retried at most once per second rather than replayed per packet. */
           if (forward_buf[0]
-              && bsd_forward_udp (udp_fd, &udp_addr, udp_addrlen, buf, n) < 0)
-            bsd_queue_forward (queue_path, queue_max_bytes, buf, n);
-          if (udp_fd >= 0)
-            bsd_drain_queue (queue_path, queue_max_bytes, udp_fd, &udp_addr,
-                             udp_addrlen);
+              && (bsd_file_size (queue_path) > 0
+                  || bsd_forward_udp (udp_fd, &udp_addr, udp_addrlen, buf, n) < 0)
+              && bsd_queue_forward (queue_path, queue_max_bytes, buf, n) < 0)
+            {
+              builtin_error ("forward queue full or unwritable; dropped copy: %s",
+                             queue_path);
+              result = EXECUTION_FAILURE;
+            }
         }
       if (once)
         break;
     }
 
+cleanup:
   if (udp_fd >= 0)
     close (udp_fd);
-  close (fd);
-  unlink (sock_path);
-  return EXECUTION_SUCCESS;
+  if (fd >= 0)
+    close (fd);
+  if (have_owned && lstat (sock_path, &current) == 0 && S_ISSOCK (current.st_mode)
+      && current.st_dev == owned.st_dev && current.st_ino == owned.st_ino)
+    unlink (sock_path);
+  while (installed > 0)
+    {
+      installed--;
+      sigaction (signals[installed], &saved[installed], NULL);
+    }
+  return result;
 }
 
 static int
@@ -820,6 +920,8 @@ bsd_parse_mode (const char *s, mode_t *out)
   char *end = NULL;
   unsigned long v;
 
+  if (!s || !*s || strspn (s, "01234567") != strlen (s))
+    return -1;
   errno = 0;
   v = strtoul (s, &end, 8);
   if (errno || !end || *end || v > 0777)
@@ -834,6 +936,8 @@ bsd_parse_size (const char *s, size_t *out)
   char *end = NULL;
   unsigned long v;
 
+  if (!s || !*s || strspn (s, "0123456789") != strlen (s))
+    return -1;
   errno = 0;
   v = strtoul (s, &end, 10);
   if (errno || !end || *end)
@@ -860,11 +964,6 @@ bashsyslogd_builtin (WORD_LIST *list)
   mode_t mode = 0666;
   size_t queue_max_bytes = 262144;
   int once = 0;
-
-  /* Pin LC_ALL=C so isspace() (bsd_trim) and the PRI / facility-name
-   * comparisons stay byte-exact regardless of inherited LC_CTYPE.
-   * Closes LOG-PARSER-AUDIT.md Wave 1 #6. */
-  setlocale (LC_ALL, "C");
 
   if (list && list->word && list->word->word
       && (strcmp (list->word->word, "--help") == 0
@@ -1011,11 +1110,14 @@ char *bashsyslogd_doc[] = {
   "",
   "Binds an AF_UNIX SOCK_DGRAM socket (default /dev/log), appends",
   "received datagrams to FILE (default /var/log/messages), and routes",
-  "<auth.*>/<authpriv.*>/<kern.*> facilities to auth.log/kern.log.",
+  "numeric PRI facilities auth/authpriv/kern to auth.log/kern.log.",
   "Existing socket paths are replaced; non-socket paths are refused.",
-  "--forward sends a best-effort UDP copy of each original datagram.",
+  "--forward sends a best-effort UDP copy with control bytes defanged.",
   "SIGHUP reloads BASHSYSLOGD_FORWARD from --config FILE when set.",
   "Forwarding failures are spooled to a bounded hex queue and retried.",
+  "Queue replay occurs at startup, on SIGHUP and at one-second intervals.",
+  "Local write errors and dropped queue copies make the final status fail.",
+  "--once consumes one datagram, including an empty one, then cleans up.",
   (char *) NULL
 };
 

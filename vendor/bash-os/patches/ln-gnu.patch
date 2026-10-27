@@ -1,0 +1,17 @@
+--- builtins/ln.c
++++ builtins/ln.c
+@@ -66 +66 @@
+-  while ((opt = internal_getopt (list, "fs")) != -1)
++  while ((opt = internal_getopt (list, "fhns")) != -1)
+@@ -83 +83 @@
+-	  return (EX_USAGE);
++	  return (EXECUTION_FAILURE);
+@@ -91 +91 @@
+-      return (EX_USAGE);
++      return (EXECUTION_FAILURE);
+@@ -119 +119 @@
+-      return (EX_USAGE);
++      return (EXECUTION_FAILURE);
+@@ -123 +123 @@
+-    rval += dolink (list->word->word, sdir, flags);
++    rval |= dolink (list->word->word, sdir, flags);

@@ -2,18 +2,19 @@
 /* pr.c — POSIX pr(1) paginator/formatter.
  *
  *   pr [--help|--version] [-t] [-m] [-h HEADER] [-l LINES] [-w WIDTH]
- *          [-n] [-N] [-a] [-o OFFSET] [-s[SEP]] [FILE...]
+ *          [-n] [-COLUMN] [-N NUMBER] [-a] [-o OFFSET] [-s[SEP]] [FILE...]
  *
- *   -t          terse: no header / footer / form-feed paging
+ *   -t          terse: no header / footer / page padding
  *   -m          merge: read all FILEs in parallel, side-by-side columns
  *   -h HEADER   override the page header (default: filename)
  *   -l LINES    lines per page (default 66; header + body + footer = 66)
  *   -w WIDTH    page width for column layout (default 72)
  *   -n          number lines (1-based, 5-digit-wide column + tab)
- *   -N          (a bare digit) lay a single file out in N balanced columns
+ *   -COLUMN     lay a single file out in COLUMN balanced columns
+ *   -N NUMBER   first line number on the first page printed
  *   -a          (--across) fill -N columns left-to-right, not top-to-bottom
  *   -o OFFSET   indent every output line by OFFSET spaces (left margin)
- *   -s[SEP]     separate columns with SEP (default TAB); no padding/truncate
+ *   -s[STRING]  separate columns (default TAB); -w retains truncation
  *
  * Input and output state are per invocation. Bash runs every builtin inside
  * one long-lived process, so anything left in the C library's `stdin` and
@@ -60,10 +61,16 @@ typedef struct {
     char   num_sep;        /* -n SEP: char after the number (default TAB) */
     int    dbl;            /* -d: double-space (blank line after each body line) */
     int    formfeed;       /* -f / -F: form-feed page separation, no blank padding */
-    int    columns;        /* -N: number of output columns (default 1) */
+    int    columns;        /* -COLUMN: number of output columns (default 1) */
     int    offset;         /* -o N: left-margin indent (default 0) */
-    int    sep_set;        /* -s seen */
-    char   sep;            /* -s[c] column separator (default '\t' when set) */
+    const char *separator;
+    int sep_len, width_set, page_width, columns_set, join, no_warn;
+    int expand, tabify, in_tab_width, out_tab_width, show_control, show_octal;
+    unsigned char in_tab, out_tab;
+    int omit_pagination;
+    const char *date_format;
+    int first_page, last_page, first_number, number_set;
+
 } pr_opts;
 
 /* One output record: the bytes and their length, so an embedded NUL stays part
@@ -71,6 +78,7 @@ typedef struct {
 typedef struct {
     char       *text;
     size_t      len;
+    int         renumber, backspace;
 } pr_cell;
 
 /* Per-invocation input over a descriptor. `stdin` is deliberately unused: its
@@ -85,6 +93,7 @@ typedef struct {
     int         failed;    /* errno of a failed read(2), 0 while healthy */
     const char *title;     /* header title; NULL for standard input */
     time_t      stamp;     /* header timestamp */
+    int         form_break, skip_nl, buffer_ff, buffer_bs, record_bs;
     size_t      start, end;
     char       *buf;
 } pr_input;
@@ -137,13 +146,16 @@ pr_input_close (pr_input *in)
     in->buf = NULL;
 }
 
-/* getline(3) over the invocation's own buffer. Stores a NUL-terminated record
-   including its trailing newline and returns its length, or -1 once the input
-   is exhausted or a read failed (in->failed then holds the errno). */
+/* Read a NUL-terminated record, preserving a trailing newline. A form feed
+   ends the record without becoming part of it: form_break marks the page end,
+   and a following newline is consumed. A standalone form feed returns zero;
+   -1 means exhaustion or a read failure (in->failed holds errno). record_bs
+   records whether byte-wise backspace accounting is needed for this record. */
 static ssize_t
 pr_input_line (pr_input *in, char **line, size_t *cap)
 {
     size_t len = 0;
+    in->form_break = in->record_bs = 0;
 
     for (;;) {
         if (in->start == in->end) {
@@ -164,10 +176,20 @@ pr_input_line (pr_input *in, char **line, size_t *cap)
             }
             in->start = 0;
             in->end = (size_t) n;
+            /* Scan once per read buffer; ordinary records then need only
+               the newline search, with no per-record control-byte scans. */
+            in->buffer_ff = memchr (in->buf, '\f', (size_t) n) != NULL;
+            in->buffer_bs = memchr (in->buf, '\b', (size_t) n) != NULL;
         }
         const char *from = in->buf + in->start;
         size_t avail = in->end - in->start;
+        if (in->skip_nl) {
+            in->skip_nl = 0;
+            if (*from == '\n') { in->start++; continue; }
+        }
         const char *nl = memchr (from, '\n', avail);
+        const char *ff = in->buffer_ff ? memchr (from, '\f', nl ? (size_t) (nl - from) : avail) : NULL;
+        if (ff && (!nl || ff < nl)) nl = ff;
         size_t take = nl ? (size_t) (nl - from) + 1 : avail;
         if (len > (size_t) SSIZE_MAX - take) {
             in->failed = EOVERFLOW;
@@ -190,13 +212,18 @@ pr_input_line (pr_input *in, char **line, size_t *cap)
             *line = grown;
             *cap = want;
         }
+        if (in->buffer_bs && memchr (from, '\b', take)) in->record_bs = 1;
         memcpy (*line + len, from, take);
         len += take;
         in->start += take;
-        if (nl)
+        if (nl) {
+            if (*nl == '\f') {
+                len--; in->form_break = in->skip_nl = 1;
+            }
             break;
+        }
     }
-    if (len == 0)
+    if (len == 0 && !in->form_break)
         return -1;
     (*line)[len] = '\0';
     return (ssize_t) len;
@@ -215,13 +242,6 @@ pr_spaces (bl_output *out, int count)
     }
 }
 
-/* Emit the -o left-margin indent (spaces) at the start of a row. */
-static void
-pr_offset (bl_output *out, const pr_opts *o)
-{
-    pr_spaces (out, o->offset);
-}
-
 static int
 pr_parse_int_arg (const char *opt, const char *arg, int *out)
 {
@@ -233,7 +253,7 @@ pr_parse_int_arg (const char *opt, const char *arg, int *out)
     if (end == arg || *end != '\0' || errno == ERANGE || v > INT_MAX || v < 0) {
         builtin_error ("%s: invalid number: %s", opt, arg);
         builtin_usage ();
-        return EX_USAGE;
+        return EXECUTION_FAILURE;
     }
 
     *out = (int) v;
@@ -249,7 +269,8 @@ pr_header (bl_output *out, const pr_opts *o, const char *fname, time_t stamp,
            int page_no)
 {
     if (o->terse) return;
-    char tbuf[64];
+    char *tbuf;
+    size_t date_cap = 128;
     char pagebuf[32];
     struct tm tm;
     const char *title = o->header ? o->header : (fname ? fname : "");
@@ -258,9 +279,20 @@ pr_header (bl_output *out, const pr_opts *o, const char *fname, time_t stamp,
     int sep_right;
     int available;
 
+    tbuf = malloc (date_cap);
+    if (!tbuf) { out->error = ENOMEM; return; }
     tbuf[0] = '\0';
-    if (localtime_r (&stamp, &tm))
-        strftime (tbuf, sizeof tbuf, "%Y-%m-%d %H:%M", &tm);
+    if (*o->date_format && localtime_r (&stamp, &tm)) {
+        while (!strftime (tbuf, date_cap, o->date_format, &tm)) {
+            char *larger;
+            /* A locale's empty date expansion must not grow forever. */
+            if (date_cap >= 1024 * 1024) { tbuf[0] = '\0'; break; }
+            date_cap *= 2;
+            larger = realloc (tbuf, date_cap);
+            if (!larger) { free (tbuf); out->error = ENOMEM; return; }
+            tbuf = larger;
+        }
+    }
     snprintf (pagebuf, sizeof pagebuf, "Page %d", page_no);
 
     title_len = (int) strlen (title);
@@ -280,7 +312,13 @@ pr_header (bl_output *out, const pr_opts *o, const char *fname, time_t stamp,
        newlines); the leading run of spaces reproduces that. Every run
        collapses to nothing when OFFSET is 0, so the no-offset header is
        byte-unchanged. */
-    pr_spaces (out, o->offset);
+    int margin = o->offset;
+    if (o->tabify)
+        while (margin > 1 && margin >= o->out_tab_width) {
+            bl_output_byte (out, o->out_tab);
+            margin -= o->out_tab_width;
+        }
+    pr_spaces (out, margin);
     bl_output_write (out, "\n\n", 2);
     pr_spaces (out, o->offset);
     bl_output_write (out, tbuf, strlen (tbuf));
@@ -289,6 +327,7 @@ pr_header (bl_output *out, const pr_opts *o, const char *fname, time_t stamp,
     pr_spaces (out, sep_right);
     bl_output_write (out, pagebuf, strlen (pagebuf));
     bl_output_write (out, "\n\n\n", 3);
+    free (tbuf);
 }
 
 static void
@@ -299,6 +338,11 @@ pr_footer (bl_output *out, const pr_opts *o, int body_printed)
        page's header leading blanks follow it (so it renders as \f\n...). The
        final page's footer is just the bare \f with no trailing newline. */
     if (o->formfeed) {
+        /* A header-only input page still prints one empty body row. */
+        if (!body_printed) {
+            bl_output_byte (out, '\n');
+            if (o->dbl) bl_output_byte (out, '\n');
+        }
         bl_output_byte (out, '\f');
         return;
     }
@@ -343,20 +387,22 @@ pr_chomp (char *s, size_t len)
 
 /* Tab-compressing output tracker, mirroring GNU pr's tabify_output path
    (print_char buffers spaces; print_white_space flushes them as TABs to each
-   8-col stop plus residual spaces). Tracks absolute output column so the
+   configured tab stop plus residual spaces). Tracks absolute output column so the
    TAB/space split matches GNU byte-for-byte. Trailing buffered spaces that are
    never followed by a glyph are dropped — that is GNU's trailing-space strip. */
-typedef struct { bl_output *out; int pos; int pending; } pr_tw;
+typedef struct { bl_output *out; int pos; int pending; const pr_opts *opts; } pr_tw;
 
 static void
 pr_tw_flush (pr_tw *w)            /* == GNU print_white_space () */
 {
     int goal = w->pos + w->pending;
     int h = w->pos;
-    while (goal - h > 1) {
-        int next_tab = h + 8 - (h % 8);          /* POS_AFTER_TAB(8, h) */
+    while (w->opts->tabify && goal - h > 1) {
+        int stop = w->opts->out_tab_width;
+        int remainder = stop == 8 && h >= 0 ? h & 7 : h % stop;
+        int next_tab = h + stop - remainder;          /* POS_AFTER_TAB(8, h) */
         if (next_tab > goal) break;
-        bl_output_byte (w->out, '\t');
+        bl_output_byte (w->out, w->opts->out_tab);
         h = next_tab;
     }
     while (++h <= goal) bl_output_byte (w->out, ' ');
@@ -368,9 +414,10 @@ static void
 pr_tw_putc (pr_tw *w, char c)     /* == GNU print_char () under tabify_output */
 {
     if (c == ' ') { w->pending++; return; }
-    if (w->pending) pr_tw_flush (w);
+    if (w->pending > 0) pr_tw_flush (w);
     bl_output_byte (w->out, (unsigned char) c);
-    w->pos++;                     /* glyphs assumed width 1 */
+    if (isprint ((unsigned char) c)) w->pos++;
+    else if (c == '\b') w->pos--;
 }
 
 /* Buffer enough spaces to reach absolute column `target`, then flush — GNU
@@ -393,7 +440,7 @@ pr_tw_pad_to (pr_tw *w, int target)
    precedes everything.
 
    Numbering has two GNU-distinct shapes:
-     - `colnums != NULL` → COLUMN mode (-N/-a with -n): each cell prints its
+     - `colnums != NULL` → COLUMN mode (-COLUMN/-a with -n): each cell prints its
        OWN "%5ld\t" number field at its column origin (colnums[i]; 0 = none).
        Column origins stay at offset + i*col_w — the number sits inside the
        cell, it does not shift the grid.
@@ -408,57 +455,59 @@ static void
 pr_print_number (bl_output *out, const pr_opts *o, long lineno)
 {
     char nb[3 * sizeof (long) + 2];
-    int nl = snprintf (nb, sizeof nb, "%*ld", o->num_width, lineno);
-    const char *s = (nl > o->num_width) ? nb + (nl - o->num_width) : nb;
-
-    bl_output_write (out, s, strlen (s));
+    int nl = snprintf (nb, sizeof nb, "%ld", lineno);
+    const char *digits = nl > o->num_width ? nb + nl - o->num_width : nb;
+    pr_spaces (out, o->num_width - nl);
+    bl_output_write (out, digits, strlen (digits));
     bl_output_byte (out, (unsigned char) o->num_sep);
 }
 
-/* GNU pr's column accounting for the text of one cell in a multi-column row
-   (its char_to_clump()/print_char() pair). A printable byte occupies one
-   column, a TAB advances to the next eight-column stop measured from the
-   start of the cell and is re-emitted as spaces for the output tabifier to
-   compress, a backspace moves back one column, and any other byte occupies
-   none. LIMIT is the cell's text field in columns, or -1 for no limit: the
-   first clump that would overrun it ends the cell, which is where GNU
-   truncates a column. CLUMP is 0 for the one layout GNU leaves alone — a -s
-   separator that is the default TAB — where every byte counts as one column
-   and an input TAB passes through untouched. */
-static void
-pr_write_cell (pr_tw *w, const pr_cell *cell, int limit, int clump)
+/* Render a record as display clumps. The first input byte is measured
+   before advancing past the number field. Raw TABs advance the logical input
+   position while occupying zero columns in the output tabifier. LIMIT is the
+   whole column width, including its number field, or -1 for joined records. */
+static int
+pr_write_cell (pr_tw *w, const pr_cell *cell, int limit, int clump,
+               int number_advance)
 {
-    int pos = 0;                          /* column within this cell */
-
+    const pr_opts *o = w->opts;
+    int pos = 0;
     for (size_t i = 0; i < cell->len; i++) {
         unsigned char c = (unsigned char) cell->text[i];
-        int width;
-
-        if (!clump)
-            width = 1;
-        else if (c == '\t')
-            width = 8 - pos % 8;
-        else if (c == '\b')
-            width = -1;
-        else if (isprint (c))
-            width = 1;
-        else
-            width = 0;
-        if (limit >= 0 && pos + width > limit)
-            break;
-        if (c == '\t' && clump) {
-            w->pending += width;          /* spaces the tabifier may re-compress */
-        } else if (c == ' ') {
-            w->pending++;
-        } else {
-            if (w->pending) pr_tw_flush (w);
-            bl_output_byte (w->out, c);
-            w->pos += width;
-            if (w->pos < 0) w->pos = 0;
-        }
+        char repr[5];
+        int count = 1, width = 0;
+        int printable = isprint (c);
+        repr[0] = c;
+        if (c == o->in_tab || c == '\t') {
+            int stop = c == o->in_tab ? o->in_tab_width : 8;
+            width = stop - (stop == 8 ? pos & 7 : pos % stop);
+            if (clump || o->expand) count = 0;
+        } else if (!printable && (o->show_octal || o->show_control)) {
+            if (o->show_octal || c >= 128) {
+                snprintf (repr, sizeof repr, "\\%03o", c);
+                count = width = 4;
+            } else {
+                repr[0] = '^'; repr[1] = c ^ 64;
+                count = width = 2;
+            }
+        } else if (c == '\b') {
+            if (pos == 0) count = 0;
+            else width = -1;
+        } else if (printable) width = 1;
+        if (limit >= 0 && pos + width > limit) break;
         pos += width;
-        if (pos < 0) pos = 0;
+        if (i == 0) pos += number_advance;
+        if (count == 0 && width > 0) w->pending += width;
+        else if (count == 1) {
+            if (c == ' ') w->pending++;
+            else {
+                if (w->pending > 0) pr_tw_flush (w);
+                bl_output_byte (w->out, c);
+                w->pos += printable ? 1 : (c == '\b' ? -1 : 0);
+            }
+        } else for (int j = 0; j < count; j++) pr_tw_putc (w, repr[j]);
     }
+    return pos;
 }
 
 /* Emit a line-number field through the tabifier: the number right-justified
@@ -471,9 +520,9 @@ static void
 pr_tw_number (pr_tw *w, const pr_opts *o, long lineno)
 {
     char nb[3 * sizeof (long) + 2];
-    int nl = snprintf (nb, sizeof nb, "%*ld", o->num_width, lineno);
-    const char *s = (nl > o->num_width) ? nb + (nl - o->num_width) : nb;
-
+    int nl = snprintf (nb, sizeof nb, "%ld", lineno);
+    const char *s = nl > o->num_width ? nb + nl - o->num_width : nb;
+    if (o->num_width > nl) w->pending += o->num_width - nl;
     for (; *s; s++) pr_tw_putc (w, *s);
     if (o->num_sep == '\t')
         w->pending += PR_NUMBER_WIDTH - o->num_width;
@@ -481,82 +530,90 @@ pr_tw_number (pr_tw *w, const pr_opts *o, long lineno)
         pr_tw_putc (w, o->num_sep);
 }
 
+/* Separators have literal-byte geometry, even for a TAB. Flush spaces at
+   the end of each separator independently from the following number. */
+static void
+pr_separator (pr_tw *w)
+{
+    const pr_opts *o = w->opts;
+    for (int j = 0; j < o->sep_len; j++) {
+        unsigned char c = o->separator[j];
+        if (c == ' ') w->pending++;
+        else {
+            if (w->pending > 0) pr_tw_flush (w);
+            bl_output_byte (w->out, c); w->pos++;
+        }
+    }
+    if (w->pending > 0) pr_tw_flush (w);
+}
+
 static void
 pr_emit_row (bl_output *out, const pr_cell *cols, int ncol, const pr_opts *o,
-             long lineno, const long *colnums)
+             long lineno, const long *colnums, int last)
 {
-    /* One column is a byte-for-byte pass-through in GNU pr: no column
-       accounting, no TAB compression of the margin, no truncation. */
-    if (ncol <= 1) {
-        pr_offset (out, o);
-        if (lineno > 0)
-            pr_print_number (out, o, lineno);
-        else if (colnums && colnums[0] > 0)
-            pr_print_number (out, o, colnums[0]);
-        if (ncol > 0 && cols[0].len)
-            bl_output_write (out, cols[0].text, cols[0].len);
+    /* Keep ordinary one-column delivery out of the column geometry and
+       tabifier. Only backspaces require per-byte input-position accounting. */
+    if (ncol == 1 && !o->tabify && !o->expand && !o->show_control
+        && !o->show_octal && (!o->page_width || o->join)
+        && !cols[0].backspace) {
+        pr_spaces (out, o->offset);
+        if (o->number) pr_print_number (out, o, colnums ? colnums[0] : lineno);
+        bl_output_write (out, cols[0].text, cols[0].len);
         bl_output_byte (out, '\n');
         return;
     }
-
-    /* Trailing columns that hold no record at all produce no padding and no
-       separator (GNU strips trailing whitespace on a short final page). A
-       record that exists but is empty still counts. Merge mode is different:
-       every FILE is a live column, so GNU advances to each column origin even
-       after a file has been exhausted — do NOT strip there. */
-    int last = ncol;
-    if (!o->merge)
-        while (last > 0 && !cols[last - 1].text
-               && !(colnums && colnums[last - 1] > 0))
-            last--;
-
-    /* GNU expands an input TAB into the columns it spans and re-compresses
-       the result, except with a -s separator that is itself the default TAB:
-       there the records pass through byte for byte. */
-    int clump = !(o->sep_set && o->sep == '\t');
-
-    /* Numbering has two GNU-distinct shapes:
-         - `colnums != NULL` -> COLUMN mode (-N/-a with -n): each cell prints
-           its OWN number field at its column origin (colnums[i]; 0 = none).
-           The number sits inside the cell and does not shift the grid; the
-           text field is what is left of the column after it.
-         - else `lineno > 0` -> MERGE: one number field is printed before all
-           columns and reserves NUMBER_WIDTH columns of left margin that push
-           every column origin out. */
-    int num_field = (!colnums && lineno > 0) ? PR_NUMBER_WIDTH : 0;
-    /* Column stride (origin-to-origin). GNU reserves a one-column separator
-       between columns: chars_per_column = (width - number - (ncol-1))/ncol and
-       the stride is chars_per_column + 1. */
-    int col_w = (o->width - num_field - (ncol - 1)) / ncol + 1;
-    /* GNU floors chars_per_column (= stride - 1) at 1, i.e. the stride at 2. */
-    if (col_w < 2) col_w = 2;
-    int cell_w = col_w - 1;
-    if (colnums) {
-        cell_w -= PR_NUMBER_WIDTH;
-        if (cell_w < 1) cell_w = 1;
-    }
-
-    pr_tw w = { .out = out, .pos = 0, .pending = 0 };
+    int num_field = (o->merge && o->number) ? PR_NUMBER_WIDTH : 0;
+    int cell_w = (o->width - num_field - (ncol - 1) * o->sep_len) / ncol;
+    int stride = cell_w + o->sep_len;
+    int truncate = !o->join && (ncol > 1 || o->page_width);
+    int clump = o->expand || (ncol > 1 && !(o->sep_len == 1 && o->separator[0] == '\t'));
+    pr_tw w = { .out = out, .pos = 0, .pending = 0, .opts = o };
     pr_tw_pad_to (&w, o->offset);
-    if (!colnums && lineno > 0)
-        pr_tw_number (&w, o, lineno);
-
-    for (int i = 0; i < last; i++) {
-        if (o->sep_set) {
-            /* -s joins the columns with the separator instead of padding to
-               the next origin, and never truncates. */
-            if (i) pr_tw_putc (&w, o->sep);
+    if (o->number && !colnums) {
+        if (ncol == 1) {
+            if (!o->tabify && !o->expand && !o->show_control && !o->show_octal && !truncate)
+                pr_print_number (out, o, lineno);
+            else {
+                pr_tw_number (&w, o, lineno);
+                if (o->num_sep == '\t') {
+                    w.pending = 0;
+                    bl_output_byte (out, '\t');
+                    w.pos += o->out_tab_width - w.pos % o->out_tab_width;
+                }
+            }
         } else {
-            /* A discrete flush at the column origin: GNU pads to each column's
-               start position as its own step, so the pad and anything the cell
-               buffers afterwards tab-compress independently. */
-            pr_tw_pad_to (&w, o->offset + num_field + i * col_w);
+            pr_tw_number (&w, o, lineno);
+            if (!cols[0].text && o->join) w.pending = 0;
         }
-        if (colnums && colnums[i] > 0)
-            pr_tw_number (&w, o, colnums[i]);
-        pr_write_cell (&w, &cols[i], o->sep_set ? -1 : cell_w, clump);
     }
-    bl_output_byte (out, '\n');     /* trailing buffered spaces dropped (GNU strip) */
+    if (!o->merge) while (last > 0 && !cols[last - 1].text) last--;
+    for (int i = 0; i < last; i++) {
+        if (i) {
+            if (!o->join) {
+                int target = o->offset + num_field + i * stride - o->sep_len;
+                w.pending = target - w.pos;
+            }
+            pr_separator (&w);
+        }
+        if (colnums && cols[i].text) {
+            if (ncol == 1) pr_print_number (out, o, colnums[i]);
+            else pr_tw_number (&w, o, colnums[i]);
+        }
+        int input_end = pr_write_cell (&w, &cols[i], truncate ? cell_w : -1, clump,
+                                      truncate && o->number && !o->merge ? PR_NUMBER_WIDTH : 0);
+        /* Down-column pages replay stored records. Their final input
+           position becomes the origin for the next separator/number,
+           even when raw TABs had zero physical output width. */
+        if (colnums && !o->across && !w.pending)
+            w.pos = (o->join ? (i ? 0 : o->offset) : o->offset + i * stride) + input_end;
+        if (o->merge && cols[i].renumber && o->number) {
+            if (w.pending > 0) pr_tw_flush (&w);
+            pr_tw_number (&w, o, lineno + 1);
+        }
+    }
+    /* Single-column output without -i retains trailing spaces. */
+    if (!o->tabify) pr_tw_flush (&w);
+    bl_output_byte (out, '\n');
 }
 
 /* Single-file, single-column mode: paginate the input one line per row. */
@@ -568,180 +625,307 @@ pr_single (bl_output *out, pr_input *in, const pr_opts *o)
     ssize_t n;
     int line_in_page = 0;
     int page_no = 1;
-    long lineno = 1;
+    long lineno = o->first_number;
 
     /* In -d mode each input line occupies two body slots (the line + a trailing
        blank), and GNU will not start a line whose blank won't also fit — so the
        break threshold is body_lines minus the per-line slot count. */
-    while ((n = pr_input_line (in, &line, &cap)) != -1) {
+    while (!out->error && page_no <= o->last_page && !(page_no == o->last_page && line_in_page >= o->body_lines)
+           && (n = pr_input_line (in, &line, &cap)) != -1) {
+        if (!n && in->form_break && line_in_page >= o->body_lines) {
+            n = pr_input_line (in, &line, &cap);
+            if (n < 0) break;
+        }
         if (line_in_page >= o->body_lines) {
-            pr_footer (out, o, line_in_page);
+            if (page_no >= o->first_page && page_no <= o->last_page) pr_footer (out, o, line_in_page);
             page_no++;
             line_in_page = 0;
         }
-        if (line_in_page == 0)
+        if (line_in_page == 0 && page_no >= o->first_page && page_no <= o->last_page)
             pr_header (out, o, in->title, in->stamp, page_no);
-        pr_cell cell;
+        if (!n && in->form_break) {
+            if (page_no >= o->first_page && page_no <= o->last_page) {
+                if (o->terse && !o->omit_pagination) bl_output_byte (out, '\f');
+                else pr_footer (out, o, line_in_page);
+            }
+            line_in_page = 0;
+            if (page_no == o->last_page) break;
+            page_no++; continue;
+        }
+        pr_cell cell = {0};
         cell.text = line;
         cell.len = pr_chomp (line, (size_t) n);
-        pr_emit_row (out, &cell, 1, o, o->number ? lineno++ : 0, NULL);
+        cell.backspace = in->record_bs;
+        if (page_no >= o->first_page && page_no <= o->last_page) {
+            pr_emit_row (out, &cell, 1, o, o->number ? lineno : 0, NULL, 1);
+        }
+        if (page_no >= o->first_page || !o->number_set) lineno++;
         line_in_page++;
         if (o->dbl) {           /* -d: blank line after each body line, counts as a body line */
-            bl_output_byte (out, '\n');
+            if (page_no >= o->first_page && page_no <= o->last_page
+                && !(o->terse && (in->form_break || in->at_eof)))
+                bl_output_byte (out, '\n');
             line_in_page++;
         }
+        if (in->form_break) {
+            if (page_no >= o->first_page && page_no <= o->last_page) {
+                if (o->terse && !o->omit_pagination) bl_output_byte (out, '\f');
+                else pr_footer (out, o, line_in_page);
+            }
+            line_in_page = 0;
+            if (page_no == o->last_page) break;
+            page_no++;
+        }
     }
-    if (line_in_page > 0) pr_footer (out, o, line_in_page);
+    if (line_in_page > 0 && page_no >= o->first_page && page_no <= o->last_page) pr_footer (out, o, line_in_page);
     free (line);
     return in->failed ? -1 : 0;
 }
 
-/* Single-file, multi-column mode (-N): balanced columns. The file is read
-   fully, then laid out. Default (column-major / "down"): column 1 gets the
-   first ceil(L/N) lines, column 2 the next batch, etc. With -a ("across"):
-   row-major — lines fill left-to-right across each row before the next.
-   With -n the number is per-cell (each cell shows its input line number),
-   matching GNU column-mode placement. */
+/* A natural page end suppresses one leading form feed on the next read
+   of each column. Across columns share a reader, but not this flag. */
+static ssize_t
+pr_column_line (pr_input *in, char **line, size_t *cap, int *full)
+{
+    ssize_t got = pr_input_line (in, line, cap);
+    if (*full && got == 0 && in->form_break)
+        got = pr_input_line (in, line, cap);
+    *full = 0;
+    return got;
+}
+
+/* GNU skips pages in input-row order even for a down-column layout.
+   Boundary flags remain per column, so replaying a balanced output page is
+   not equivalent when a later skipped page begins with form feeds. */
+static int
+pr_skip_column_page (pr_input *in, const pr_opts *o, int *full,
+                     size_t rows, char **raw, size_t *cap, long *number)
+{
+    for (size_t row = 0; row < rows; row++) {
+        for (int c = 0; c < o->columns; c++) {
+            ssize_t got = pr_column_line (in, raw, cap, &full[c]);
+            if (got < 0) return 1;
+            if (got > 0 && !o->number_set) (*number)++;
+            if (in->form_break) {
+                if (row + 1 == rows)
+                    memset (full, 0, (size_t) o->columns * sizeof *full);
+                return 0;
+            }
+            if (in->at_eof) return 1;
+            if (row + 1 == rows) full[c] = 1;
+        }
+    }
+    return 0;
+}
+
+/* Down columns need at most one page to balance; across columns need only
+   one row. Neither path reads the next page before delivering this one. */
 static int
 pr_columns (bl_output *out, pr_input *in, const pr_opts *o)
 {
-    pr_cell *lines = NULL;
-    long nlines = 0, lcap = 0;
+    int ncol = o->columns;
+    size_t rows_per_page = o->dbl ? o->body_lines / 2 : o->body_lines;
+    if (!rows_per_page) rows_per_page = 1;
+    if (rows_per_page > SIZE_MAX / (size_t) ncol) {
+        in->failed = EOVERFLOW; return -1;
+    }
+    size_t per_page = rows_per_page * ncol;
+    pr_cell *lines = NULL, *cols = calloc ((size_t) ncol, sizeof *cols);
+    size_t capacity = 0;
+    int *full = calloc ((size_t) ncol, sizeof *full);
+    long *colnums = o->number ? calloc ((size_t) ncol, sizeof *colnums) : NULL;
     char *raw = NULL;
     size_t rawcap = 0;
-    ssize_t nread;
+    int page_no = 1, ended = 0;
+    long number_base = o->first_number;
+    if (!cols || !full || (o->number && !colnums)) in->failed = ENOMEM;
 
-    while ((nread = pr_input_line (in, &raw, &rawcap)) != -1) {
-        if (nlines == lcap) {
-            long newcap = lcap ? lcap * 2 : 64;
-            pr_cell *grown = realloc (lines, (size_t) newcap * sizeof *lines);
-            if (!grown) { in->failed = ENOMEM; break; }
-            lines = grown; lcap = newcap;
+    while (!in->failed && !out->error && !ended && page_no <= o->last_page) {
+        size_t count = 0, rows = 0;
+        int form_break = 0;
+        int selected = page_no >= o->first_page;
+        if (!selected) {
+            ended = pr_skip_column_page (in, o, full, rows_per_page,
+                                         &raw, &rawcap, &number_base);
+            page_no++;
+            continue;
         }
-        size_t len = pr_chomp (raw, (size_t) nread);
-        char *copy = malloc (len + 1);
-        if (!copy) { in->failed = ENOMEM; break; }
-        memcpy (copy, raw, len);
-        copy[len] = '\0';
-        lines[nlines].text = copy;
-        lines[nlines].len = len;
-        nlines++;
-    }
-    free (raw);
-
-    int ncol = o->columns;
-    /* GNU pr lays each page out on its own: a page holds body_lines*ncol
-       records, and the balancing below applies within that page, so column 2
-       of page 1 starts at record body_lines+1 however long the input is. */
-    /* -d gives each record a trailing blank, so a page holds half as many
-       rows; body_lines was already rounded down to an even number. */
-    long rows_per_page = o->dbl ? o->body_lines / 2 : o->body_lines;
-    if (rows_per_page < 1) rows_per_page = 1;
-    long per_page = rows_per_page * ncol;
-    int page_no = 1;
-    pr_cell *cols = calloc ((size_t) ncol, sizeof *cols);
-    long *colnums = o->number ? calloc ((size_t) ncol, sizeof *colnums) : NULL;
-
-    if (!cols || (o->number && !colnums)) {
-        in->failed = ENOMEM;
-    } else for (long first = 0; first < nlines; first += per_page) {
-        long count = nlines - first < per_page ? nlines - first : per_page;
-        /* GNU balances "down" columns when the page's record count is not a
-           multiple of ncol: the first `rem` columns get base+1 records, the
-           rest get base (e.g. 7 in 3 cols => heights 3,2,2, not 3,3,1).
-           Column c then begins at start(c) = c*base + min(c, rem). "across"
-           is unaffected (row-major). */
-        long base = count / ncol;
-        int  rem  = (int) (count % ncol);
-        long rows = (count + ncol - 1) / ncol;
-
-        pr_header (out, o, in->title, in->stamp, page_no);
-        for (long row = 0; row < rows; row++) {
-            for (int c = 0; c < ncol; c++) {
-                long idx;
-                if (o->across) {
-                    /* row-major: records fill left-to-right across each row. */
-                    idx = first + row * ncol + c;
-                } else {
-                    /* column-major, balanced: column c holds base(+1 if c<rem)
-                       records from start(c); rows past its height are empty. */
-                    long height = base + (c < rem ? 1 : 0);
-                    long start  = first + (long) c * base + (c < rem ? c : rem);
-                    idx = (row < height) ? start + row : nlines;
+        do {
+            int c = o->across ? count % ncol : count / rows_per_page;
+            ssize_t got = pr_column_line (in, &raw, &rawcap, &full[c]);
+            if (got < 0) { ended = 1; break; }
+            form_break = in->form_break;
+            if (in->at_eof) ended = 1;
+            if (got > 0) {
+                size_t slot = o->across ? count % ncol : count;
+                if (slot == capacity) {
+                    size_t limit = o->across ? (size_t) ncol : per_page;
+                    size_t next = capacity ? capacity * 2 : 64;
+                    if (next < capacity || next > limit) next = limit;
+                    if (next > SIZE_MAX / sizeof *lines) { in->failed = EOVERFLOW; break; }
+                    pr_cell *grown = realloc (lines, next * sizeof *lines);
+                    if (!grown) { in->failed = ENOMEM; break; }
+                    lines = grown; capacity = next;
                 }
-                if (idx < first + count) {
-                    cols[c] = lines[idx];
-                } else {
-                    cols[c].text = NULL;
-                    cols[c].len = 0;
-                }
-                if (colnums)
-                    colnums[c] = (idx < first + count) ? idx + 1 : 0;
+                size_t len = pr_chomp (raw, (size_t) got);
+                char *copy = malloc (len + 1);
+                if (!copy) { in->failed = ENOMEM; break; }
+                memcpy (copy, raw, len + 1);
+                lines[slot] = (pr_cell) { .text = copy, .len = len,
+                                        .backspace = in->record_bs };
+                count++;
             }
-            pr_emit_row (out, cols, ncol, o, 0, colnums);
-            if (o->dbl)
-                bl_output_byte (out, '\n');
+            if (o->across && (count % ncol == 0 || form_break)) {
+                size_t cells = count - rows * ncol;
+                if (cells) {
+                    if (selected) {
+                        if (!rows) pr_header (out, o, in->title, in->stamp, page_no);
+                        memset (cols, 0, (size_t) ncol * sizeof *cols);
+                        for (size_t j = 0; j < cells; j++) {
+                            cols[j] = lines[j];
+                            if (colnums) colnums[j] = number_base + (long) (rows * ncol + j);
+                        }
+                        pr_emit_row (out, cols, ncol, o, 0, colnums, ncol);
+                        if (o->dbl && !(o->terse && (form_break || ended))) bl_output_byte (out, '\n');
+                    }
+                    for (size_t j = 0; j < cells; j++) free (lines[j].text);
+                    rows++;
+                }
+            }
+        } while (!form_break && !ended && count < per_page && !out->error);
+
+        if (o->across) {
+            /* EOF can finish a partial row. */
+            size_t cells = count > rows * ncol ? count - rows * ncol : 0;
+            if (cells) {
+                if (selected) {
+                    if (!rows) pr_header (out, o, in->title, in->stamp, page_no);
+                    memset (cols, 0, (size_t) ncol * sizeof *cols);
+                    for (size_t j = 0; j < cells; j++) {
+                        cols[j] = lines[j];
+                        if (colnums) colnums[j] = number_base + (long) (rows * ncol + j);
+                    }
+                    pr_emit_row (out, cols, ncol, o, 0, colnums, ncol);
+                    if (o->dbl && !o->terse) bl_output_byte (out, '\n');
+                }
+                for (size_t j = 0; j < cells; j++) free (lines[j].text);
+                rows++;
+            }
+        } else {
+            size_t base = count / ncol, rem = count % ncol;
+            rows = base + (rem != 0);
+            if (selected && (count || form_break)) {
+                pr_header (out, o, in->title, in->stamp, page_no);
+                for (size_t row = 0; row < rows && !out->error; row++) {
+                    memset (cols, 0, (size_t) ncol * sizeof *cols);
+                    for (int c = 0; c < ncol; c++) {
+                        size_t start = c * base + ((size_t) c < rem ? (size_t) c : rem);
+                        if (row < base + ((size_t) c < rem)) {
+                            cols[c] = lines[start + row];
+                            if (colnums) colnums[c] = number_base + (long) (start + row);
+                        }
+                    }
+                    pr_emit_row (out, cols, ncol, o, 0, colnums, ncol);
+                    if (o->dbl && !(o->terse && row + 1 == rows && (ended || form_break)))
+                        bl_output_byte (out, '\n');
+                }
+            }
+            for (size_t j = 0; j < count; j++) free (lines[j].text);
         }
-        pr_footer (out, o, (int) (o->dbl ? rows * 2 : rows));
+        if (selected && (count || form_break)) {
+            if (o->across && !count) pr_header (out, o, in->title, in->stamp, page_no);
+            pr_footer (out, o, (int) (o->dbl ? rows * 2 : rows));
+            if (form_break && o->terse && !o->omit_pagination) bl_output_byte (out, '\f');
+            bl_output_flush (out);
+        }
+        if (count == per_page && !form_break)
+            for (int c = 0; c < ncol; c++) full[c] = 1;
+        if (selected || !o->number_set) number_base += (long) count;
+        if (page_no == o->last_page) break;
         page_no++;
     }
-
-    for (long j = 0; j < nlines; j++) free (lines[j].text);
-    free (lines); free (cols); free (colnums);
+    free (raw); free (lines); free (cols); free (full); free (colnums);
     return in->failed ? -1 : 0;
 }
 
-/* Merge mode: read all inputs line-by-line in parallel, side by side. End of
-   input on one leaves its column blank until the others finish. With -n the
-   line number is emitted once per row, before all columns (GNU placement).
-   GNU dates a merged page from the current time and leaves its title blank,
-   because the page belongs to no single file. */
+/* Merge reader ownership is separate from column page state: repeated '-'
+   operands share bytes and EOF, while each column holds/releases independently. */
 static int
 pr_merge (bl_output *out, pr_input *ins, int n, const pr_opts *o)
 {
     char **lines = calloc ((size_t) n, sizeof *lines);
     size_t *caps = calloc ((size_t) n, sizeof *caps);
     pr_cell *cols = calloc ((size_t) n, sizeof *cols);
-    int line_in_page = 0;
-    int page_no = 1;
-    long lineno = 1;
+    int *state = calloc ((size_t) n, sizeof *state); /* 0 open, 1 held, 2 closed */
+    int *full = calloc ((size_t) n, sizeof *full);
+    int page_no = 1, failed = 0;
+    long lineno = o->first_number;
     time_t now = time (NULL);
-    int failed = 0;
-
-    if (!lines || !caps || !cols) {
-        free (lines); free (caps); free (cols);
-        return -1;
+    int rows_per_page = o->dbl ? o->body_lines / 2 : o->body_lines;
+    if (!rows_per_page) rows_per_page = 1;
+    if (!lines || !caps || !cols || !state || !full) {
+        free (lines); free (caps); free (cols); free (state); free (full);
+        ins[0].failed = ENOMEM; return -1;
     }
-    for (;;) {
-        int any = 0;
-        for (int i = 0; i < n; i++) {
-            ssize_t got = pr_input_line (&ins[i], &lines[i], &caps[i]);
-            if (got != -1) {
-                any = 1;
-                cols[i].text = lines[i];
-                cols[i].len = pr_chomp (lines[i], (size_t) got);
-            } else {
-                cols[i].text = NULL;
-                cols[i].len = 0;
+    while (!out->error && page_no <= o->last_page) {
+        int ready = 0, rows = 0, form_break = 0, page_started = 0;
+        int selected = page_no >= o->first_page;
+        for (int i = 0; i < n; i++) if (state[i] != 2) { state[i] = 0; ready++; }
+        if (!ready) break;
+        while (ready && rows < rows_per_page && !out->error) {
+            int any = 0, last = n;
+            memset (cols, 0, (size_t) n * sizeof *cols);
+            for (int i = 0; i < n; i++) {
+                if (state[i]) continue;
+                pr_input *reader = &ins[i];
+                if (!reader->owned)
+                    for (int j = 0; j < i; j++)
+                        if (!ins[j].owned) { reader = &ins[j]; break; }
+                ssize_t got = pr_column_line (reader, &lines[i], &caps[i], &full[i]);
+                if (reader->failed) ins[i].failed = reader->failed;
+                if (!selected && !o->number_set && i == 0
+                    && !(got == 0 && reader->form_break)) lineno++;
+                if (reader->form_break) { state[i] = 1; form_break = 1; }
+                else if (got < 0 || reader->at_eof) state[i] = 2;
+                if (got > 0) {
+                    any = 1;
+                    cols[i] = (pr_cell) { .text = lines[i],
+                        .backspace = reader->record_bs,
+                        .len = pr_chomp (lines[i], (size_t) got) };
+                }
+                if (state[i]) ready--;
+                /* GNU aligns a just-closed first column before discovering
+                   whether the remaining open columns contain another record. */
+                if (i == 0 && got > 0 && reader->at_eof && ready)
+                    cols[0].renumber = 1;
+                if (!ready) { last = got > 0 ? i + 1 : i; break; }
             }
+            if (selected && !page_started && (any || form_break)) {
+                pr_header (out, o, NULL, now, page_no); page_started = 1;
+            }
+            if (!any) break;
+            if (selected) {
+                pr_emit_row (out, cols, n, o, o->number ? lineno : 0, NULL, last);
+                if (o->dbl && (ready || !o->terse)) bl_output_byte (out, '\n');
+            }
+            if (selected) {
+                lineno++;
+                if (cols[0].renumber) lineno++;
+            }
+            rows++;
         }
-        if (!any) break;
-        if (line_in_page >= o->body_lines) {
-            pr_footer (out, o, line_in_page);
-            page_no++;
-            line_in_page = 0;
+        if (selected && page_started) {
+            pr_footer (out, o, o->dbl ? rows * 2 : rows);
+            if (form_break && o->terse && !o->omit_pagination) bl_output_byte (out, '\f');
+            bl_output_flush (out);
         }
-        if (line_in_page == 0)
-            pr_header (out, o, NULL, now, page_no);
-        pr_emit_row (out, cols, n, o, o->number ? lineno++ : 0, NULL);
-        line_in_page++;
+        if (rows == rows_per_page)
+            for (int i = 0; i < n; i++) if (!state[i]) full[i] = 1;
+        if (page_no == o->last_page) break;
+        page_no++;
     }
-    if (line_in_page > 0) pr_footer (out, o, line_in_page);
-    for (int i = 0; i < n; i++) {
-        free (lines[i]);
-        if (ins[i].failed) failed = 1;
-    }
-    free (lines); free (caps); free (cols);
+    for (int i = 0; i < n; i++) { free (lines[i]); if (ins[i].failed) failed = 1; }
+    free (lines); free (caps); free (cols); free (state); free (full);
     return failed ? -1 : 0;
 }
 
@@ -753,31 +937,13 @@ pr_set_length (pr_opts *o, const char *opt, const char *arg)
 {
     int parsed;
     if (pr_parse_int_arg (opt, arg, &parsed) != EXECUTION_SUCCESS)
-        return EX_USAGE;
+        return EXECUTION_FAILURE;
     if (parsed < 1) {
         builtin_error ("%s: invalid number of lines: %s", opt, arg);
         builtin_usage ();
-        return EX_USAGE;
+        return EXECUTION_FAILURE;
     }
     o->page_lines = parsed;
-    if (parsed <= 10)
-        o->terse = 1;
-    return EXECUTION_SUCCESS;
-}
-
-/* -w/--width: the supported range starts at 8 columns; see docs/pr.md. */
-static int
-pr_set_width (pr_opts *o, const char *opt, const char *arg)
-{
-    int parsed;
-    if (pr_parse_int_arg (opt, arg, &parsed) != EXECUTION_SUCCESS)
-        return EX_USAGE;
-    if (parsed < 8) {
-        builtin_error ("%s: invalid width: %s", opt, arg);
-        builtin_usage ();
-        return EX_USAGE;
-    }
-    o->width = parsed;
     return EXECUTION_SUCCESS;
 }
 
@@ -791,145 +957,198 @@ pr_report (bl_output *out, const char *name, int number)
     builtin_error ("%s: %s", name ? name : "standard input", strerror (number));
 }
 
+/* CLI parsing is kept separate from descriptor ownership and rendering. */
+static int
+pr_optional_format (const char *arg, unsigned char *sep, int *width)
+{
+    if (!arg) return 0;
+    if (!*arg) return EXECUTION_FAILURE;
+    if (!isdigit ((unsigned char) *arg)) *sep = *arg++;
+    if (*arg) {
+        if (pr_parse_int_arg ("format", arg, width) || *width < 1) return EXECUTION_FAILURE;
+    }
+    return 0;
+}
+
+static int
+pr_options (WORD_LIST *list, pr_opts *o, const char ***files, int *count)
+{
+    size_t total = 0;
+    for (WORD_LIST *p = list; p; p = p->next) total++;
+    *files = calloc (total + 1, sizeof **files);
+    if (!*files) { builtin_error ("out of memory"); return 1; }
+    const char *old_sep = NULL, *new_sep = NULL;
+    int old_s = 0, new_s = 0, end_options = 0;
+    struct option_name { const char *name; char key; int argument; };
+    static const struct option_name names[] = {
+        {"across", 'a', 0}, {"show-control-chars", 'c', 0},
+        {"double-space", 'd', 0}, {"date-format", 'D', 1},
+        {"expand-tabs", 'e', 2}, {"form-feed", 'f', 0},
+        {"header", 'h', 1}, {"output-tabs", 'i', 2},
+        {"join-lines", 'J', 0}, {"length", 'l', 1}, {"merge", 'm', 0},
+        {"number-lines", 'n', 2}, {"first-line-number", 'N', 1},
+        {"indent", 'o', 1}, {"no-file-warnings", 'r', 0},
+        {"separator", 's', 2}, {"sep-string", 'S', 2},
+        {"omit-header", 't', 0}, {"omit-pagination", 'T', 0},
+        {"show-nonprinting", 'v', 0}, {"width", 'w', 1},
+        {"page-width", 'W', 1}, {"columns", '#', 1}, {"pages", '+', 1},
+        {NULL, 0, 0}
+    };
+    for (; list; list = list->next) {
+        const char *word = list->word->word;
+        if (!end_options && !strcmp (word, "--")) { end_options = 1; continue; }
+        if (!end_options && (!strcmp (word, "--help") || !strcmp (word, "--version"))) {
+            if (word[2] == 'h') builtin_usage ();
+            else puts ("pr 1.1 (bash-loadable)");
+            return -1;
+        }
+        if (end_options || (!word[0] || (word[0] != '-' && word[0] != '+')) || !word[1]
+            || (word[0] == '+' && !isdigit ((unsigned char) word[1]))) {
+            (*files)[(*count)++] = word; continue;
+        }
+        int long_option = word[0] == '-' && word[1] == '-';
+        const char *cursor = word + (long_option ? 2 : 1);
+        do {
+            char key;
+            const char *arg = NULL;
+            int kind = 0;
+            if (word[0] == '+') { key = '+'; arg = cursor; cursor += strlen (cursor); }
+            else if (long_option) {
+                const char *equals = strchr (cursor, '=');
+                size_t len = equals ? (size_t) (equals - cursor) : strlen (cursor);
+                int found = -1;
+                for (int k = 0; names[k].name; k++)
+                    if (strlen (names[k].name) == len && !strncmp (cursor, names[k].name, len)) { found = k; break; }
+                if (found < 0) goto invalid;
+                key = names[found].key; kind = names[found].argument;
+                if (equals) { if (!kind) goto invalid; arg = equals + 1; }
+                cursor += strlen (cursor);
+            } else if (isdigit ((unsigned char) *cursor)) {
+                key = '#'; arg = cursor; cursor += strlen (cursor);
+            } else {
+                key = *cursor++;
+                if (strchr ("DhlNowW", key)) kind = 1;
+                else if (strchr ("einsS", key)) kind = 2;
+                if (kind && *cursor) { arg = cursor; cursor += strlen (cursor); }
+            }
+            if (kind == 1 && !arg) {
+                if (!list->next) goto invalid;
+                list = list->next; arg = list->word->word;
+            }
+            int value = 0;
+            switch (key) {
+            case 'a': o->across = 1; break;
+            case 'b': break; /* balancing is the default */
+            case 'c': o->show_control = 1; break;
+            case 'd': o->dbl = 1; break;
+            case 'D': o->date_format = arg; break;
+            case 'e': o->expand = 1;
+                if (pr_optional_format (arg, &o->in_tab, &o->in_tab_width)) goto invalid;
+                break;
+            case 'f': case 'F': o->formfeed = 1; break;
+            case 'h': o->header = arg; break;
+            case 'i': o->tabify = 1;
+                if (pr_optional_format (arg, &o->out_tab, &o->out_tab_width)) goto invalid;
+                break;
+            case 'J': o->join = 1; break;
+            case 'l': if (pr_set_length (o, word, arg)) goto invalid; break;
+            case 'm': o->merge = 1; break;
+            case 'n': {
+                unsigned char sep = o->num_sep;
+                o->number = 1;
+                if (pr_optional_format (arg, &sep, &o->num_width)) goto invalid;
+                if (o->num_width > INT_MAX - 8) goto invalid;
+                o->num_sep = sep; break;
+            }
+            case 'N': {
+                char *end; errno = 0;
+                long n = strtol (arg, &end, 10);
+                if (!*arg || *end || errno || n < INT_MIN || n > INT_MAX) goto invalid;
+                o->first_number = n; o->number_set = 1; break;
+            }
+            case 'o': if (pr_parse_int_arg (word, arg, &o->offset)) goto invalid; break;
+            case 'r': o->no_warn = 1; break;
+            case 's': old_s = 1; old_sep = arg; break;
+            case 'S': new_s = 1; new_sep = arg ? arg : ""; break;
+            case 't': o->terse = 1; o->omit_pagination = 0; break;
+            case 'T': o->terse = o->omit_pagination = 1; break;
+            case 'v': o->show_octal = 1; break;
+            case 'w': case 'W':
+                if (pr_parse_int_arg (word, arg, &value) || value < 1) goto invalid;
+                if (key == 'W' || !o->page_width) o->width = value;
+                if (key == 'W') o->page_width = 1;
+                else o->width_set = 1;
+                break;
+            case '#':
+                if (pr_parse_int_arg (word, arg, &value) || value < 1) goto invalid;
+                o->columns = value; o->columns_set = 1; break;
+            case '+': {
+                char *end; errno = 0;
+                long first = strtol (arg, &end, 10), last = INT_MAX;
+                if (end == arg || first < 1 || first > INT_MAX || errno) goto invalid;
+                if (*end == ':') {
+                    const char *tail = end + 1;
+                    last = strtol (tail, &end, 10);
+                    if (end == tail || last < first || last > INT_MAX || errno) goto invalid;
+                }
+                if (*end) goto invalid;
+                o->first_page = first; o->last_page = last; break;
+            }
+            default: goto invalid;
+            }
+        } while (*cursor && !long_option);
+        continue;
+invalid:
+        builtin_error ("invalid option or argument: %s", word);
+        builtin_usage ();
+        return EXECUTION_FAILURE;
+    }
+    if (o->merge && (o->columns_set || o->across)) {
+        builtin_error ("cannot combine merge with columns or across"); return 1;
+    }
+    if (o->page_lines <= 10) {
+        o->terse = 1;
+        /* GNU's implicit short-page mode re-enables input form feeds,
+           including when -T was explicitly requested. */
+        o->omit_pagination = 0;
+    }
+    /* Capital options control separation independently of width. */
+    if (old_s && !new_s) {
+        if (!o->width_set && !o->page_width) o->join = 1;
+        o->separator = old_sep ? old_sep : (o->join ? "\t" : "");
+    } else o->separator = new_s ? new_sep : (o->join ? "\t" : " ");
+    if (!o->join && !strcmp (o->separator, "\t")) o->separator = " ";
+    o->sep_len = strlen (o->separator);
+    return 0;
+}
+
+
 int
 pr_builtin (WORD_LIST *list)
 {
     pr_opts o = { .page_lines = 66, .width = 72, .columns = 1,
-                  .num_width = PR_DEFAULT_CHARS_PER_NUMBER, .num_sep = '\t' };
-    while (list && list->word->word[0] == '-' && list->word->word[1]) {
-        const char *w = list->word->word;
-        if (!strcmp (w, "--")) { list = list->next; break; }
-        if (!strcmp (w, "--help")) {
-            builtin_usage ();
-            return EXECUTION_SUCCESS;
-        }
-        if (!strcmp (w, "--version")) {
-            puts ("pr 1.0 (bash-loadable)");
-            return EXECUTION_SUCCESS;
-        }
-        if (!strcmp (w, "-t")) { o.terse = 1; list = list->next; continue; }
-        if (!strcmp (w, "-m")) { o.merge = 1; list = list->next; continue; }
-        if (!strcmp (w, "-d") || !strcmp (w, "--double-space")) { o.dbl = 1; list = list->next; continue; }
-        if (!strcmp (w, "-f") || !strcmp (w, "-F")
-            || !strcmp (w, "--form-feed") || !strcmp (w, "--form-feed=")) {
-            o.formfeed = 1; list = list->next; continue;
-        }
-        /* -n[SEP[DIGITS]]: number lines. Attached arg is GNU's only form (a
-           separated token is taken as a filename). SEP = a single leading
-           non-digit char (default TAB); DIGITS = the field width (default 5).
-           e.g. -n => 5/TAB, -n3 => 3/TAB, -nc3 => 3/sep 'c', -n: => 5/sep ':'. */
-        if (w[1] == 'n') {
-            o.number = 1;
-            const char *p = w + 2;
-            if (*p && !(*p >= '0' && *p <= '9')) {
-                o.num_sep = *p;                 /* leading non-digit = separator */
-                p++;
-            }
-            if (*p) {                           /* remaining = digit width */
-                char *end;
-                long d = strtol (p, &end, 10);
-                if (*end != '\0' || d < 1) {
-                    builtin_error ("-n: invalid number format: %s", w);
-                    builtin_usage ();
-                    return EX_USAGE;
-                }
-                o.num_width = (int) d;
-            }
-            list = list->next;
-            continue;
-        }
-        if (!strcmp (w, "-a") || !strcmp (w, "--across")) { o.across = 1; list = list->next; continue; }
-        /* -N (a bare digit count) selects N output columns. */
-        if (w[1] >= '1' && w[1] <= '9' && w[2] == '\0') {
-            o.columns = w[1] - '0';
-            list = list->next;
-            continue;
-        }
-        /* -o OFFSET (attached -oN or separate -o N): left-margin indent. */
-        if (w[1] == 'o') {
-            int parsed;
-            const char *arg;
-            if (w[2] != '\0') {
-                arg = w + 2;
-            } else {
-                if (!list->next) { builtin_error ("-o needs OFFSET"); builtin_usage (); return EX_USAGE; }
-                list = list->next;
-                arg = list->word->word;
-            }
-            if (pr_parse_int_arg ("-o", arg, &parsed) != EXECUTION_SUCCESS)
-                return EX_USAGE;
-            o.offset = parsed;
-            list = list->next;
-            continue;
-        }
-        /* -s[c]: column separator (default TAB). Disables width padding. */
-        if (w[1] == 's' && (w[2] == '\0' || w[3] == '\0')) {
-            o.sep_set = 1;
-            o.sep = (w[2] != '\0') ? w[2] : '\t';
-            list = list->next;
-            continue;
-        }
-        if (!strcmp (w, "--header")) {
-            if (!list->next) { builtin_error ("--header needs HEADER"); builtin_usage (); return EX_USAGE; }
-            list = list->next;
-            o.header = list->word->word;
-            list = list->next;
-            continue;
-        }
-        if (!strncmp (w, "--header=", 9)) {
-            o.header = w + 9;
-            list = list->next;
-            continue;
-        }
-        if (!strcmp (w, "-h")) {
-            if (!list->next) { builtin_error ("-h needs HEADER"); builtin_usage (); return EX_USAGE; }
-            list = list->next;
-            o.header = list->word->word;
-            list = list->next;
-            continue;
-        }
-        if (!strcmp (w, "--length") || !strcmp (w, "-l")) {
-            if (!list->next) { builtin_error ("%s needs LINES", w); builtin_usage (); return EX_USAGE; }
-            list = list->next;
-            if (pr_set_length (&o, w, list->word->word) != EXECUTION_SUCCESS)
-                return EX_USAGE;
-            list = list->next;
-            continue;
-        }
-        if (!strncmp (w, "--length=", 9)) {
-            if (pr_set_length (&o, "--length", w + 9) != EXECUTION_SUCCESS)
-                return EX_USAGE;
-            list = list->next;
-            continue;
-        }
-        if (!strcmp (w, "--width") || !strcmp (w, "-w")) {
-            if (!list->next) { builtin_error ("%s needs WIDTH", w); builtin_usage (); return EX_USAGE; }
-            list = list->next;
-            if (pr_set_width (&o, w, list->word->word) != EXECUTION_SUCCESS)
-                return EX_USAGE;
-            list = list->next;
-            continue;
-        }
-        if (!strncmp (w, "--width=", 8)) {
-            if (pr_set_width (&o, "--width", w + 8) != EXECUTION_SUCCESS)
-                return EX_USAGE;
-            list = list->next;
-            continue;
-        }
-        builtin_error ("unknown flag: %s", w);
-        builtin_usage ();
-        return EX_USAGE;
-    }
-    o.body_lines = o.terse ? o.page_lines : (o.page_lines - 10);
-    if (o.body_lines < 1) o.body_lines = 56;
-    /* -d emits each body line as a 2-line unit (line + blank); GNU rounds the
-       body region down to an even number of lines so a unit never straddles a
-       page boundary. */
-    if (o.dbl && (o.body_lines & 1)) o.body_lines--;
-
-    int rc = EXECUTION_SUCCESS;
+                  .num_width = PR_DEFAULT_CHARS_PER_NUMBER, .num_sep = '\t',
+                  .in_tab = '\t', .out_tab = '\t', .in_tab_width = 8, .out_tab_width = 8,
+                  .date_format = "%Y-%m-%d %H:%M", .first_page = 1, .last_page = INT_MAX,
+                  .first_number = 1 };
+    const char **files = NULL;
     int n_files = 0;
-    for (WORD_LIST *p = list; p; p = p->next) n_files++;
+    int parsed = pr_options (list, &o, &files, &n_files);
+    if (parsed) { free (files); return parsed == -1 ? 0 : parsed; }
+    /* With no operands GNU disables parallel input after translating old
+       width options; an explicit -w therefore still truncates this stream. */
+    if (o.merge && o.width_set) o.page_width = 1;
+    if (o.merge && !n_files) o.merge = 0;
+    o.body_lines = o.terse ? o.page_lines : o.page_lines - 10;
+    if (o.dbl) o.body_lines = o.body_lines > 1 ? o.body_lines - (o.body_lines & 1) : 2;
+    int ncol = o.merge && n_files ? n_files : o.columns;
+    int number_width = o.num_sep == '\t' ? o.num_width + 8 - o.num_width % 8 : o.num_width + 1;
+    if ((int64_t) o.width - (o.merge && o.number ? number_width : 0)
+        - (int64_t) (ncol - 1) * o.sep_len < ncol) {
+        builtin_error ("page width too narrow"); free (files); return 1;
+    }
+    o.tabify |= ncol > 1;
+    int rc = EXECUTION_SUCCESS;
 
     /* Output goes through this invocation's own buffer rather than the shell's
        stdout object, so a failed write is seen here and reported. */
@@ -957,9 +1176,9 @@ pr_builtin (WORD_LIST *list)
             rc = EXECUTION_FAILURE;
         } else {
             int opened = 0;
-            for (WORD_LIST *p = list; p; p = p->next) {
-                if (pr_input_open (&ins[opened], p->word->word) < 0) {
-                    pr_report (&output, p->word->word, errno);
+            for (int f = 0; f < n_files; f++) {
+                if (pr_input_open (&ins[opened], files[f]) < 0) {
+                    if (!o.no_warn) pr_report (&output, files[f], errno);
                     rc = EXECUTION_FAILURE;
                     continue;
                 }
@@ -975,26 +1194,32 @@ pr_builtin (WORD_LIST *list)
             free (ins);
         }
     } else {
-        /* Single-file mode: paginate each FILE separately. */
-        for (WORD_LIST *p = list; p; p = p->next) {
-            pr_input in;
-            if (pr_input_open (&in, p->word->word) < 0) {
-                pr_report (&output, p->word->word, errno);
-                rc = EXECUTION_FAILURE;
-                continue;
-            }
-            /* -m always uses a blank header title and the current time (GNU
-               pr), even with a single FILE, where this would otherwise fall
-               through to the filename-titled single-file path. */
-            if (o.merge) { in.title = NULL; in.stamp = time (NULL); }
-            int bad = (o.columns > 1 && !o.merge) ? pr_columns (&output, &in, &o)
-                                                  : pr_single (&output, &in, &o);
+        /* Paginate operands separately, retaining standard-input read-ahead
+           within this invocation when a selected page range ends early. */
+        pr_input standard_input;
+        int standard_open = 0;
+        for (int f = 0; f < n_files && !output.error; f++) {
+            pr_input file_input, *in;
+            int is_standard = !strcmp (files[f], "-");
+            in = is_standard ? &standard_input : &file_input;
+            if (!is_standard || !standard_open) {
+                if (pr_input_open (in, files[f]) < 0) {
+                    if (!o.no_warn) pr_report (&output, files[f], errno);
+                    rc = EXECUTION_FAILURE;
+                    continue;
+                }
+                if (is_standard) standard_open = 1;
+            } else in->stamp = time (NULL);
+            if (o.merge) { in->title = NULL; in->stamp = time (NULL); }
+            int bad = (o.columns > 1 && !o.merge) ? pr_columns (&output, in, &o)
+                                                  : pr_single (&output, in, &o);
             if (bad < 0) {
-                pr_report (&output, in.title, in.failed);
+                pr_report (&output, in->title, in->failed);
                 rc = EXECUTION_FAILURE;
             }
-            pr_input_close (&in);
+            if (!is_standard) pr_input_close (in);
         }
+        if (standard_open) pr_input_close (&standard_input);
     }
 
     bl_output_flush (&output);
@@ -1002,13 +1227,14 @@ pr_builtin (WORD_LIST *list)
         builtin_error ("write error: %s", strerror (output.error));
         rc = EXECUTION_FAILURE;
     }
+    free (files);
     return rc;
 }
 
 char *pr_doc[] = {
     "Format text for printing (POSIX pr).",
     "",
-    "    pr [--help|--version] [-t] [-m] [-h HEADER] [-l LINES] [-w WIDTH] [-n] [-N] [-a] [-o OFFSET] [-s[SEP]] [FILE...]",
+    "    pr [--help|--version] [-t] [-m] [-h HEADER] [-l LINES] [-w WIDTH] [-n] [-COLUMN] [-N NUMBER] [-a] [-o OFFSET] [-s[SEP]] [FILE...]",
     "",
     "    -t          terse: no header / footer paging",
     "    -m          merge mode: side-by-side columns of all FILEs",
@@ -1016,12 +1242,22 @@ char *pr_doc[] = {
     "    -f, -F      use a form-feed to separate pages (no blank padding)",
     "    -h HEADER   override page header (default: filename)",
     "    -l LINES    lines per page (default 66 — 5 hdr + 56 body + 5 ftr)",
-    "    -w WIDTH    column-layout width (default 72, minimum 8)",
+    "    -w WIDTH    column-layout width (default 72, positive)",
     "    -n[SEP[N]]  number body lines (N digits, default 5; SEP after, def tab)",
-    "    -N          a bare digit: lay one file out in N balanced columns",
+    "    -COLUMN     lay one file out in COLUMN balanced columns",
+    "    -N NUMBER   first line number on the first page printed",
     "    -a          (--across) fill -N columns left-to-right, not top-down",
     "    -o OFFSET   indent every line by OFFSET spaces (left margin)",
-    "    -s[SEP]     separate columns with SEP (default tab), no padding",
+    "    -s[STRING]  separate columns (default tab); -w retains truncation",
+    "    -S[STRING]  set separator independently of column alignment",
+    "    -J          join full lines; -W WIDTH truncates even one column",
+    "    -e[C[N]]    expand input tabs; -i[C[N]] tabify output (default 8)",
+    "    -c, -v      show control bytes using caret / octal notation",
+    "    -D FORMAT   strftime format for the header date",
+    "    -r          suppress failed-open diagnostics",
+    "    -T          omit headers, trailers and input form-feed bytes",
+    "    +FIRST:LAST or --pages=FIRST:LAST: print selected pages",
+    "    Options may follow operands; long GNU option names are accepted.",
     "    --help      show this help",
     "    --version   show version",
     "",
@@ -1037,6 +1273,6 @@ struct builtin pr_struct = {
     pr_builtin,
     BUILTIN_ENABLED,
     pr_doc,
-    "pr [--help|--version] [-tmnadfF] [-N] [-o OFFSET] [-s[SEP]] [-h HEADER] [-l LINES] [-w WIDTH] [FILE...]",
+    "pr [OPTION...] [+FIRST[:LAST]] [-COLUMN] [FILE...]",
     0
 };

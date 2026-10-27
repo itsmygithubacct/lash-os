@@ -11,20 +11,21 @@
  *   - a seed may be CREDITED only if it was written by a process whose pool
  *     was initialised. `save` uses a BLOCKING getrandom(2), so it waits for
  *     exactly that before writing.
- *   - a seed is never used twice. `load` replaces the file the moment it is
- *     credited. The credit itself initialises the pool, so the replacement is
- *     drawn from an initialised pool and is creditable next boot. If the pool
- *     is somehow still not ready, the spent seed is REMOVED rather than
- *     rewritten with weak bytes; `save` writes a fresh one later.
+ *   - load unlinks and directory-fsyncs a seed BEFORE crediting it. A crash or
+ *     failed refresh therefore cannot leave a spent seed at FILE. Failed
+ *     credit restores the original through the same durable write protocol.
+ *     Operations lock the parent directory, so cooperating calls serialize.
  *
  *   rngseed load FILE    credit FILE (32..4096 bytes; 512 expected), refresh it.
  *                        A missing FILE is the first boot: one line to stderr,
- *                        exit 0. Never blocks — safe from PID 1's boot path.
+ *                        exit 0. Never waits for entropy on PID 1's boot path.
  *   rngseed save FILE    512 bytes from a BLOCKING getrandom(2) -> FILE.
  *
  * FILE is written 0600 to a temp name in the same directory, fsynced, renamed
  * over, and the directory fsynced, so a power cut leaves the old seed or the
- * new one — never a torn file.
+ * new one — never a torn file. Load may leave no seed after consumption.
+ * Seeds must be regular, single-link, caller-owned 0600 files in a trusted
+ * directory. Raw seeds have no checksum: size-valid corruption is undetectable.
  */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE 1
@@ -38,6 +39,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <sys/stat.h>
+#include <sys/file.h>
 #include <sys/ioctl.h>
 #include <sys/random.h>
 #include <linux/random.h>
@@ -63,54 +65,120 @@ pool_bits (int want)
   return (bits > 0 && bits < want) ? bits : want;
 }
 
-/* Read up to SEED_MAX bytes. Returns the count; -1 on error with *missing set
-   when the file simply does not exist (the first boot, not a failure). */
+/* All pathname operations are relative to one opened, locked directory.
+   The parent must be private/trusted; flock coordinates rngseed callers, not
+   arbitrary writers or snapshots of the backing filesystem. */
+struct seed_path { int dir; char *storage, *name; };
+
+static void
+wipe (void *p, size_t n)
+{
+  volatile unsigned char *v = p;
+  while (n--) *v++ = 0;
+}
+
 static int
-read_seed (const char *path, unsigned char *buf, int *missing)
+open_path (const char *path, struct seed_path *p)
+{
+  p->dir = -1;
+  p->storage = strdup (path);
+  if (!p->storage) return -1;
+  char *slash = strrchr (p->storage, '/');
+  const char *dir = ".";
+  p->name = p->storage;
+  if (slash)
+    {
+      *slash = 0;
+      dir = slash == p->storage ? "/" : p->storage;
+      p->name = slash + 1;
+    }
+  if (!*p->name) { errno = EINVAL; goto fail; }
+  p->dir = open (dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (p->dir < 0 || flock (p->dir, LOCK_EX | LOCK_NB) != 0) goto fail;
+  return 0;
+fail:
+  {
+    int err = errno;
+    if (p->dir >= 0) close (p->dir);
+    free (p->storage);
+    errno = err;
+    return -1;
+  }
+}
+
+static void
+close_path (struct seed_path *p)
+{
+  int err = errno;
+  close (p->dir);
+  free (p->storage);
+  errno = err;
+}
+
+/* One extra byte distinguishes an oversized seed from an exact SEED_MAX seed.
+   Refuse links, non-regular files, other owners and non-private permissions. */
+static int
+read_seed (struct seed_path *p, unsigned char *buf, int *missing)
 {
   *missing = 0;
-  int fd = open (path, O_RDONLY | O_CLOEXEC);
+  int fd = openat (p->dir, p->name, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
   if (fd < 0) { if (errno == ENOENT) *missing = 1; return -1; }
-  int n = 0;
-  while (n < SEED_MAX)
+  struct stat st;
+  int n = -1, err;
+  if (fstat (fd, &st) != 0) goto out;
+  if (!S_ISREG (st.st_mode) || (st.st_mode & 07777) != 0600 ||
+      st.st_uid != geteuid () || st.st_nlink != 1)
+    { errno = EPERM; goto out; }
+  n = 0;
+  while (n <= SEED_MAX)
     {
-      ssize_t r = read (fd, buf + n, SEED_MAX - n);
-      if (r < 0) { if (errno == EINTR) continue; close (fd); return -1; }
+      ssize_t r = read (fd, buf + n, SEED_MAX + 1 - n);
+      if (r < 0) { if (errno == EINTR) continue; n = -1; break; }
       if (r == 0) break;
       n += (int) r;
     }
-  close (fd);
+out:
+  err = errno;
+  if (close (fd) != 0 && n >= 0) return -1;
+  errno = err;
   return n;
 }
 
-/* Atomic write: temp in the same dir, 0600 regardless of umask, fsync, rename,
-   then fsync the directory so the rename survives a power cut too. */
+/* Exclusive temp creation never follows an attacker-supplied .tmp symlink.
+   Success means write -> fsync(file) -> close -> rename -> fsync(directory).
+   Every failure closes descriptors, removes the temp, and preserves errno. */
 static int
-write_seed (const char *path, const unsigned char *buf, int n)
+write_seed (struct seed_path *p, const unsigned char *buf, int n)
 {
-  char tmp[PATH_MAX], dir[PATH_MAX];
-  if (snprintf (tmp, sizeof tmp, "%s.tmp", path) >= (int) sizeof tmp)
-    { errno = ENAMETOOLONG; return -1; }
-  int fd = open (tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+  static unsigned long serial;
+  char tmp[80];
+  int fd = -1, err;
+  for (int i = 0; i < 128; i++)
+    {
+      snprintf (tmp, sizeof tmp, ".rngseed-%ld-%lu", (long) getpid (), ++serial);
+      fd = openat (p->dir, tmp, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+      if (fd >= 0 || errno != EEXIST) break;
+    }
   if (fd < 0) return -1;
-  if (fchmod (fd, 0600) != 0) { close (fd); unlink (tmp); return -1; }
+  if (fchmod (fd, 0600) != 0) goto fail;
   for (int off = 0; off < n; )
     {
       ssize_t w = write (fd, buf + off, n - off);
-      if (w < 0) { if (errno == EINTR) continue; close (fd); unlink (tmp); return -1; }
+      if (w < 0) { if (errno == EINTR) continue; goto fail; }
+      if (w == 0) { errno = EIO; goto fail; }
       off += (int) w;
     }
-  if (fsync (fd) != 0 || close (fd) != 0) { unlink (tmp); return -1; }
-  if (rename (tmp, path) != 0) { unlink (tmp); return -1; }
-
-  strncpy (dir, path, sizeof dir - 1); dir[sizeof dir - 1] = '\0';
-  char *slash = strrchr (dir, '/');
-  if (slash == 0) strcpy (dir, ".");
-  else if (slash == dir) slash[1] = '\0';
-  else *slash = '\0';
-  int dfd = open (dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-  if (dfd >= 0) { fsync (dfd); close (dfd); }
-  return 0;
+  if (fsync (fd) != 0) goto fail;
+  if (close (fd) != 0) { fd = -1; goto fail; }
+  fd = -1;
+  if (renameat (p->dir, tmp, p->dir, p->name) != 0) goto fail;
+  return fsync (p->dir);
+fail:
+  err = errno;
+  if (fd >= 0) close (fd);
+  unlinkat (p->dir, tmp, 0);
+  errno = err;
+  return -1;
 }
 
 /* Exactly n bytes from getrandom(2); `flags` decides blocking. -1 on failure,
@@ -122,6 +190,7 @@ get_random (unsigned char *buf, int n, unsigned flags)
     {
       ssize_t r = getrandom (buf + off, n - off, flags);
       if (r < 0) { if (errno == EINTR) continue; return -1; }
+      if (r == 0) { errno = EIO; return -1; }
       off += (int) r;
     }
   return 0;
@@ -130,69 +199,79 @@ get_random (unsigned char *buf, int n, unsigned flags)
 static int
 do_load (const char *path)
 {
-  unsigned char seed[SEED_MAX], fresh[SEED_MAX];
-  int missing, rc, err;
-  int n = read_seed (path, seed, &missing);
+  unsigned char seed[SEED_MAX + 1], fresh[SEED_MAX];
+  struct seed_path p;
+  struct rand_pool_info *rpi = 0;
+  int missing, n, fd, rc = EXECUTION_FAILURE, err;
+  if (open_path (path, &p) != 0)
+    { builtin_error ("load %s: %s", path, strerror (errno)); return rc; }
+  n = read_seed (&p, seed, &missing);
   if (n < 0 && missing)
-    { fprintf (stderr, "rngseed: no seed at %s (first boot)\n", path); return EXECUTION_SUCCESS; }
+    {
+      rc = fprintf (stderr, "rngseed: no seed at %s (first boot)\n", path) < 0 ||
+           fflush (stderr) != 0 ? EXECUTION_FAILURE : EXECUTION_SUCCESS;
+      goto out;
+    }
   if (n < 0)
-    { builtin_error ("load %s: %s", path, strerror (errno)); return EXECUTION_FAILURE; }
-  if (n < SEED_MIN)
-    { builtin_error ("load %s: seed too short (%d bytes; need %d..%d)", path, n, SEED_MIN, SEED_MAX);
-      return EXECUTION_FAILURE; }
+    { builtin_error ("load %s: %s", path, strerror (errno)); goto out; }
+  if (n < SEED_MIN || n > SEED_MAX)
+    { builtin_error ("load %s: invalid seed size (%d; need %d..%d)", path, n, SEED_MIN, SEED_MAX); goto out; }
 
-  /* Credit it. RNDADDENTROPY needs CAP_SYS_ADMIN, which PID 1 has. */
-  struct rand_pool_info *rpi = malloc (sizeof *rpi + n);
-  if (rpi == 0) { builtin_error ("load: out of memory"); return EXECUTION_FAILURE; }
+  rpi = malloc (sizeof *rpi + n);
+  if (!rpi) { builtin_error ("load: out of memory"); goto out; }
   rpi->entropy_count = pool_bits (8 * n);
   rpi->buf_size = n;
   memcpy (rpi->buf, seed, n);
-  memset (seed, 0, sizeof seed);
-  int fd = open ("/dev/urandom", O_WRONLY | O_CLOEXEC);
-  rc = fd < 0 ? -1 : ioctl (fd, RNDADDENTROPY, rpi);
+  /* Persist consumption before the irreversible credit. A failed sync means
+     no credit; losing an uncredited seed is preferable to crediting it twice. */
+  if (unlinkat (p.dir, p.name, 0) != 0 || fsync (p.dir) != 0)
+    { builtin_error ("load: consume %s: %s", path, strerror (errno)); goto out; }
+  fd = open ("/dev/urandom", O_WRONLY | O_CLOEXEC);
+  int credit = fd < 0 ? -1 : ioctl (fd, RNDADDENTROPY, rpi);
   err = errno;
   if (fd >= 0) close (fd);
-  memset (rpi, 0, sizeof *rpi + n);
-  free (rpi);
-  if (rc != 0)
-    { builtin_error ("load: RNDADDENTROPY: %s", strerror (err)); return EXECUTION_FAILURE; }
-
-  /* The seed is spent: replace it at once, from the pool the credit just
-     initialised. NON-blocking, so PID 1 can never stall here. */
+  if (credit != 0)
+    {
+      builtin_error ("load: RNDADDENTROPY: %s", strerror (err));
+      if (write_seed (&p, seed, n) != 0)
+        builtin_error ("load: restore %s: %s", path, strerror (errno));
+      goto out;
+    }
   if (get_random (fresh, n, GRND_NONBLOCK) == 0)
     {
-      rc = write_seed (path, fresh, n);
-      err = errno;
-      memset (fresh, 0, sizeof fresh);
-      if (rc != 0) { builtin_error ("load: refresh %s: %s", path, strerror (err)); return EXECUTION_FAILURE; }
-      return EXECUTION_SUCCESS;
+      if (write_seed (&p, fresh, n) != 0)
+        { builtin_error ("load: refresh %s: %s", path, strerror (errno)); goto out; }
+      rc = EXECUTION_SUCCESS;
     }
-  if (errno == EAGAIN)
-    {
-      /* Pool still uninitialised after the credit. Never leave a spent seed
-         where it could be credited again; save will write a fresh one. */
-      unlink (path);
-      fprintf (stderr, "rngseed: pool not initialised after credit; %s consumed, not refreshed\n", path);
-      return EXECUTION_SUCCESS;
-    }
-  builtin_error ("load: getrandom: %s", strerror (errno));
-  return EXECUTION_FAILURE;
+  else if (errno == EAGAIN)
+    rc = fprintf (stderr, "rngseed: pool not initialised after credit; %s consumed, not refreshed\n", path) < 0 ||
+         fflush (stderr) != 0 ? EXECUTION_FAILURE : EXECUTION_SUCCESS;
+  else builtin_error ("load: getrandom: %s", strerror (errno));
+out:
+  wipe (seed, sizeof seed);
+  wipe (fresh, sizeof fresh);
+  if (rpi) { wipe (rpi, sizeof *rpi + n); free (rpi); }
+  close_path (&p);
+  return rc;
 }
 
 static int
 do_save (const char *path)
 {
   unsigned char fresh[SEED_LEN];
-  int rc, err;
-  /* BLOCKING: returns only once the CRNG is initialised, which is exactly what
-     makes the result creditable next boot. Callers run this in the background. */
+  struct seed_path p;
+  int rc = EXECUTION_FAILURE;
+  if (open_path (path, &p) != 0)
+    { builtin_error ("save %s: %s", path, strerror (errno)); return rc; }
+  /* Blocking getrandom is the qualification for creditable saved bytes. */
   if (get_random (fresh, SEED_LEN, 0) != 0)
-    { builtin_error ("save: getrandom: %s", strerror (errno)); return EXECUTION_FAILURE; }
-  rc = write_seed (path, fresh, SEED_LEN);
-  err = errno;
-  memset (fresh, 0, sizeof fresh);
-  if (rc != 0) { builtin_error ("save %s: %s", path, strerror (err)); return EXECUTION_FAILURE; }
-  return EXECUTION_SUCCESS;
+    builtin_error ("save: getrandom: %s", strerror (errno));
+  else if (write_seed (&p, fresh, SEED_LEN) != 0)
+    builtin_error ("save %s: %s", path, strerror (errno));
+  else rc = EXECUTION_SUCCESS;
+  wipe (fresh, sizeof fresh);
+  close_path (&p);
+  return rc;
 }
 
 int
@@ -214,8 +293,8 @@ rngseed_builtin (WORD_LIST *list)
 char *rngseed_doc[] = {
   "Credit and refresh the kernel random seed.",
   "",
-  "rngseed load FILE   credit FILE into the kernel pool (RNDADDENTROPY), then",
-  "                    replace it with fresh bytes so it is never used twice.",
+  "rngseed load FILE   durably consume FILE, credit it (RNDADDENTROPY),",
+  "                    then refresh it with nonblocking getrandom.",
   "                    A missing FILE is the first boot: reported, exit 0.",
   "rngseed save FILE   write 512 bytes from a BLOCKING getrandom(2) to FILE;",
   "                    waits for the pool to initialise (run in background).",

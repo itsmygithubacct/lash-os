@@ -64,6 +64,7 @@ typedef struct {
   int next_nums;
   const unsigned char *ext_stridx;
   int next_strs;
+  const unsigned char *ext_nameidx;
   const unsigned char *ext_strtab;
   int ext_strtab_len;
   int ext_names_off;
@@ -784,24 +785,34 @@ bt_parse (const unsigned char *buf, size_t len, bt_entry *e)
           e->next_strs = xs;
           p += (size_t) xs * 2;
 
+          /* String-value offsets are followed by one offset for every
+             extended capability name, before the shared string table. */
+          size_t name_count = (size_t) xb + xn + xs;
+          if (p + name_count * 2 > len) return 0;
+          e->ext_nameidx = buf + p;
+          p += name_count * 2;
+
           if (p + (size_t) xt_len > len) return 0;
           e->ext_strtab = buf + p;
           e->ext_strtab_len = xt_len;
           e->ext_names_off = -1;
 
-          int seen = 0;
-          size_t q = 0;
-          while (q < (size_t) xt_len && seen < xs)
+          /* Name offsets are relative to the names portion of the table.
+             Absent/cancelled values have offsets but occupy no string bytes. */
+          size_t names_base = 0;
+          for (int i = 0; i < xs; i++)
             {
-              size_t start = q;
-              while (q < (size_t) xt_len && e->ext_strtab[q] != '\0') q++;
-              if (q >= (size_t) xt_len) break;
-              (void) start;
-              q++;
-              seen++;
+              int value_off = bt_s16 (e->ext_stridx + (size_t) i * 2);
+              if (value_off == BT_ABSENT16 || value_off == BT_CANCEL16) continue;
+              if (value_off < 0 || value_off >= xt_len) return 0;
+              size_t q = (size_t) value_off;
+              size_t n = strnlen ((const char *) e->ext_strtab + q,
+                                  (size_t) xt_len - q);
+              if (n == (size_t) xt_len - q) return 0;
+              if (q + n + 1 > names_base) names_base = q + n + 1;
             }
-          if (seen == xs && q < (size_t) xt_len)
-            e->ext_names_off = (int) q;
+          if (names_base < (size_t) xt_len)
+            e->ext_names_off = (int) names_base;
         }
     }
 
@@ -840,19 +851,20 @@ bt_get_str_at (const bt_entry *e, int idx, int ext, const char **out)
 static int
 bt_ext_name_index (const bt_entry *e, const char *name, int kind)
 {
-  if (!e->ext_strtab || e->ext_names_off < 0) return -1;
-  int total = e->next_bools + e->next_nums + e->next_strs;
+  if (!e->ext_strtab || !e->ext_nameidx || e->ext_names_off < 0) return -1;
   int want_start = kind == 0 ? 0 : (kind == 1 ? e->next_bools : e->next_bools + e->next_nums);
   int want_count = kind == 0 ? e->next_bools : (kind == 1 ? e->next_nums : e->next_strs);
-  size_t q = (size_t) e->ext_names_off;
-  for (int i = 0; i < total && q < (size_t) e->ext_strtab_len; i++)
+  size_t names_base = (size_t) e->ext_names_off;
+  for (int i = 0; i < want_count; i++)
     {
+      int name_off = bt_s16 (e->ext_nameidx + (size_t) (want_start + i) * 2);
+      if (name_off < 0 || (size_t) name_off >= (size_t) e->ext_strtab_len - names_base)
+        continue;
+      size_t q = names_base + (size_t) name_off;
       const char *s = (const char *) e->ext_strtab + q;
       size_t n = strnlen (s, (size_t) e->ext_strtab_len - q);
-      if (q + n >= (size_t) e->ext_strtab_len) break;
-      if (i >= want_start && i < want_start + want_count && strcmp (s, name) == 0)
-        return i - want_start;
-      q += n + 1;
+      if (q + n < (size_t) e->ext_strtab_len && strcmp (s, name) == 0)
+        return i;
     }
   return -1;
 }

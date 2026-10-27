@@ -1,0 +1,50 @@
+--- builtins/pathchk.c
++++ builtins/pathchk.c
+@@ -101,7 +101,7 @@
+ int
+ pathchk_builtin (WORD_LIST *list)
+ {
+-  int retval, pflag, opt;
++  int retval, pflag = 0, opt;
+
+   reset_internal_getopt ();
+   while ((opt = internal_getopt (list, "p")) != -1)
+@@ -114,7 +114,7 @@
+ 	CASE_HELPOPT;
+ 	default:
+ 	  builtin_usage ();
+-	  return (EX_USAGE);
++	  return (EXECUTION_FAILURE);
+ 	}
+     }
+   list = loptend;
+@@ -122,7 +122,7 @@
+   if (list == 0)
+     {
+       builtin_usage ();
+-      return (EX_USAGE);
++      return (EXECUTION_FAILURE);
+     }
+
+   for (retval = 0; list; list = list->next)
+@@ -282,7 +282,10 @@
+     return 1;
+
+   if (*path == '\0')
+-    return 0;
++    {
++      builtin_error ("empty file name");
++      return 1;
++    }
+
+ #ifdef lint
+   /* Suppress `used before initialized' warning.  */
+@@ -362,7 +365,7 @@
+   if (path_max < 0)
+     path_max = _POSIX_PATH_MAX;
+   free (parent);
+-  if (strlen (path) > path_max)
++  if (strlen (path) >= path_max)
+     {
+       builtin_error ("path `%s' has length %lu; exceeds limit of %d",
+ 	     path, (unsigned long)strlen (path), path_max);

@@ -134,13 +134,13 @@ int strings_builtin(WORD_LIST *list) {
             if (!list->next) {
                 builtin_error("%s requires o, d, or x", w);
                 builtin_usage();
-                return EX_USAGE;
+                return EXECUTION_FAILURE;
             }
             radix = parse_radix(list->next->word->word);
             if (radix < 0) {
                 builtin_error("invalid radix: %s", list->next->word->word);
                 builtin_usage();
-                return EX_USAGE;
+                return EXECUTION_FAILURE;
             }
             list = list->next->next; continue;
         }
@@ -149,7 +149,7 @@ int strings_builtin(WORD_LIST *list) {
             if (radix < 0) {
                 builtin_error("invalid radix: %s", w + 2);
                 builtin_usage();
-                return EX_USAGE;
+                return EXECUTION_FAILURE;
             }
             list = list->next; continue;
         }
@@ -158,7 +158,7 @@ int strings_builtin(WORD_LIST *list) {
             if (radix < 0) {
                 builtin_error("invalid radix: %s", w + 8);
                 builtin_usage();
-                return EX_USAGE;
+                return EXECUTION_FAILURE;
             }
             list = list->next; continue;
         }
@@ -167,12 +167,12 @@ int strings_builtin(WORD_LIST *list) {
             if (!list->next) {
                 builtin_error("-n requires a length");
                 builtin_usage();
-                return EX_USAGE;
+                return EXECUTION_FAILURE;
             }
             if (parse_min_length(list->next->word->word, &min) < 0) {
                 builtin_error("invalid minimum string length: %s", list->next->word->word);
                 builtin_usage();
-                return EX_USAGE;
+                return EXECUTION_FAILURE;
             }
             list = list->next->next; continue;
         }
@@ -180,7 +180,7 @@ int strings_builtin(WORD_LIST *list) {
             if (parse_min_length(w + 2, &min) < 0) {
                 builtin_error("invalid minimum string length: %s", w + 2);
                 builtin_usage();
-                return EX_USAGE;
+                return EXECUTION_FAILURE;
             }
             list = list->next; continue;
         }
@@ -188,7 +188,7 @@ int strings_builtin(WORD_LIST *list) {
             if (parse_min_length(w + 8, &min) < 0) {
                 builtin_error("invalid minimum string length: %s", w + 8);
                 builtin_usage();
-                return EX_USAGE;
+                return EXECUTION_FAILURE;
             }
             list = list->next; continue;
         }
@@ -196,13 +196,13 @@ int strings_builtin(WORD_LIST *list) {
             if (parse_min_length(w + 1, &min) < 0) {
                 builtin_error("invalid minimum string length: %s", w + 1);
                 builtin_usage();
-                return EX_USAGE;
+                return EXECUTION_FAILURE;
             }
             list = list->next; continue;
         }
         builtin_error("unknown option: %s", w);
         builtin_usage();
-        return EX_USAGE;
+        return EXECUTION_FAILURE;
     }
     if (!list) {
         FILE *in = strings_open_stdin ();
@@ -216,7 +216,19 @@ int strings_builtin(WORD_LIST *list) {
     }
     for (; list; list = list->next) {
         FILE *f = fopen(list->word->word, "rb");
-        if (!f) { builtin_error("%s: %s", list->word->word, strerror(errno)); rc = EXECUTION_FAILURE; continue; }
+        if (!f) {
+            int error = errno;
+            const char *name = list->word->word;
+            if (error == ENOENT)
+                fprintf(stderr, "strings: '%s': No such file\n", name);
+            else if (error == ENOTDIR)
+                fprintf(stderr, "strings: Warning: could not locate '%s'.  reason: %s\n",
+                        name, strerror(error));
+            else
+                builtin_error("%s: %s", name, strerror(error));
+            rc = EXECUTION_FAILURE;
+            continue;
+        }
         if (strings_stream(f, min, list->word->word, print_fname, radix, incl_ws)) rc = EXECUTION_FAILURE;
         fclose(f);
     }

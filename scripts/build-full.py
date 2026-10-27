@@ -6,12 +6,14 @@ import subprocess
 import sys
 sys.dont_write_bytecode = True
 from workspace import ROOT, BUILD, prepare_cmake
+from release_version import release_metadata
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--profile', choices=['pure', 'full'], default='full')
     args = parser.parse_args()
+    release_metadata(ROOT)
     full = args.profile == 'full'
     build = BUILD / ('kernel-full' if full else 'kernel')
     libraries = []

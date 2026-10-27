@@ -36,6 +36,7 @@
 #include <sys/wait.h>
 
 #include "loadables.h"
+#include "child-wait.h"
 
 typedef struct bpl_res {
   const char *name;
@@ -485,23 +486,36 @@ bpl_spawn (const bpl_res *res, const char *spec, WORD_LIST *cmd)
       return EX_USAGE;
     }
 
+  bos_child_wait child_wait;
+  if (bos_child_wait_begin (&child_wait) < 0)
+    {
+      builtin_error ("SIGCHLD setup: %s", strerror (errno));
+      free (argv);
+      return EXECUTION_FAILURE;
+    }
+  maybe_make_export_env ();
+  fflush (stdout);
+  fflush (stderr);
   child = fork ();
   if (child < 0)
     {
       builtin_error ("fork: %s", strerror (errno));
+      bos_child_wait_end (&child_wait);
       free (argv);
       return EXECUTION_FAILURE;
     }
   if (child == 0)
     {
+      bos_child_wait_child (&child_wait);
       if (bpl_prlimit (0, res->resource, &newlim, NULL) < 0)
         {
           builtin_error ("set %s: %s", res->name, strerror (errno));
           _exit (126);
         }
       execvp (argv[0], argv);
-      builtin_error ("%s: %s", argv[0], strerror (errno));
-      _exit (errno == ENOENT ? 127 : 126);
+      int saved = errno;
+      builtin_error ("%s: %s", argv[0], strerror (saved));
+      _exit (saved == ENOENT ? 127 : 126);
     }
 
   free (argv);
@@ -509,9 +523,11 @@ bpl_spawn (const bpl_res *res, const char *spec, WORD_LIST *cmd)
     {
       if (errno == EINTR)
         continue;
+      bos_child_wait_end (&child_wait);
       builtin_error ("waitpid: %s", strerror (errno));
       return EXECUTION_FAILURE;
     }
+  bos_child_wait_end (&child_wait);
   if (WIFEXITED (status))
     return WEXITSTATUS (status);
   if (WIFSIGNALED (status))

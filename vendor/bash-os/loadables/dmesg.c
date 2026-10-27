@@ -57,6 +57,8 @@
 #include <time.h>
 #include <sys/syscall.h>
 #include <poll.h>
+#include <limits.h>
+#include <math.h>
 
 /* Userspace declarations of klogctl(3). musl ships <sys/klog.h>; we
    prefer the syscall wrapper to keep the header surface portable. */
@@ -90,7 +92,7 @@ static int
 bd_level_index (const char *tok)
 {
     if (!tok || !*tok) return -1;
-    if (isdigit ((unsigned char) tok[0]) && tok[1] == '\0')
+    if (tok[0] >= '0' && tok[0] <= '7' && tok[1] == '\0')
         return tok[0] - '0';
     for (int i = 0; i < 8; i++)
         if (!strcmp (tok, bd_level_names[i]))
@@ -137,7 +139,7 @@ bd_parse_level_mask (const char *spec)
         mask |= 1 << idx;
         t = strtok_r (NULL, ",", &save);
     }
-    return mask;
+    return mask ? mask : -1;
 }
 
 /* Parse comma-separated list of facility names/numbers into a bitmask
@@ -157,7 +159,7 @@ bd_parse_facility_mask (const char *spec)
         mask |= 1 << idx;
         t = strtok_r (NULL, ",", &save);
     }
-    return mask;
+    return mask ? mask : -1;
 }
 
 static int
@@ -168,9 +170,13 @@ bd_parse_seconds_us (const char *spec, unsigned long long *out)
     if (!spec || !*spec) return -1;
     errno = 0;
     v = strtod (spec, &end);
-    if (errno || !end || *end != '\0' || v < 0)
+    if (errno || end == spec || *end != '\0' || v < 0 || !isfinite (v))
         return -1;
-    *out = (unsigned long long) (v * 1000000.0);
+    double us = v * 1000000.0;
+    /* ULLONG_MAX rounds upward to 2^64 as a double on Linux. Reject that
+       boundary before a floating-to-integer conversion can overflow. */
+    if (!isfinite (us) || us >= (double) ULLONG_MAX) return -1;
+    *out = (unsigned long long) us;
     return 0;
 }
 
@@ -208,7 +214,23 @@ bd_parse_record (const char *line, unsigned int *pri,
 {
     const char *semi = strchr (line, ';');
     if (!semi) return -1;
-    if (sscanf (line, "%u,%llu,%llu", pri, seq, us) != 3) return -1;
+    unsigned long long fields[3];
+    const char *cursor = line;
+    for (int i = 0; i < 3; i++) {
+        if (*cursor < '0' || *cursor > '9') return -1;
+        char *end;
+        errno = 0;
+        fields[i] = strtoull (cursor, &end, 10);
+        if (errno || end > semi) return -1;
+        if (i < 2 && *end != ',') return -1;
+        if (i == 2 && *end != ',' && end != semi) return -1;
+        cursor = end + 1;
+    }
+    /* The ABI reserves three priority bits and eight facility bits. */
+    if (fields[0] > 2047) return -1;
+    *pri = (unsigned int) fields[0];
+    *seq = fields[1];
+    *us = fields[2];
     *text = semi + 1;
     return 0;
 }
@@ -223,11 +245,13 @@ bd_emit (unsigned int pri, unsigned long long us, const char *text,
     tbuf[0] = '\0';
     if (!no_ts) {
         if (human_ts) {
-            time_t when = boot_epoch + (time_t) (us / 1000000ULL);
+            time_t when;
             struct tm tm;
-            localtime_r (&when, &tm);
-            strftime (tbuf, sizeof tbuf, "[%a %b %e %H:%M:%S %Y] ", &tm);
-        } else {
+            if (!__builtin_add_overflow (boot_epoch, (time_t) (us / 1000000ULL), &when) &&
+                localtime_r (&when, &tm))
+                strftime (tbuf, sizeof tbuf, "[%a %b %e %H:%M:%S %Y] ", &tm);
+        }
+        if (!tbuf[0]) {
             unsigned long long secs = us / 1000000ULL;
             unsigned long long frac = us % 1000000ULL;
             snprintf (tbuf, sizeof tbuf, "[%5llu.%06llu] ", secs, frac);
@@ -268,7 +292,8 @@ bd_process_record (const char *record, int kernel_only, int facility_mask,
     (void) seq;
 
     if (kernel_only && BD_FACILITY (pri) != 0) return 0;
-    if (facility_mask && !((facility_mask >> BD_FACILITY (pri)) & 1)) return 0;
+    if (facility_mask && (BD_FACILITY (pri) >= 16 ||
+                          !((facility_mask >> BD_FACILITY (pri)) & 1))) return 0;
     if (level_mask && !((level_mask >> BD_LEVEL (pri)) & 1)) return 0;
     if (have_since && us < since_us) return 0;
     if (have_until && us > until_us) return 0;
@@ -287,6 +312,8 @@ bd_drain (int fd, int kernel_only, int facility_mask, int level_mask,
 {
     char buf[8193];   /* kernel CONSOLE_EXT_LOG_MAX + 1 */
     int fixture_file = getenv ("BASHDMESG_DEV_KMSG_FILE") != NULL;
+    char *pending = NULL;
+    size_t pending_len = 0;
     for (;;) {
         ssize_t n = read (fd, buf, sizeof buf - 1);
         if (n < 0) {
@@ -296,23 +323,52 @@ bd_drain (int fd, int kernel_only, int facility_mask, int level_mask,
             if (errno == EPIPE) continue;
             if (errno == EINTR) continue;
             builtin_error ("read %s: %s", bd_kmsg_path (), strerror (errno));
+            free (pending);
             return EXECUTION_FAILURE;
         }
-        if (n == 0) break;     /* EOF on a fixture */
+        if (n == 0) {
+            if (pending_len) {
+                pending[pending_len] = '\0';
+                *emitted += bd_process_record (pending, kernel_only,
+                                               facility_mask, level_mask,
+                                               raw, no_ts, human_ts,
+                                               boot_epoch, have_since,
+                                               since_us, have_until, until_us);
+            }
+            break;
+        }
         buf[n] = '\0';
 
         if (fixture_file) {
-            char *save = NULL;
-            char *line = strtok_r (buf, "\n", &save);
-            while (line) {
+            size_t need = pending_len + (size_t)n + 1;
+            char *grown = realloc (pending, need);
+            if (!grown) {
+                builtin_error ("out of memory reading %s", bd_kmsg_path ());
+                free (pending);
+                return EXECUTION_FAILURE;
+            }
+            pending = grown;
+            memcpy (pending + pending_len, buf, (size_t)n);
+            pending_len += (size_t)n;
+            pending[pending_len] = '\0';
+
+            char *line = pending;
+            char *nl;
+            while ((nl = memchr (line, '\n',
+                                 pending_len - (size_t)(line - pending))) != NULL) {
+                *nl = '\0';
                 *emitted += bd_process_record (line, kernel_only,
                                                facility_mask, level_mask,
                                                raw, no_ts, human_ts,
                                                boot_epoch, have_since,
                                                since_us, have_until,
                                                until_us);
-                line = strtok_r (NULL, "\n", &save);
+                line = nl + 1;
             }
+            pending_len -= (size_t)(line - pending);
+            if (pending_len)
+                memmove (pending, line, pending_len);
+            pending[pending_len] = '\0';
         } else {
             *emitted += bd_process_record (buf, kernel_only, facility_mask,
                                            level_mask, raw, no_ts, human_ts,
@@ -320,6 +376,7 @@ bd_drain (int fd, int kernel_only, int facility_mask, int level_mask,
                                            have_until, until_us);
         }
     }
+    free (pending);
     return EXECUTION_SUCCESS;
 }
 

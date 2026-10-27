@@ -2149,7 +2149,14 @@ bs_attach_broker (const char *sdir, int observer)
             }
         } else if (fds[1].revents & (POLLERR | POLLHUP | POLLNVAL)) {
             if (observer) stdin_open = 0;
-            else break;
+            else {
+                /* A drained pipe reports HUP without POLLIN. Preserve the
+                 * literal prefix just as the read(0) EOF path above does. */
+                if ((fds[1].revents & POLLHUP) && pending &&
+                    pb_send (root, id, &prefix, 1) < 0)
+                    result = BSCREEN_RELAY_ERROR;
+                break;
+            }
         }
     }
 done:

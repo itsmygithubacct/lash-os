@@ -553,7 +553,7 @@ watch_builtin (WORD_LIST *list)
         {
         case 'n':
           if (bw_parse_interval (list_optarg, &interval, "-n") < 0)
-            BW_CLEANUP_AND_RETURN (EX_USAGE);
+            BW_CLEANUP_AND_RETURN (EXECUTION_FAILURE);
           break;
         case 'x':
           exec_form = 1;
@@ -595,7 +595,7 @@ watch_builtin (WORD_LIST *list)
         CASE_HELPOPT;
         default:
           builtin_usage ();
-          BW_CLEANUP_AND_RETURN (EX_USAGE);
+          BW_CLEANUP_AND_RETURN (EXECUTION_FAILURE);
         }
     }
   list = loptend;
@@ -603,7 +603,7 @@ watch_builtin (WORD_LIST *list)
   if (!list)
     {
       builtin_error ("usage: watch [-n SEC] [-x] [-b] [-e] [-g] [-d] [-t|--no-title] [-p|--precise] [-C FILE] CMD [ARGS...]");
-      BW_CLEANUP_AND_RETURN (EX_USAGE);
+      BW_CLEANUP_AND_RETURN (EXECUTION_FAILURE);
     }
 
   int argc = 0;

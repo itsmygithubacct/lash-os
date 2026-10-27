@@ -1,11 +1,11 @@
 # Source distribution and rebuilding
 
-The [0.1.2 release](https://github.com/itsmygithubacct/lash-os/releases/tag/v0.1.2)
+The [0.1.2.1 release](https://github.com/itsmygithubacct/lash-os/releases/tag/v0.1.2.1)
 provides two source archives next to the portable executables:
 
-- `lashos-0.1.2-source.tar.zst`: the project at the release commit, including its
+- `lashos-0.1.2.1-source.tar.zst`: the project at the release commit, including its
   vendored source, licenses, patches, configuration and build scripts.
-- `lashos-0.1.2-dependency-sources.tar.zst`: exact upstream Bash archives and
+- `lashos-0.1.2.1-dependency-sources.tar.zst`: exact upstream Bash archives and
   patches, guest libraries, Linux, 75 Debian source packages, and the Nix source
   inputs and evaluated recipes used by the three portable builds.
 
@@ -25,10 +25,10 @@ needs the KVM and Landlock requirements described in [README.md](../README.md).
 
 ```sh
 sha256sum --check --ignore-missing SHA256SUMS
-tar --zstd -xf lashos-0.1.2-source.tar.zst
-tar --zstd -xf lashos-0.1.2-dependency-sources.tar.zst
-cd lashos-0.1.2
-export LASHOS_DOWNLOADS_DIR="$(cd ../lashos-0.1.2-dependency-sources/downloads && pwd)"
+tar --zstd -xf lashos-0.1.2.1-source.tar.zst
+tar --zstd -xf lashos-0.1.2.1-dependency-sources.tar.zst
+cd lashos-0.1.2.1
+export LASHOS_DOWNLOADS_DIR="$(cd ../lashos-0.1.2.1-dependency-sources/downloads && pwd)"
 make portable-all
 make paths
 ```
@@ -90,4 +90,4 @@ source versions through signed Debian APT metadata in an isolated workspace.
 Normal downloads verify every file against the checked-in SHA256 and size.
 The source packager verifies the Nix store inputs and refuses a dirty project
 checkout when making the project archive. Outputs go under
-`out/releases/0.1.2/` in the external workspace.
+`out/releases/0.1.2.1/` in the external workspace.

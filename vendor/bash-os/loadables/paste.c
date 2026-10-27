@@ -26,6 +26,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <limits.h>
+#include <sys/stat.h>
 
 #include "loadables.h"
 #include "bl-output.h"
@@ -35,6 +37,68 @@ typedef struct {
     size_t *lens;
     size_t count;
 } bp_delims;
+
+typedef struct {
+    char *data;
+    size_t pos, len;
+} bp_block;
+
+/* A record wholly inside a regular-file block can be consumed in place.
+   Only records crossing block boundaries need a separate line allocation.
+   Pipes and shared stdin keep getdelim's existing incremental behavior. */
+static ssize_t
+bp_read_record (FILE *f, bp_block *block, char **line, size_t *cap,
+                unsigned char delim, char **record)
+{
+    if (!block->data) {
+        ssize_t n = getdelim (line, cap, delim, f);
+        *record = *line;
+        return n;
+    }
+    size_t copied = 0;
+    for (;;) {
+        if (block->pos == block->len) {
+            if (feof (f) || ferror (f)) {
+                *record = *line;
+                return copied ? (ssize_t) copied : -1;
+            }
+            block->len = fread (block->data, 1, 65536, f);
+            block->pos = 0;
+            if (!block->len) {
+                *record = *line;
+                return copied ? (ssize_t) copied : -1;
+            }
+        }
+        char *start = block->data + block->pos;
+        char *end = memchr (start, delim, block->len - block->pos);
+        size_t n = end ? (size_t) (end - start) + 1 : block->len - block->pos;
+        if (!copied && end) {
+            *record = start;
+            block->pos += n;
+            return (ssize_t) n;
+        }
+        if (n > (size_t) SSIZE_MAX - copied) {
+            errno = EOVERFLOW;
+            return -1;
+        }
+        size_t need = copied + n;
+        if (need > *cap) {
+            size_t nc = *cap > (size_t) SSIZE_MAX / 2 ? (size_t) SSIZE_MAX : *cap * 2;
+            if (nc < need) nc = need;
+            char *next = realloc (*line, nc);
+            if (!next) return -1;
+            *line = next;
+            *cap = nc;
+        }
+        memcpy (*line + copied, start, n);
+        copied += n;
+        block->pos += n;
+        if (end) {
+            *record = *line;
+            return (ssize_t) copied;
+        }
+    }
+}
 
 /* Expand POSIX/GNU backslash escapes in delim string.  The \0 escape is an
    empty delimiter, so lengths are tracked separately from the byte buffer.
@@ -149,7 +213,7 @@ paste_builtin (WORD_LIST *list)
             if (!list->next) {
                 builtin_error ("--delimiters needs DELIM");
                 builtin_usage ();
-                return EX_USAGE;
+                return EXECUTION_FAILURE;
             }
             list = list->next;
             delim_arg = list->word->word;
@@ -171,7 +235,7 @@ paste_builtin (WORD_LIST *list)
                         if (!list->next) {
                             builtin_error ("-d needs DELIM");
                             builtin_usage ();
-                            return EX_USAGE;
+                            return EXECUTION_FAILURE;
                         }
                         list = list->next;
                         arg = list->word->word;
@@ -181,7 +245,7 @@ paste_builtin (WORD_LIST *list)
                 } else {
                     builtin_error ("unknown flag: %s", w);
                     builtin_usage ();
-                    return EX_USAGE;
+                    return EXECUTION_FAILURE;
                 }
             }
             list = list->next;
@@ -189,15 +253,14 @@ paste_builtin (WORD_LIST *list)
         }
         builtin_error ("unknown flag: %s", w);
         builtin_usage ();
-        return EX_USAGE;
+        return EXECUTION_FAILURE;
     }
 
     bp_delims delims = {0};
     int de = bp_expand_delim (delim_arg, &delims);
     if (de < 0) return EXECUTION_FAILURE;
     if (de > 0) {
-        /* Match GNU paste's diagnostic and its exit status of 1 (not the
-           EX_USAGE/2 used for our own flag-parsing errors above). */
+        /* Match GNU paste's diagnostic and failure status. */
         builtin_error ("delimiter list ends with an unescaped backslash: %s", delim_arg);
         bp_free_delims (&delims);
         return EXECUTION_FAILURE;
@@ -261,8 +324,11 @@ paste_builtin (WORD_LIST *list)
         int *is_stdin = calloc ((size_t) n_files, sizeof *is_stdin);
         if (!files || !is_stdin) { free (files); free (is_stdin); bp_free_delims (&delims); return EXECUTION_FAILURE; }
         char **lines = NULL;
+        char **records = NULL;
         size_t *caps = NULL;
         size_t *lens = NULL;
+        bp_block *blocks = calloc ((size_t) n_files, sizeof *blocks);
+        if (!blocks) { free (files); free (is_stdin); bp_free_delims (&delims); return EXECUTION_FAILURE; }
         int i = 0;
         for (WORD_LIST *p = list; i < n_files; i++) {
             const char *name = p ? p->word->word : "-";
@@ -270,15 +336,22 @@ paste_builtin (WORD_LIST *list)
             if (!files[i]) {
                 builtin_error ("%s: %s", name, strerror (errno));
                 rc = EXECUTION_FAILURE;
+            } else if (!is_stdin[i]) {
+                struct stat st;
+                if (fstat (fileno (files[i]), &st) == 0 && S_ISREG (st.st_mode)) {
+                    blocks[i].data = malloc (65536);
+                    if (!blocks[i].data) rc = EXECUTION_FAILURE;
+                }
             }
             if (p) p = p->next;
         }
         if (rc != EXECUTION_SUCCESS)
             goto parallel_done;
         lines = calloc ((size_t) n_files, sizeof *lines);
+        records = calloc ((size_t) n_files, sizeof *records);
         caps = calloc ((size_t) n_files, sizeof *caps);
         lens = calloc ((size_t) n_files, sizeof *lens);
-        if (!lines || !caps || !lens) {
+        if (!lines || !records || !caps || !lens) {
             rc = EXECUTION_FAILURE;
             goto parallel_done;
         }
@@ -286,14 +359,18 @@ paste_builtin (WORD_LIST *list)
             int any = 0;
             for (i = 0; i < n_files; i++) {
                 if (!files[i]) { lens[i] = 0; continue; }
-                ssize_t rd = getdelim (&lines[i], &caps[i], line_delim, files[i]);
+                errno = 0;
+                ssize_t rd = bp_read_record (files[i], &blocks[i], &lines[i], &caps[i],
+                                            line_delim, &records[i]);
                 if (rd == -1) {
-                    if (ferror (files[i])) { builtin_error ("read error: %s", strerror (errno)); rc = EXECUTION_FAILURE; }
+                    if (ferror (files[i]) || errno) {
+                        builtin_error ("read error: %s", strerror (errno)); rc = EXECUTION_FAILURE;
+                    }
                     bp_close_input (files[i], is_stdin[i]); files[i] = NULL;
                     lens[i] = 0;
                 } else {
                     size_t len = (size_t) rd;
-                    if (len > 0 && (unsigned char) lines[i][len - 1] == line_delim) len--;
+                    if (len > 0 && (unsigned char) records[i][len - 1] == line_delim) len--;
                     lens[i] = len;
                     any = 1;
                 }
@@ -302,16 +379,17 @@ paste_builtin (WORD_LIST *list)
             size_t dpos = 0, doff = 0;
             for (i = 0; i < n_files; i++) {
                 if (i > 0) bp_write_delim (&output, &delims, &dpos, &doff);
-                if (lines[i] && lens[i]) bl_output_write (&output, lines[i], lens[i]);
+                if (records[i] && lens[i]) bl_output_write (&output, records[i], lens[i]);
             }
             bl_output_byte (&output, line_delim);
         }
 parallel_done:
         for (i = 0; i < n_files; i++) {
             if (lines) free (lines[i]);
+            free (blocks[i].data);
             if (files[i]) bp_close_input (files[i], is_stdin[i]);
         }
-        free (lines); free (caps); free (lens); free (files); free (is_stdin);
+        free (blocks); free (records); free (lines); free (caps); free (lens); free (files); free (is_stdin);
     }
     bl_output_flush (&output);
     if (output.error) { builtin_error ("write error: %s", strerror (output.error)); rc = EXECUTION_FAILURE; }
@@ -347,6 +425,6 @@ struct builtin paste_struct = {
     paste_builtin,
     BUILTIN_ENABLED,
     paste_doc,
-    "bashpaste [-s] [-z] [-d DELIM] [FILE...]",
+    "paste [-s] [-z] [-d DELIM] [FILE...]",
     0
 };

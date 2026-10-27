@@ -15,13 +15,14 @@
  *
  * Dialects: the default is BRE as in GNU grep (\( \) \| \+ \? \{ \} are
  * operators, ( ) | + ? { } are literal), -E is ERE, -F fixed strings, -P
- * PCRE2 when built with BASHGREP_PCRE2=1. The rules GNU grep applies on top
+ * PCRE2 (libpcre2-8 >= 10.34). The rules GNU grep applies on top
  * of the regex engine are reproduced from grep 3.11: -w retries a shorter
  * match at the same place and then the next start; -x is a match spanning
  * the line; -m keeps printing trailing context; a NUL makes a file binary
  * (NULs then separate lines, output goes quiet, "binary file matches" goes
  * to stderr), and a printed line that is not valid in the locale's
- * encoding does the same; stdin is left positioned just after the last
+ * encoding is withheld while later lines still print, followed by the same
+ * message; stdin is left positioned just after the last
  * match for -m, or at its end when grep stopped early. tests/grep-parity.sh
  * holds the output to GNU's.
  *
@@ -54,24 +55,11 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 
-#ifndef BASHGREP_PCRE2
-#define BASHGREP_PCRE2 0   /* set 1 to enable `grep -P`; needs libpcre2. Off: POSIX regex only. */
-#endif
-#if BASHGREP_PCRE2
+/* Required by the grep build selection, including static/cross builds. */
 #define PCRE2_CODE_UNIT_WIDTH 8
 #include <pcre2.h>
-#else
-/* No PCRE2 in this build. Stub the opaque types and the few functions used
-   outside the (guarded) helper block; -P then fails cleanly at run time. */
-typedef void pcre2_code;
-typedef void pcre2_match_data;
-typedef void pcre2_match_context;
-#ifndef PCRE2_NOTBOL
-#define PCRE2_NOTBOL 0u
-#endif
-#define pcre2_match_data_create_from_pattern(a,b) ((pcre2_match_data *)0)
-#define pcre2_code_free(a)        ((void)0)
-#define pcre2_match_data_free(a)  ((void)0)
+#if PCRE2_MAJOR < 10 || (PCRE2_MAJOR == 10 && PCRE2_MINOR < 34)
+#error "grep requires PCRE2 >= 10.34 (invalid UTF subject support)"
 #endif
 
 #include "loadables.h"
@@ -125,6 +113,8 @@ typedef struct {
     regex_t *re_ns;                 /* the same with REG_NOSUB: a faster yes or no (NULL: none) */
     char *combined;                 /* the combined pattern text, freed at the end */
     pcre2_code *pcre; pcre2_match_data *pcre_md;
+    pcre2_match_context *pcre_ctx;
+    int pcre_utf;                  /* effective mode, including (*UTF) */
     size_t *kw_blk, *kw_line;       /* needle caches: the block scan, the line scan */
     char *ob; size_t on;            /* the output buffer: bash line-buffers stdout, a write per line */
 } bg_opts;
@@ -149,17 +139,11 @@ bg_parse_count (const char *s, int *out)
 
 /* ---------------------------------------------------------------- PCRE2 --- */
 
-#if BASHGREP_PCRE2
 static pcre2_match_context *
 bg_pcre_match_ctx (void)
 {
-    static pcre2_match_context *ctx = NULL;
-    if (!ctx)
-    {
-        ctx = pcre2_match_context_create (NULL);
-        if (!ctx)
-            return NULL;
-    }
+    pcre2_match_context *ctx = pcre2_match_context_create (NULL);
+    if (!ctx) return NULL;
     uint32_t mlim = BG_PCRE_DEFAULT_MATCH_LIMIT;
     uint32_t dlim = BG_PCRE_DEFAULT_DEPTH_LIMIT;
     const char *e;
@@ -179,17 +163,34 @@ bg_pcre_match_ctx (void)
 }
 
 static pcre2_code *
-bg_pcre_compile (const char *pattern, int iflag)
+bg_pcre_compile (const char *pattern, size_t length, bg_opts *o)
 {
-    uint32_t flags = PCRE2_UTF | PCRE2_UCP;
-    if (iflag)
+    /* GNU grep keeps \d/\w/\s ASCII unless the pattern requests UCP.
+       Invalid UTF bytes are barriers, not fatal subject errors. */
+    uint32_t flags = PCRE2_DOLLAR_ENDONLY;
+    if (o->mb) flags |= PCRE2_UTF | PCRE2_MATCH_INVALID_UTF;
+    if (o->iflag)
         flags |= PCRE2_CASELESS;
 
     int errcode;
     PCRE2_SIZE erroffset;
     pcre2_code *code = pcre2_compile ((PCRE2_SPTR) pattern,
-                                      PCRE2_ZERO_TERMINATED,
+                                      length,
                                       flags, &errcode, &erroffset, NULL);
+    if (code) {
+        uint32_t effective;
+        pcre2_pattern_info (code, PCRE2_INFO_ALLOPTIONS, &effective);
+        o->pcre_utf = !!(effective & PCRE2_UTF);
+        /* A leading (*UTF) can enable UTF in the C locale too. Enabling
+           invalid-subject support unconditionally would force byte patterns
+           into UTF mode, so recompile only when the pattern requested it. */
+        if ((effective & PCRE2_UTF) && !(flags & PCRE2_MATCH_INVALID_UTF)) {
+            pcre2_code_free (code);
+            code = pcre2_compile ((PCRE2_SPTR) pattern, length,
+                                  flags | PCRE2_MATCH_INVALID_UTF,
+                                  &errcode, &erroffset, NULL);
+        }
+    }
     if (!code)
     {
         char buf[256];
@@ -204,8 +205,13 @@ static int
 bg_pcre_exec (const bg_opts *o, const char *line, size_t llen,
               size_t start, uint32_t match_opts, regmatch_t *m)
 {
-    int rc = pcre2_match (o->pcre, (PCRE2_SPTR) line, llen, start,
-                          match_opts, o->pcre_md, bg_pcre_match_ctx ());
+    /* Keep GNU's invalid starting-offset error even though
+       MATCH_INVALID_UTF otherwise accepts continuation-byte offsets. */
+    int rc = o->pcre_utf && start && start < llen
+             && ((unsigned char) line[start] & 0xC0) == 0x80
+        ? PCRE2_ERROR_BADUTFOFFSET
+        : pcre2_match (o->pcre, (PCRE2_SPTR) line, llen, start,
+                        match_opts, o->pcre_md, o->pcre_ctx);
     if (rc == PCRE2_ERROR_NOMATCH)
         return 0;
     if (rc < 0)
@@ -220,23 +226,6 @@ bg_pcre_exec (const bg_opts *o, const char *line, size_t llen,
     m->rm_eo = (regoff_t) ovec[1];
     return 1;
 }
-#else /* !BASHGREP_PCRE2 : POSIX-only build */
-static pcre2_code *
-bg_pcre_compile (const char *pattern, int iflag)
-{
-    (void) pattern; (void) iflag;
-    builtin_error ("grep: -P (Perl regex) not supported in this build");
-    return (pcre2_code *) 0;
-}
-static int
-bg_pcre_exec (const bg_opts *o, const char *line, size_t llen,
-              size_t start, uint32_t match_opts, regmatch_t *m)
-{
-    (void) o; (void) line; (void) llen; (void) start; (void) match_opts; (void) m;
-    return -1;
-}
-#endif /* BASHGREP_PCRE2 */
-
 /* ------------------------------------------------------- byte helpers --- */
 
 static long
@@ -916,10 +905,11 @@ bg_match_line (const bg_opts *o, char *line, size_t llen, size_t start, regmatch
         return bg_fixed_line (o, line, llen, start, m);
     if (o->mode == BG_PCRE)
     {
-        int prc = bg_pcre_exec (o, line, llen, start, start ? PCRE2_NOTBOL : 0, m);
-        if (prc <= 0) return prc;
-        if (o->xflag && (m->rm_so != 0 || (size_t) m->rm_eo != llen)) return 0;
-        return 1;
+        /* Anchoring the engine lets alternatives backtrack to the whole
+           record, preserves capture numbering, leading verbs and \K. */
+        if (o->xflag && start) return 0;
+        uint32_t flags = o->xflag ? PCRE2_ANCHORED | PCRE2_ENDANCHORED : 0;
+        return bg_pcre_exec (o, line, llen, start, flags, m);
     }
     if (!bg_re_search (o, line, llen, start, llen, 0, m)) return 0;
     if (o->xflag) return m->rm_so == 0 && (size_t) m->rm_eo == llen;
@@ -1217,16 +1207,11 @@ bg_prefix (bg_state *st, size_t ls, off_t boff, int sep)
     if (o->bflag) { bg_out_num (o, (long long) boff); bg_outc (o, sep); }
 }
 
-/* Output switches off: a printed line was not valid in the locale (GNU
-   then reports the file as binary and stops at this match). */
-static void
-bg_go_quiet (bg_state *st)
-{
-    st->enc_err = 1; st->quiet = 1; st->done_on_match = 1; st->pending = 0;
-}
-
 /* Print the line [LS, LE) with SEP (':' selected, '-' context). MATCHING
-   says whether it matches the pattern: with -o only its matches print. */
+   says whether it matches the pattern: with -o only its matches print.
+   Output that is not valid in the locale is withheld, as GNU grep 3.11
+   does: that line (or the rest of its -o matches) is skipped, later lines
+   still print, and the file is reported as binary at the end. */
 static void
 bg_emit (bg_state *st, size_t ls, size_t le, int sep, int matching)
 {
@@ -1244,9 +1229,15 @@ bg_emit (bg_state *st, size_t ls, size_t le, int sep, int matching)
                 int r = bg_match_line (o, line, llen, pos, &m);
                 if (r < 0) { st->err = 1; break; }
                 if (!r) break;
-                if (m.rm_eo == m.rm_so) { pos = (size_t) m.rm_so + 1; continue; }
+                if (m.rm_eo == m.rm_so)
+                {
+                    pos = (size_t) m.rm_so + 1;
+                    if (o->mode == BG_PCRE && o->mb)
+                        while (pos < llen && ((unsigned char) line[pos] & 0xC0) == 0x80) pos++;
+                    continue;
+                }
                 if (!o->aflag && bg_encoding_error (o, line + m.rm_so, (size_t) (m.rm_eo - m.rm_so)))
-                { bg_go_quiet (st); return; }
+                { st->enc_err = 1; return; }
                 bg_prefix (st, ls, base + m.rm_so, sep);
                 bg_out (o, line + m.rm_so, (size_t) (m.rm_eo - m.rm_so));
                 bg_outc (o, o->delim);
@@ -1256,7 +1247,7 @@ bg_emit (bg_state *st, size_t ls, size_t le, int sep, int matching)
     }
     else
     {
-        if (!o->aflag && bg_encoding_error (o, line, llen)) { bg_go_quiet (st); return; }
+        if (!o->aflag && bg_encoding_error (o, line, llen)) { st->enc_err = 1; return; }
         bg_prefix (st, ls, base, sep);
         bg_out (o, line, llen);
         bg_outc (o, o->delim);
@@ -1333,6 +1324,40 @@ bg_range_nomatch (bg_state *st, size_t end)
     st->pos = end;
 }
 
+/* The common unadorned single-literal search needs no per-line option,
+   prefix, or context bookkeeping. Work over complete windows and coalesce
+   adjacent selected lines before copying them to the output buffer. Binary
+   windows and multibyte encoding errors retain the general path below. */
+static void
+bg_fixed_window (bg_state *st)
+{
+    bg_opts *o = st->o;
+    char *buf = st->in.buf;
+    size_t pos = st->pos, begin = 0, end = 0;
+    while (pos < st->lim)
+    {
+        size_t at = bg_memfind (o, buf, st->lim, pos, &o->needles[0]);
+        if (at == BG_NOHIT) break;
+        char *e = memchr (buf + at, o->delim, st->lim - at);
+        size_t next = (size_t) (e - buf) + 1;
+        st->count++;
+        if (!o->cflag)
+        {
+            char *b = at > pos ? memrchr (buf + pos, o->delim, at - pos) : NULL;
+            size_t first = b ? (size_t) (b - buf) + 1 : pos;
+            if (first != end)
+            {
+                if (end > begin) bg_out (o, buf + begin, end - begin);
+                begin = first;
+            }
+            end = next;
+        }
+        pos = next;
+    }
+    if (end > begin) bg_out (o, buf + begin, end - begin);
+    st->pos = st->lim;
+}
+
 /* ------------------------------------------------------------- one file --- */
 
 static void
@@ -1353,6 +1378,7 @@ bg_grep_file (bg_opts *o, const char *path, int n_files, int from_recursion)
     st.name = is_stdin ? "(standard input)" : path;
     st.prefix = o->Hflag || (!o->hflag && (n_files > 1 || from_recursion));
     int fd = is_stdin ? 0 : open (path, O_RDONLY);
+    off_t stdin_start = is_stdin ? lseek (0, 0, SEEK_CUR) : -1;
     if (fd < 0) { bg_file_error (o, path, errno); return -1; }
     struct stat sb;
     if (fstat (fd, &sb) == 0 && S_ISDIR (sb.st_mode))
@@ -1373,6 +1399,11 @@ bg_grep_file (bg_opts *o, const char *path, int n_files, int from_recursion)
     st.done_on_match = o->lflag || o->Lflag || o->qflag;
     st.quiet = o->cflag || st.done_on_match;
     st.printmode = !st.quiet;
+    int simple_fixed = o->mode == BG_FIXED && o->n_needles == 1
+        && o->needles[0].n > 0 && !o->fold && !o->wrap_l && !o->wrap_r
+        && !o->wflag && !o->xflag && !o->vflag && !o->ctx && !o->mflag_set
+        && !st.done_on_match && !o->oflag && !o->nflag && !o->bflag
+        && (o->cflag || !st.prefix);
 
     for (;;)
     {
@@ -1387,6 +1418,13 @@ bg_grep_file (bg_opts *o, const char *path, int n_files, int from_recursion)
                 break;
             }
             if (r == 0) break;
+        }
+        if (simple_fixed && !st.binary
+            && (o->cflag || o->aflag
+                || !bg_encoding_error (o, st.in.buf + st.pos, st.lim - st.pos)))
+        {
+            bg_fixed_window (&st);
+            continue;
         }
         if (st.outleft == 0)
         {
@@ -1420,9 +1458,17 @@ bg_grep_file (bg_opts *o, const char *path, int n_files, int from_recursion)
 
     if (is_stdin)
     {
-        /* as GNU: stdin is left just after the last match for -m, and at its
-           end when grep stopped early, so the caller reads on from there */
-        if (st.outleft == 0) lseek (0, st.after_last, SEEK_SET);
+        /* As GNU: -m restores the offset after the last selection relative
+           to this invocation, even after -A read farther. Other early stops
+           consume seekable stdin. Nonseekable input keeps its read-ahead. */
+        if (st.outleft == 0 && stdin_start >= 0)
+        {
+            off_t target = stdin_start + st.after_last;
+            off_t read_end = lseek (0, 0, SEEK_CUR);
+            /* The final unterminated record has a synthetic delimiter. */
+            if (target > read_end) target = read_end;
+            lseek (0, target, SEEK_SET);
+        }
         else if (!st.in.eof) lseek (0, 0, SEEK_END);
     }
     else
@@ -1560,13 +1606,17 @@ bg_add_pattern_file (bg_opts *o, const char *path)
     if (!pf) return -1;
     char *line = NULL; size_t cap = 0; ssize_t rd;
     int rc = 0;
+    if (pf == stdin) clearerr (stdin);
     while ((rd = getline (&line, &cap, pf)) != -1)
     {
         if (rd > 0 && line[rd - 1] == '\n') rd--;
         if (bg_add_arm (o, line, (size_t) rd) < 0) { rc = -1; break; }
     }
+    if (ferror (pf)) rc = -1;
+    int saved_errno = errno;
     free (line);
     if (pf != stdin) fclose (pf);
+    errno = saved_errno;
     return rc;
 }
 
@@ -1673,27 +1723,34 @@ bg_setup (bg_opts *o)
 
     if (o->Pflag)
     {
-        size_t total = 3;
-        for (int i = 0; i < o->n_arms; i++) total += o->arms[i].n + 6;
-        char *s = malloc (total);
-        if (!s) return -1;
-        size_t k = 0;
-        if (o->xflag) { s[k++] = '^'; s[k++] = '('; }
-        for (int i = 0; i < o->n_arms; i++)
+        if (o->n_arms != 1)
         {
-            if (i) s[k++] = '|';
-            memcpy (s + k, "(?:", 3); k += 3;
-            memcpy (s + k, o->arms[i].s, o->arms[i].n); k += o->arms[i].n;
-            s[k++] = ')';
+            builtin_error ("the -P option only supports a single pattern");
+            return -1;
         }
-        if (o->xflag) { s[k++] = ')'; s[k++] = '$'; }
-        s[k] = '\0';
-        o->combined = s;
+        const char *pattern = o->arms[0].s;
+        size_t length = o->arms[0].n;
+        /* The lookarounds allow punctuation-only matches too (\b would
+           reject them), and let PCRE retry alternatives at the same start. */
+        if (o->wflag)
+        {
+            const char *left = "(?<!\\w)(?:", *right = ")(?!\\w)";
+            size_t l = strlen (left), r = strlen (right);
+            char *wrapped = malloc (l + length + r + 1);
+            if (!wrapped) return -1;
+            memcpy (wrapped, left, l);
+            memcpy (wrapped + l, pattern, length);
+            memcpy (wrapped + l + length, right, r + 1);
+            pattern = o->combined = wrapped;
+            length += l + r;
+        }
         o->mode = BG_PCRE;
-        o->pcre = bg_pcre_compile (s, o->iflag);
+        o->pcre = bg_pcre_compile (pattern, length, o);
         if (!o->pcre) return -1;
         o->pcre_md = pcre2_match_data_create_from_pattern (o->pcre, NULL);
-        if (!o->pcre_md) { builtin_error ("pcre2 match_data allocation failed"); return -1; }
+        o->pcre_ctx = bg_pcre_match_ctx ();
+        if (!o->pcre_md || !o->pcre_ctx)
+        { builtin_error ("PCRE2 match allocation failed"); return -1; }
         return 0;
     }
 
@@ -1873,6 +1930,7 @@ bg_free (bg_opts *o)
     free (o->combined);
     if (o->pcre_md) pcre2_match_data_free (o->pcre_md);
     if (o->pcre) pcre2_code_free (o->pcre);
+    if (o->pcre_ctx) pcre2_match_context_free (o->pcre_ctx);
     free (o->kw_blk); free (o->kw_line);
     free (o->ob);
     for (int i = 0; i < o->n_incl; i++) free (o->incl_globs[i]);
@@ -2161,8 +2219,6 @@ grep_builtin (WORD_LIST *list)
     }
     if (o.xflag) o.wflag = 0;               /* -x takes precedence, as GNU */
     o.delim = o.zdflag ? '\0' : '\n';
-    if (o.Pflag && o.zdflag) { builtin_error ("-P with -z is not supported"); BG_FAIL (EX_USAGE); }
-    if (o.Pflag && o.wflag) { builtin_error ("-P with -w is not supported"); BG_FAIL (EX_USAGE); }
 
     /* No pattern at all (-f /dev/null): nothing matches, which -v turns
        into everything; and -x/-w are moot. As GNU. */
@@ -2233,7 +2289,7 @@ char *grep_doc[] = {
     "files, context, -m and -w follow GNU grep 3.11.",
     "",
     "Options:",
-    "    -E -F -G -P      extended, fixed, basic (default), Perl (if built)",
+    "    -E -F -G -P      extended, fixed, basic (default), Perl (PCRE2)",
     "    -e PAT -f FILE   patterns; -f - reads them from standard input",
     "    -i -y -v -w -x   ignore case, invert, whole words, whole lines",
     "    -c -l -L -q -s   count, files with/without matches, quiet, no messages",

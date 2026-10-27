@@ -626,36 +626,36 @@ ps_builtin (WORD_LIST *list)
             if (!list) {
                 builtin_error ("option --pid requires a PID list");
                 builtin_usage ();
-                return EX_USAGE;
+                return EXECUTION_FAILURE;
             }
             if (bps_add_pid_list (list->word->word, explicit_pids, &n_pids,
                                   (int) (sizeof explicit_pids / sizeof explicit_pids[0])) < 0)
-                return EX_USAGE;
+                return EXECUTION_FAILURE;
             list = list->next;
             continue;
         }
         if (!strncmp (w, "--pid=", 6)) {
             if (bps_add_pid_list (w + 6, explicit_pids, &n_pids,
                                   (int) (sizeof explicit_pids / sizeof explicit_pids[0])) < 0)
-                return EX_USAGE;
+                return EXECUTION_FAILURE;
             list = list->next;
             continue;
         }
         if (w[1] == '-') {
             builtin_error ("unknown flag: %s", w);
             builtin_usage ();
-            return EX_USAGE;
+            return EXECUTION_FAILURE;
         }
         if (!strcmp (w, "-o")) {
             list = list->next;
             if (!list) {
                 builtin_error ("option -o requires a column list");
                 builtin_usage ();
-                return EX_USAGE;
+                return EXECUTION_FAILURE;
             }
             if (bps_add_o_list (list->word->word, cols, &n_cols) < 0) {
                 builtin_usage ();
-                return EX_USAGE;
+                return EXECUTION_FAILURE;
             }
             list = list->next;
             continue;
@@ -665,25 +665,25 @@ ps_builtin (WORD_LIST *list)
             if (!list) {
                 builtin_error ("option -p requires a PID list");
                 builtin_usage ();
-                return EX_USAGE;
+                return EXECUTION_FAILURE;
             }
             if (bps_add_pid_list (list->word->word, explicit_pids, &n_pids,
                                   (int) (sizeof explicit_pids / sizeof explicit_pids[0])) < 0)
-                return EX_USAGE;
+                return EXECUTION_FAILURE;
             list = list->next;
             continue;
         }
         if (!strncmp (w, "-p", 2) && w[2]) {
             if (bps_add_pid_list (w + 2, explicit_pids, &n_pids,
                                   (int) (sizeof explicit_pids / sizeof explicit_pids[0])) < 0)
-                return EX_USAGE;
+                return EXECUTION_FAILURE;
             list = list->next;
             continue;
         }
         if (!strncmp (w, "-o", 2) && w[2]) {
             if (bps_add_o_list (w + 2, cols, &n_cols) < 0) {
                 builtin_usage ();
-                return EX_USAGE;
+                return EXECUTION_FAILURE;
             }
             list = list->next;
             continue;
@@ -707,19 +707,19 @@ ps_builtin (WORD_LIST *list)
                                 ? "option -o requires a column list"
                                 : "option -p requires a PID list");
                             builtin_usage ();
-                            return EX_USAGE;
+                            return EXECUTION_FAILURE;
                         }
                         arg = list->word->word;
                     }
                     if (opt == 'o') {
                         if (bps_add_o_list (arg, cols, &n_cols) < 0) {
                             builtin_usage ();
-                            return EX_USAGE;
+                            return EXECUTION_FAILURE;
                         }
                     } else {
                         if (bps_add_pid_list (arg, explicit_pids, &n_pids,
                                               (int) (sizeof explicit_pids / sizeof explicit_pids[0])) < 0)
-                            return EX_USAGE;
+                            return EXECUTION_FAILURE;
                     }
                     goto next_word;
                 }
@@ -727,14 +727,14 @@ ps_builtin (WORD_LIST *list)
                     if (c[1] != '\0') {
                         builtin_error ("unknown flag: -%c", c[1]);
                         builtin_usage ();
-                        return EX_USAGE;
+                        return EXECUTION_FAILURE;
                     }
                     puts ("bashps 1.0 (bash-loadable, procps-compatible)");
                     return EXECUTION_SUCCESS;
                 default:
                     builtin_error ("unknown flag: -%c", *c);
                     builtin_usage ();
-                    return EX_USAGE;
+                    return EXECUTION_FAILURE;
             }
         }
     next_word:
@@ -749,7 +749,7 @@ ps_builtin (WORD_LIST *list)
     while (list) {
         if (bps_add_pid_operand (list->word->word, explicit_pids, &n_pids,
                                  (int) (sizeof explicit_pids / sizeof explicit_pids[0])) < 0)
-            return EX_USAGE;
+            return EXECUTION_FAILURE;
         list = list->next;
     }
     if (n_pids == 0) all = 1;

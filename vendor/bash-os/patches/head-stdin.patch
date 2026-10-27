@@ -1,98 +1,560 @@
 --- head.c.orig
 +++ head.c
-@@ -86,8 +86,51 @@
- 	  if (ch == '\n')
- 	    break;
- 	}
-+      if (ch == EOF)
-+        break;
-+    }
-+  if (ferror (fp))
-+    {
-+      builtin_error ("read error: %s", strerror (errno));
-+      return EXECUTION_FAILURE;
-     }
-   return (EXECUTION_SUCCESS);
+@@ -35,4 +35,5 @@
+ #include <stdio.h>
+ #include <errno.h>
++#include <stdint.h>
+ #include "chartypes.h"
+ 
+@@ -46,121 +47,459 @@
+ #endif
+ 
+-static void
+-munge_list (WORD_LIST *list)
++#define HEAD_BUFSIZE 65536
++
++struct head_options {
++  uintmax_t count;
++  int bytes, exclude, delimiter, headers;
++};
++
++/* GNU counts saturate on overflow; even an unrepresentably large count is
++   useful (copy everything, or exclude everything). Never wrap a multiplier. */
++static uintmax_t
++head_multiply (uintmax_t n, unsigned int factor)
+ {
+-  WORD_LIST *l, *nl;
+-  WORD_DESC *wd;
+-  char *arg;
++  return n > UINTMAX_MAX / factor ? UINTMAX_MAX : n * factor;
 +}
-+
-+/* stdin's FILE belongs to the persistent shell. A private stream prevents
-+   buffered bytes and EOF from surviving a redirection. Seek back unread bytes
-+   on regular files; pipes must not read beyond the requested last line. */
+ 
+-  for (l = list; l; l = l->next)
 +static int
-+stdin_head (int nline)
++head_count (const char *s, struct head_options *o)
 +{
-+  int fd, seekable, rval;
-+  FILE *fp;
++  const char *p, *units;
++  uintmax_t n;
++  int power, base;
 +
-+  fd = dup (STDIN_FILENO);
-+  if (fd < 0)
-+    {
-+      builtin_error ("stdin: %s", strerror (errno));
-+      return EXECUTION_FAILURE;
-+    }
-+  fp = fdopen (fd, "r");
-+  if (fp == NULL)
-+    {
-+      builtin_error ("stdin: %s", strerror (errno));
-+      close (fd);
-+      return EXECUTION_FAILURE;
-+    }
-+  seekable = lseek (fd, 0, SEEK_CUR) != (off_t)-1;
-+  if (seekable == 0)
-+    setvbuf (fp, NULL, _IONBF, 0);
-+  rval = file_head (fp, nline);
-+  if (seekable && fseeko (fp, 0, SEEK_CUR) != 0)
-+    {
-+      builtin_error ("stdin: %s", strerror (errno));
-+      rval = EXECUTION_FAILURE;
-+    }
-+  if (fclose (fp) != 0)
-+    rval = EXECUTION_FAILURE;
-+  return rval;
++  p = s;
++  o->exclude = *p == '-';
++  if (*p == '-') p++;
++  if (*p && strchr ("bkKMGTPEZYRQ", *p)) { n = 1; goto suffix; }
++  while (*p && strchr (" \t\n\r\v\f", *p)) p++;
++  if (*p == '+') p++;
++  if (*p < '0' || *p > '9') goto invalid;
++  for (n = 0; *p >= '0' && *p <= '9'; p++)
++    n = n > (UINTMAX_MAX - (*p - '0')) / 10
++        ? UINTMAX_MAX : n * 10 + (*p - '0');
++suffix:
++  if (*p)
+     {
+-      arg = l->word->word;
+-      if (arg[0] != '-' || arg[1] == '-' || (DIGIT(arg[1]) == 0))
+-        return;
+-      /* We have -[0-9]* */
+-      wd = make_bare_word (arg+1);
+-      nl = make_word_list (wd, l->next);
+-      l->word->word[1] = 'n';
+-      l->word->word[2] = '\0';
+-      l->next = nl;
+-      l = nl;	/* skip over new argument */
++      if (*p == 'b' && p[1] == 0)
++        n = head_multiply (n, 512);
++      else
++        {
++          units = "KMGTPEZYRQ";
++          if (*p == 'k') power = 1;
++          else
++            {
++              const char *u = strchr (units, *p);
++              if (u == 0) goto invalid;
++              power = u - units + 1;
++            }
++          p++;
++          base = 1024;
++          if (*p == 'B') { base = 1000; p++; }
++          else if (p[0] == 'i' && p[1] == 'B') p += 2;
++          if (*p) goto invalid;
++          while (power--) n = head_multiply (n, base);
++        }
+     }
++  o->count = n;
++  return 0;
++invalid:
++  builtin_error ("invalid %s count: %s", o->bytes ? "byte" : "line", s);
++  return -1;
  }
  
- int
-@@ -123,15 +166,17 @@
-     }
-   list = loptend;
+ static int
+-file_head (FILE *fp, int cnt)
++head_write (const void *data, size_t length)
+ {
++  return fwrite (data, 1, length, stdout) == length ? 0 : -1;
++}
++
++static int
++head_bytes (FILE *fp, uintmax_t count)
++{
++  unsigned char buffer[HEAD_BUFSIZE];
++  size_t n, want;
++  while (count)
++    {
++      QUIT;
++      want = count < sizeof buffer ? (size_t)count : sizeof buffer;
++      n = fread (buffer, 1, want, fp);
++      if (n && head_write (buffer, n) < 0) return -1;
++      count -= n;
++      if (n < want) break;
++    }
++  return ferror (fp) ? -1 : 0;
++}
++
++static int
++head_lines (FILE *fp, const struct head_options *o, int seekable)
++{
++  unsigned char buffer[HEAD_BUFSIZE], *p, *match;
++  uintmax_t count;
++  size_t n, used;
+   int ch;
  
-+  rval = EXECUTION_SUCCESS;
-   if (list == 0)
+-  while (cnt--)
++  count = o->count;
++  if (seekable)
++    {
++      while (count)
++        {
++          QUIT;
++          n = fread (buffer, 1, sizeof buffer, fp);
++          for (p = buffer; p < buffer + n; p = match + 1)
++            {
++              match = memchr (p, o->delimiter, buffer + n - p);
++              if (match == 0) break;
++              if (--count == 0)
++                {
++                  used = match + 1 - buffer;
++                  if (fseeko (fp, -(off_t)(n - used), SEEK_CUR) != 0)
++                    return -1;
++                  return head_write (buffer, used);
++                }
++            }
++          if (n && head_write (buffer, n) < 0) return -1;
++          if (n < sizeof buffer) break;
++        }
++    }
++  else
+     {
+-      while ((ch = getc (fp)) != EOF)
+-	{
+-	  QUIT;
+-	  if (putchar (ch) == EOF)
+-	    {
+-	      builtin_error ("write error: %s", strerror (errno));
+-	      return EXECUTION_FAILURE;
+-	    }
+-	  QUIT;
+-	  if (ch == '\n')
+-	    break;
+-	}
++      /* No read-ahead on a shared pipe, including when its writer is still
++         open. Accumulate output only; each input syscall consumes one byte. */
++      used = 0;
++      while (count && (ch = getc (fp)) != EOF)
++        {
++          QUIT;
++          buffer[used++] = ch;
++          if (ch == o->delimiter) count--;
++          if (used == sizeof buffer || count == 0)
++            {
++              if (head_write (buffer, used) < 0) return -1;
++              used = 0;
++            }
++        }
++      if (used && head_write (buffer, used) < 0) return -1;
+     }
+-  return (EXECUTION_SUCCESS);
++  return ferror (fp) ? -1 : 0;
+ }
+ 
+-int
+-head_builtin (WORD_LIST *list)
++/* Find the excluded suffix without reading the whole regular file. pread
++   leaves the private stream and its shared open-file offset undisturbed. */
++static int
++head_suffix (FILE *fp, const struct head_options *o, off_t start, off_t end)
+ {
+-  int nline, opt, rval;
+-  WORD_LIST *l;
+-  FILE *fp;
++  unsigned char buffer[HEAD_BUFSIZE];
++  off_t pos, cutoff;
++  uintmax_t left;
++  size_t want;
++  ssize_t n, i;
++  int last;
+ 
+-  char *t;
++  cutoff = start;
++  if (o->bytes)
++    {
++      if (o->count < (uintmax_t)(end - start))
++        cutoff = end - (off_t)o->count;
++    }
++  else
++    {
++      pos = end;
++      left = o->count;
++      last = 1;
++      while (pos > start && left)
++        {
++          QUIT;
++          want = pos - start < HEAD_BUFSIZE ? (size_t)(pos - start) : HEAD_BUFSIZE;
++          pos -= want;
++          n = pread (fileno (fp), buffer, want, pos);
++          if (n < 0 && errno == EINTR) { pos += want; continue; }
++          if (n != (ssize_t)want) { if (n >= 0) errno = EIO; return -1; }
++          for (i = n; i-- > 0; )
++            {
++              if (last) { last = 0; if (buffer[i] == o->delimiter) continue; }
++              if (buffer[i] == o->delimiter && --left == 0)
++                { cutoff = pos + i + 1; break; }
++            }
++        }
++    }
++  return head_bytes (fp, (uintmax_t)(cutoff - start));
++}
+ 
+-  munge_list (list);	/* change -num into -n num */
++struct head_chunk {
++  struct head_chunk *next;
++  size_t begin, end;
++  unsigned char data[HEAD_BUFSIZE];
++};
+ 
+-  reset_internal_getopt ();
+-  nline = 10;
+-  while ((opt = internal_getopt (list, "n:")) != -1)
+-    {
+-      switch (opt)
+-	{
+-	case 'n':
+-	  nline = atoi (list_optarg);
+-	  if (nline <= 0)
+-	    {
+-	      builtin_error ("bad line count: %s", list_optarg);
+-	      return (EX_USAGE);
+-	    }
+-	  break;
+-	CASE_HELPOPT;
+-	default:
+-	  builtin_usage ();
+-	  return (EX_USAGE);
+-	}
+-    }
+-  list = loptend;
+-
+-  if (list == 0)
 -    return (file_head (stdin, nline));
 -
 -  for (rval = EXECUTION_SUCCESS, opt = 1, l = list; l; l = l->next)
-+    rval = stdin_head (nline);
+-    {
+-      fp = fopen (l->word->word, "r");
+-      if (fp == NULL)
+-	{
+-	  builtin_error ("%s: %s", l->word->word, strerror (errno));
+-	  continue;
+-	}
+-      if (list->next)	/* more than one file */
+-	{
+-	  printf ("%s==> %s <==\n", opt ? "" : "\n", l->word->word);
+-	  opt = 0;
+-	}
++/* A pipe must reach EOF to exclude a suffix. Retain chunks holding the last
++   N bytes or N delimiters plus the unfinished record; emit older data once.
++   Allocation grows with actual retained input, never with an untrusted N. */
++static int
++head_tail_stream (FILE *fp, const struct head_options *o)
++{
++  struct head_chunk *first, *last, *chunk, *next;
++  uintmax_t held, delimiters, excess;
++  unsigned char *p, *match;
++  size_t emit;
++  int final_byte, result;
 +
-+  for (opt = 1, l = list; l; l = l->next)
-     {
-       fp = fopen (l->word->word, "r");
-       if (fp == NULL)
- 	{
- 	  builtin_error ("%s: %s", l->word->word, strerror (errno));
-+          rval = EXECUTION_FAILURE;
- 	  continue;
- 	}
-       if (list->next)	/* more than one file */
-@@ -140,10 +185,18 @@
- 	  opt = 0;
- 	}
++  first = last = 0;
++  held = delimiters = 0;
++  final_byte = o->delimiter;
++  result = 0;
++  for (;;)
++    {
        QUIT;
 -      rval = file_head (fp, nline);
 -      fclose (fp);
--    }
--   
-+      if (file_head (fp, nline) != EXECUTION_SUCCESS)
-+        rval = EXECUTION_FAILURE;
-+      if (fclose (fp) != 0)
-+        rval = EXECUTION_FAILURE;
++      chunk = malloc (sizeof *chunk);
++      if (chunk == 0) { errno = ENOMEM; result = -1; break; }
++      chunk->begin = 0;
++      chunk->next = 0;
++      chunk->end = fread (chunk->data, 1, HEAD_BUFSIZE, fp);
++      if (chunk->end == 0) { free (chunk); break; }
++      final_byte = chunk->data[chunk->end - 1];
++      if (last) last->next = chunk; else first = chunk;
++      last = chunk;
++      held += chunk->end;
++      if (!o->bytes)
++        for (p = chunk->data; p < chunk->data + chunk->end; p = match + 1)
++          {
++            match = memchr (p, o->delimiter, chunk->data + chunk->end - p);
++            if (match == 0) break;
++            delimiters++;
++          }
++      while (first && (o->bytes ? held > o->count : delimiters > o->count))
++        {
++          emit = first->end - first->begin;
++          if (o->bytes)
++            {
++              excess = held - o->count;
++              if (excess < emit) emit = excess;
++            }
++          else
++            {
++              p = first->data + first->begin;
++              while (p < first->data + first->end && delimiters > o->count)
++                {
++                  match = memchr (p, o->delimiter, first->data + first->end - p);
++                  if (match == 0) { p = first->data + first->end; break; }
++                  delimiters--;
++                  p = match + 1;
++                }
++              emit = p - (first->data + first->begin);
++            }
++          if (head_write (first->data + first->begin, emit) < 0)
++            { result = -1; goto done; }
++          held -= emit;
++          first->begin += emit;
++          if (first->begin == first->end)
++            {
++              next = first->next;
++              free (first);
++              first = next;
++              if (first == 0) last = 0;
++            }
++        }
 +    }
++  /* An unterminated last record also belongs to the excluded N lines. */
++  if (result == 0 && !o->bytes && final_byte != o->delimiter && delimiters == o->count)
++    while (first)
++      {
++        p = first->data + first->begin;
++        match = memchr (p, o->delimiter, first->end - first->begin);
++        emit = match ? (size_t)(match + 1 - p) : first->end - first->begin;
++        if (head_write (p, emit) < 0) { result = -1; break; }
++        if (match) break;
++        next = first->next;
++        free (first);
++        first = next;
++      }
++done:
++  while (first) { next = first->next; free (first); first = next; }
++  return ferror (fp) ? -1 : result;
++}
 +
-+  if (fflush (stdout) == EOF || ferror (stdout))
++static int
++head_input (const char *name, const struct head_options *o, int header, int *printed)
++{
++  FILE *fp;
++  struct stat st;
++  off_t start;
++  int fd, standard, seekable, result, saved_errno;
++
++  standard = name == 0 || strcmp (name, "-") == 0;
++  /* Ownership follows how the descriptor was obtained, even if open returns
++     descriptor zero because shell stdin was closed. Never use global stdin. */
++  fd = standard ? fcntl (STDIN_FILENO, F_DUPFD_CLOEXEC, 3) : open (name, O_RDONLY);
++  if (fd < 0) goto open_error;
++  fp = fdopen (fd, "r");
++  if (fp == 0) { saved_errno = errno; close (fd); errno = saved_errno; goto open_error; }
++  start = lseek (fd, 0, SEEK_CUR);
++  seekable = start != (off_t)-1;
++  if (!seekable && !o->exclude) setvbuf (fp, NULL, _IONBF, 0);
++  result = 0;
++  if (header)
 +    {
-+      builtin_error ("write error: %s", strerror (errno));
-+      rval = EXECUTION_FAILURE;
++      if (printf ("%s==> %s <==\n", *printed ? "\n" : "", standard ? "standard input" : name) < 0)
++        result = -1;
++      *printed = 1;
 +    }
++  if (result == 0)
++    {
++      if (o->exclude && o->count == 0)
++        result = head_bytes (fp, UINTMAX_MAX);
++      else if (o->exclude && seekable && fstat (fd, &st) == 0 && S_ISREG (st.st_mode) && st.st_size > 0)
++        result = head_suffix (fp, o, start, st.st_size > start ? st.st_size : start);
++      else if (o->exclude)
++        result = head_tail_stream (fp, o);
++      else if (o->bytes)
++        result = head_bytes (fp, o->count);
++      else
++        result = head_lines (fp, o, seekable);
++    }
++  if (result < 0)
++    builtin_error ("%s: %s", standard ? "standard input" : name, strerror (errno));
++  /* Return all stdio read-ahead to the shared seekable descriptor. */
++  if (seekable && fseeko (fp, 0, SEEK_CUR) != 0)
++    { builtin_error ("%s: %s", standard ? "standard input" : name, strerror (errno)); result = -1; }
++  if (fclose (fp) != 0) result = -1;
++  return result;
++open_error:
++  builtin_error ("%s: %s", standard ? "standard input" : name, strerror (errno));
++  return -1;
++}
++
++/* The shell's option-parser state and caller's WORD_LIST remain untouched.
++   Collect operands while accepting GNU-style interspersed options. */
++int
++head_builtin (WORD_LIST *list)
++{
++  static const char *long_names[] = {
++    "bytes", "lines", "quiet", "silent", "verbose", "zero-terminated", "help", "version"
++  };
++  static const char long_options[] = "cnqqvzHV";
++  struct head_options o;
++  WORD_LIST *l;
++  char **files, *arg, *p, *value, *equal;
++  size_t len;
++  int nfiles, total, end_options, i, j, found, opt, result, printed;
++  unsigned int legacy_scale;
++
++  o.count = 10; o.bytes = o.exclude = 0; o.delimiter = '\n'; o.headers = -1;
++  for (total = 0, l = list; l; l = l->next) total++;
++  files = malloc ((total + 1) * sizeof *files);
++  if (files == 0) { builtin_error ("out of memory"); return EXECUTION_FAILURE; }
++  nfiles = end_options = 0;
++  result = EXECUTION_FAILURE;
++  for (l = list; l; l = l->next)
++    {
++      arg = l->word->word;
++      if (end_options || arg[0] != '-' || arg[1] == 0)
++        { files[nfiles++] = arg; continue; }
++      if (strcmp (arg, "--") == 0) { end_options = 1; continue; }
++      if (l == list && arg[1] >= '0' && arg[1] <= '9')
++        {
++          for (p = arg + 1; *p >= '0' && *p <= '9'; p++);
++          /* Historical -NUM[bkm][clqvz] form, only as the first argument. */
++          len = p - (arg + 1);
++          value = malloc (len + 1);
++          if (value == 0) goto done;
++          memcpy (value, arg + 1, len); value[len] = 0;
++          i = head_count (value, &o); free (value);
++          if (i < 0) goto done;
++          legacy_scale = 1;
++          for (; *p; p++)
++            switch (*p)
++              {
++              case 'b': o.bytes = 1; legacy_scale = 512; break;
++              case 'k': o.bytes = 1; legacy_scale = 1024; break;
++              case 'm': o.bytes = 1; legacy_scale = 1048576; break;
++              case 'c': o.bytes = 1; legacy_scale = 1; break;
++              case 'l': o.bytes = 0; legacy_scale = 1; break;
++              case 'q': o.headers = 0; break;
++              case 'v': o.headers = 1; break;
++              case 'z': o.delimiter = 0; break;
++              default: builtin_error ("invalid trailing option: %c", *p); goto done;
++              }
++          o.count = head_multiply (o.count, legacy_scale);
++          continue;
++        }
++      p = arg + 1;
++      do
++        {
++          value = 0;
++          if (*p == '-')
++            {
++              p++;
++              equal = strchr (p, '=');
++              len = equal ? (size_t)(equal - p) : strlen (p);
++              found = -1;
++              for (j = 0; j < 8; j++)
++                if (len && strncmp (p, long_names[j], len) == 0)
++                  {
++                    if (strlen (long_names[j]) == len) { found = j; break; }
++                    if (found != -1) { found = -2; break; }
++                    found = j;
++                  }
++              if (found < 0) { builtin_error ("invalid or ambiguous option: %s", arg); goto done; }
++              opt = long_options[found];
++              if (equal) value = equal + 1;
++              p += strlen (p);
++              if (value && opt != 'c' && opt != 'n')
++                { builtin_error ("option does not take an argument: %s", arg); goto done; }
++            }
++          else
++            {
++              opt = *p++;
++              if (opt == 'H' || opt == 'V')
++                { builtin_error ("invalid option: %s", arg); goto done; }
++            }
++          switch (opt)
++            {
++            case 'c': case 'n':
++              o.bytes = opt == 'c';
++              if (value == 0 && *p) { value = p; p += strlen (p); }
++              if (value == 0 && l->next) { l = l->next; value = l->word->word; }
++              if (value == 0) { builtin_error ("option requires a count: %s", arg); goto done; }
++              if (head_count (value, &o) < 0) goto done;
++              break;
++            case 'q': o.headers = 0; break;
++            case 'v': o.headers = 1; break;
++            case 'z': o.delimiter = 0; break;
++            case 'H': builtin_help (); result = EXECUTION_SUCCESS; goto done;
++            case 'V': printf ("head (Bash loadable)\n"); result = EXECUTION_SUCCESS; goto done;
++            default: builtin_error ("invalid option: %s", arg); goto done;
++            }
++        }
++      while (*p);
+     }
+-   
+-  return (rval);
++  result = EXECUTION_SUCCESS;
++  printed = 0;
++  if (nfiles == 0)
++    { if (head_input (0, &o, o.headers == 1, &printed) < 0) result = EXECUTION_FAILURE; }
++  else
++    for (i = 0; i < nfiles; i++)
++      if (head_input (files[i], &o, o.headers == 1 || (o.headers < 0 && nfiles > 1), &printed) < 0)
++        result = EXECUTION_FAILURE;
++done:
++  free (files);
++  if (fflush (stdout) == EOF || ferror (stdout))
++    { builtin_error ("write error: %s", strerror (errno)); result = EXECUTION_FAILURE; }
 +  clearerr (stdout);
-   return (rval);
++  return result;
  }
  
+ char *head_doc[] = {
+-	"Display lines from beginning of file.",
+-	"",
+-	"Copy the first N lines from the input files to the standard output.",
+-	"N is supplied as an argument to the `-n' option.  If N is not given,",
+-	"the first ten lines are copied.",
+-	(char *)NULL
++  "Copy the first ten lines of each FILE, or standard input when FILE is -.",
++  "-n, --lines=[-]NUM: first NUM lines, or all but the last NUM lines.",
++  "-c, --bytes=[-]NUM: first NUM bytes, or all but the last NUM bytes.",
++  "Counts accept GNU decimal/binary suffixes (b, kB, K, KiB, M, ... Q).",
++  "-q, --quiet, --silent: suppress file headers; -v, --verbose: always show them.",
++  "-z, --zero-terminated: delimit records with NUL instead of newline.",
++  "-- ends options; legacy -NUM[bkm][clqvz] is accepted as the first option.",
++  (char *)NULL
+ };
+ 
+ struct builtin head_struct = {
+-	"head",			/* builtin name */
+-	head_builtin,		/* function implementing the builtin */
+-	BUILTIN_ENABLED,	/* initial flags for builtin */
+-	head_doc,		/* array of long documentation strings. */
+-	"head [-n num] [file ...]", /* usage synopsis; becomes short_doc */
+-	0			/* reserved for internal use */
++  "head", head_builtin, BUILTIN_ENABLED, head_doc,
++  "head [-cn [-]NUM] [-qvz] [FILE ...]", 0
+ };

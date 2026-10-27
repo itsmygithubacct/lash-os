@@ -91,6 +91,7 @@
 #include <arpa/inet.h>
 
 #include "loadables.h"
+#include "command-run.h"
 
 /* Caps. Response buffer is the dominant memory footprint; curl is
  * meant for small page/file fetches, not multi-GiB downloads. The cap
@@ -102,13 +103,14 @@
 #define BCURL_MAX_REDIRECTS       20   /* RFC 9110 §15.4 minimum recommendation; user override via --max-redirs */
 #define BCURL_DEFAULT_TIMEOUT 300                /* seconds */
 #define BCURL_HEADER_SLOTS       32
+#define BCURL_URL_MAX          8192   /* signed storage redirects run past 1 KB */
 #define BCURL_VERSION          "0.1"
 
 typedef struct {
   char  scheme[8];
   char  host[256];
   char  port[8];
-  char  path[2048];
+  char  path[BCURL_URL_MAX];
 } bc_url;
 
 typedef struct {
@@ -148,7 +150,8 @@ typedef struct {
   size_t hlen;
   unsigned char *body;         /* malloc'd; raw decoded body */
   size_t blen;
-  char  location[1024];        /* extracted Location: header if 3xx */
+  char  location[BCURL_URL_MAX]; /* extracted Location: header if 3xx */
+  int   location_too_long;     /* the Location: header did not fit */
 } bc_response;
 
 /* ---- url parser (mirrors http's, with bigger path buffer) ---- */
@@ -179,7 +182,8 @@ bc_parse_url (const char *url, bc_url *u)
   else
     snprintf (u->port, sizeof u->port, "%s",
               strcasecmp (u->scheme, "https") == 0 ? "443" : "80");
-  snprintf (u->path, sizeof u->path, "%s", slash ? slash : "/");
+  if (snprintf (u->path, sizeof u->path, "%s", slash ? slash : "/") >= (int) sizeof u->path)
+    return -1;
   return 0;
 }
 
@@ -923,6 +927,26 @@ bc_https_exchange (const bc_url *u, const char *req, size_t reqlen,
       close (out_pipe[0]); close (out_pipe[1]);
       char hostport[320];
       snprintf (hostport, sizeof hostport, "%s:%s", u->host, u->port);
+      /* Run the crypto builtin in this child, so HTTPS works whatever
+       * /bin/bash is. The exec below is only for a shell without crypto. */
+      char *argv[10];
+      int argc = 0;
+      argv[argc++] = "crypto";
+      argv[argc++] = "tls";
+      argv[argc++] = "connect";
+      argv[argc++] = hostport;
+      argv[argc++] = "-s";
+      argv[argc++] = (char *) u->host;
+      if (cacert && *cacert)
+        {
+          argv[argc++] = "-c";
+          argv[argc++] = (char *) cacert;
+        }
+      if (insecure)
+        argv[argc++] = "-k";
+      argv[argc] = NULL;
+      bos_prepare_child ();
+      bos_run_builtin ("crypto", argv, NULL);
       /* crypto is a builtin (no PATH binary). Use `builtin` to
        * force builtin-lookup dispatch; the wrapping /bin/bash is the
        * bash-os shell that has crypto compiled in. `exec
@@ -1019,7 +1043,9 @@ bc_content_length (const char *hdrs)
   return -1;
 }
 
-static void
+/* Returns -1, leaving OUT empty, when the target does not fit: following a
+   truncated URL would fetch some other resource. */
+static int
 bc_extract_location (const char *hdrs, char *out, size_t cap)
 {
   out[0] = '\0';
@@ -1032,15 +1058,16 @@ bc_extract_location (const char *hdrs, char *out, size_t cap)
           while (*v == ' ' || *v == '\t') v++;
           const char *eol = strstr (v, "\r\n");
           size_t n = eol ? (size_t) (eol - v) : strlen (v);
-          if (n >= cap) n = cap - 1;
+          if (n >= cap) return -1;
           memcpy (out, v, n);
           out[n] = '\0';
-          return;
+          return 0;
         }
       p = strstr (p, "\r\n");
       if (!p) break;
       p += 2;
     }
+  return 0;
 }
 
 /* De-chunk a chunked-transfer body in place; returns new length, or -1 on
@@ -1121,7 +1148,7 @@ bc_parse_response (unsigned char *raw, size_t rawlen, bc_response *r)
     }
 
   if (r->status >= 300 && r->status < 400)
-    bc_extract_location (r->headers, r->location, sizeof r->location);
+    r->location_too_long = bc_extract_location (r->headers, r->location, sizeof r->location) < 0;
 
   return 0;
 }
@@ -1139,9 +1166,9 @@ static int
 bc_emit (const bc_opts *o, const bc_url *u, const bc_response *r)
 {
   const char *out = o->outfile;
-  /* nbuf must match u->path's size (2048) so -Wformat-truncation is
-   * silenced for the pathological case of a path with no '/'. */
-  char nbuf[2048];
+  /* nbuf must match u->path's size (BCURL_URL_MAX) so -Wformat-truncation
+   * is silenced for the pathological case of a path with no '/'. */
+  char nbuf[BCURL_URL_MAX];
   if (!out && o->use_basename)
     {
       const char *slash = strrchr (u->path, '/');
@@ -1287,16 +1314,14 @@ bc_resolve_redirect (const char *cur, const char *loc, char *out, size_t cap)
       (!is_https && strcmp (u.port, "80")  != 0))
     { port_sep = ":"; port_str = u.port; }
   if (loc[0] == '/')
-    snprintf (out, cap, "%s://%s%s%s%s", u.scheme, u.host, port_sep, port_str, loc);
-  else
-    {
-      char dir[2048];
-      snprintf (dir, sizeof dir, "%s", u.path);
-      char *slash = strrchr (dir, '/');
-      if (slash) slash[1] = '\0'; else strcpy (dir, "/");
-      snprintf (out, cap, "%s://%s%s%s%s%s", u.scheme, u.host, port_sep, port_str, dir, loc);
-    }
-  return 0;
+    return snprintf (out, cap, "%s://%s%s%s%s", u.scheme, u.host, port_sep, port_str, loc)
+           >= (int) cap ? -1 : 0;
+  char dir[BCURL_URL_MAX];
+  snprintf (dir, sizeof dir, "%s", u.path);
+  char *slash = strrchr (dir, '/');
+  if (slash) slash[1] = '\0'; else strcpy (dir, "/");
+  return snprintf (out, cap, "%s://%s%s%s%s%s", u.scheme, u.host, port_sep, port_str, dir, loc)
+         >= (int) cap ? -1 : 0;
 }
 
 /* ---- main builtin entrypoint ---- */
@@ -1564,8 +1589,12 @@ curl_builtin (WORD_LIST *list)
    * we just gate the call. */
   int show_errs = (!o.silent) || o.show_error;
 
-  char cur_url[2048];
-  snprintf (cur_url, sizeof cur_url, "%s", o.url);
+  char cur_url[BCURL_URL_MAX];
+  if (snprintf (cur_url, sizeof cur_url, "%s", o.url) >= (int) sizeof cur_url)
+    {
+      builtin_error ("URL is longer than %d bytes", BCURL_URL_MAX - 1);
+      return EX_USAGE;
+    }
   bc_url start_url;
   int have_start_url = bc_parse_url (cur_url, &start_url) == 0;
   int cookie_from_file = o.cookie_input && strchr (o.cookie_input, '=') == NULL
@@ -1600,13 +1629,16 @@ curl_builtin (WORD_LIST *list)
           free (o.body_alloc);
           return EXECUTION_FAILURE;
         }
-      if (o.follow && r.status >= 300 && r.status < 400 && r.location[0])
+      if (o.follow && r.status >= 300 && r.status < 400 && (r.location[0] || r.location_too_long))
         {
           int rcap = o.max_redirs > 0 ? o.max_redirs : BCURL_MAX_REDIRECTS;
           if (++redirects > rcap)
             { if (show_errs) builtin_error ("too many redirects (>%d)", rcap);
               bc_response_free (&r); free (o.cookie_alloc); free (o.body_alloc); return EXECUTION_FAILURE; }
-          char next[2048];
+          if (r.location_too_long)
+            { if (show_errs) builtin_error ("redirect target is longer than %d bytes", BCURL_URL_MAX - 1);
+              bc_response_free (&r); free (o.cookie_alloc); free (o.body_alloc); return EXECUTION_FAILURE; }
+          char next[BCURL_URL_MAX];
           if (bc_resolve_redirect (cur_url, r.location, next, sizeof next) < 0)
             { if (show_errs) builtin_error ("bad redirect target: %s", r.location);
               bc_response_free (&r); free (o.cookie_alloc); free (o.body_alloc); return EXECUTION_FAILURE; }

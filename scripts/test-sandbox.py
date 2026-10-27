@@ -286,6 +286,17 @@ exit 37
 
     try:
         expect(b"kernel-bash# ")
+        send(b"sh\n")
+        expect(b"kernel-bash# ", timeout=args.timeout)
+        send(b"printf 'NESTED_%s\\n' SHELL_READY\n")
+        expect(b"\r\nNESTED_SHELL_READY\r\n")
+        expect(b"kernel-bash# ")
+        send(b"exit\n")
+        expect(b"kernel-bash# ")
+        send(b"bc\n2+2\n")
+        expect(b"\r\n4\r\n")
+        send(b"quit\n")
+        expect(b"kernel-bash# ")
         # The terminal's shared description stays blocking while the session runs.
         assert fcntl.fcntl(slave, fcntl.F_GETFL) == initial_flags
         # SIGTSTP returns the terminal while stopped; SIGCONT restores raw mode.
@@ -326,7 +337,7 @@ exit 37
         assert fcntl.fcntl(slave, fcntl.F_GETFL) == initial_flags
         results.append({"name": "terminal-jobs-resize-restore", "exit": 0,
                         "seconds": round(time.monotonic() - started, 3)})
-        print("PASS: terminal jobs, Ctrl-Z/bg/fg/Ctrl-C, resize, terminal restoration", flush=True)
+        print("PASS: nested shell, calculator exit, terminal jobs, Ctrl-Z/bg/fg/Ctrl-C, resize, terminal restoration", flush=True)
     finally:
         stop(proc)
         (work / "terminal.log").write_bytes(transcript)

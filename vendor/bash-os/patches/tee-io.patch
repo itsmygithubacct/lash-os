@@ -1,7 +1,13 @@
---- tee.c.orig
-+++ tee.c
-@@ -124,32 +124,53 @@
+--- builtins/tee.c
++++ builtins/tee.c
+@@ -87,5 +87,5 @@
+ 	default:
+ 	  builtin_usage ();
+-	  return (EX_USAGE);
++	  return (EXECUTION_FAILURE);
+ 	}
      }
+@@ -125,23 +125,44 @@
  
    while ((nr = read(0, buf, TEE_BUFSIZE)) > 0)
 -    for (fl = tee_flist; fl; fl = fl->next)
@@ -64,12 +70,10 @@
 +    }
  
    /* Deallocate resources -- this is a builtin command. */
-   tee_flist = tee_flist->next;		/* skip bogus close of stdout */
-   while (tee_flist)
+@@ -150,5 +171,5 @@
      {
        fl = tee_flist;
 -      if (close (fl->fd) < 0)
 +      if (fl->fd >= 0 && close (fl->fd) < 0)
  	{
  	  builtin_error ("%s: close_error: %s", fl->fname, strerror (errno));
- 	  rval = EXECUTION_FAILURE;

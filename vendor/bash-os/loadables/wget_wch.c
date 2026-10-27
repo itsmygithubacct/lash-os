@@ -18,10 +18,12 @@
 #endif
 
 #include <errno.h>
+#include <fcntl.h>
 #include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #include "loadables.h"
 
@@ -151,7 +153,7 @@ bww_read_byte (int fd, unsigned char *out)
   do
     n = read (fd, out, 1);
   while (n < 0 && errno == EINTR);
-  return n == 1 ? 0 : -1;
+  return n == 1 ? 1 : n == 0 ? 0 : -1;
 }
 
 static int
@@ -164,22 +166,125 @@ bww_read_more_ready (int fd)
   return poll (&pfd, 1, 0) > 0;
 }
 
+/* Nonseekable input needs one scalar of lookahead. Key this by stream
+   identity, rather than the descriptor number, so switches and dup aliases
+   do not mix distinct pipes. Seekable input is rewound instead. This private
+   cache belongs to wget_wch: mixing other readers, or reopening a FIFO/TTY
+   with the same identity, needs an explicit reader lifecycle API. */
+#define BWW_PENDING_STREAMS 1025
+static struct {
+  int valid;
+  dev_t device;
+  ino_t inode;
+  mode_t type;
+  dev_t rdevice;
+  unsigned char bytes[4];
+  size_t len;
+} bww_pending[BWW_PENDING_STREAMS];
+
+static int
+bww_pending_matches (size_t i, const struct stat *st)
+{
+  return bww_pending[i].valid
+      && bww_pending[i].device == st->st_dev
+      && bww_pending[i].inode == st->st_ino
+      && bww_pending[i].type == (st->st_mode & S_IFMT)
+      && bww_pending[i].rdevice == st->st_rdev;
+}
+
+static int
+bww_take_pending (int fd, unsigned char *buf, size_t *len)
+{
+  struct stat st;
+  int flags = fcntl (fd, F_GETFL);
+  if (flags < 0) return -1;
+  if ((flags & O_ACCMODE) == O_WRONLY) { errno = EBADF; return -1; }
+  if (fstat (fd, &st) < 0) return -1;
+  for (size_t i = 0; i < BWW_PENDING_STREAMS; i++)
+    if (bww_pending_matches (i, &st))
+      {
+        *len = bww_pending[i].len;
+        memcpy (buf, bww_pending[i].bytes, *len);
+        bww_pending[i].valid = 0;
+        return 1;
+      }
+  return 0;
+}
+
+static int
+bww_save_pending (int fd, const unsigned char *buf, size_t len)
+{
+  if (lseek (fd, -(off_t) len, SEEK_CUR) != (off_t) -1) return 0;
+  if (errno != ESPIPE) return -1;
+  struct stat st;
+  if (fstat (fd, &st) < 0) return -1;
+  for (size_t i = 0; i < BWW_PENDING_STREAMS; i++)
+    if (!bww_pending[i].valid)
+      {
+        bww_pending[i].device = st.st_dev;
+        bww_pending[i].inode = st.st_ino;
+        bww_pending[i].type = st.st_mode & S_IFMT;
+        bww_pending[i].rdevice = st.st_rdev;
+        bww_pending[i].len = len;
+        memcpy (bww_pending[i].bytes, buf, len);
+        bww_pending[i].valid = 1;
+        return 0;
+      }
+  errno = ENOBUFS;
+  return -1;
+}
+
+/* Read a complete scalar before making a cluster-boundary decision.
+   1 = scalar, 0 = EOF, -1 = invalid/incomplete scalar or input error. */
+static int
+bww_read_scalar (int fd, unsigned char *buf, size_t *len, unsigned *cp)
+{
+  size_t used;
+  int pending = bww_take_pending (fd, buf, len);
+  if (pending < 0) return -1;
+  if (!pending)
+    {
+      *len = 0;
+      int r = bww_read_byte (fd, buf);
+      if (r <= 0) return r;
+      *len = 1;
+      size_t need = buf[0] < 0x80 ? 1
+                  : buf[0] >= 0xc2 && buf[0] <= 0xdf ? 2
+                  : buf[0] >= 0xe0 && buf[0] <= 0xef ? 3
+                  : buf[0] >= 0xf0 && buf[0] <= 0xf4 ? 4 : 1;
+      while (*len < need)
+        {
+          if (bww_read_byte (fd, buf + *len) != 1) return -1;
+          (*len)++;
+        }
+    }
+  return bww_utf8_one (buf, *len, cp, &used) == 0 ? 1 : -1;
+}
+
 static int
 bww_read_cluster (int fd, unsigned char *buf, size_t *len)
 {
-  size_t n = 0;
-  if (bww_read_byte (fd, &buf[n++]) < 0)
-    return -1;
-  while (n < BWW_MAX_BYTES && bww_read_more_ready (fd))
+  unsigned char scalar[4];
+  size_t used = 0, n = 0, count = 1;
+  unsigned cp;
+  if (bww_read_scalar (fd, scalar, &used, &cp) != 1) return -1;
+  memcpy (buf, scalar, used);
+  n = used;
+  int join_next = cp == 0x200d;
+  while (count < BWW_MAX_CPS && bww_read_more_ready (fd))
     {
-      unsigned tmp[BWW_MAX_CPS];
-      size_t ncp = 0, nbytes = 0, used = 0;
-      if (bww_utf8_one (buf, n, &tmp[0], &used) == 0
-          && bww_decode_cluster (buf, n, tmp, &ncp, &nbytes) == 0
-          && nbytes < n)
-        break;
-      if (bww_read_byte (fd, &buf[n++]) < 0)
-        break;
+      int r = bww_read_scalar (fd, scalar, &used, &cp);
+      if (r == 0) break;
+      if (r < 0) return -1;
+      if (!bww_is_extend (cp) && !join_next)
+        {
+          if (bww_save_pending (fd, scalar, used) < 0) return -1;
+          break;
+        }
+      memcpy (buf + n, scalar, used);
+      n += used;
+      count++;
+      join_next = cp == 0x200d;
     }
   *len = n;
   return 0;
@@ -257,6 +362,12 @@ char *wget_wch_doc[] = {
   "    wget_wch read [FD]",
   "",
   "Output is: wch U+XXXX[,U+YYYY...] bytes=N.",
+  "Nonseekable read owns process-local lookahead: drain an input using",
+  "wget_wch in one shell process. Do not mix other readers, fork between",
+  "reads, or reopen the same FIFO/TTY while lookahead remains pending.",
+  "Seekable file lookahead is rewound; ordinary FD switches are supported.",
+  "Closing an undrained input retains its pending slot until shell exit.",
+  "Read failures, including exhausted pending slots, can consume input.",
   (char *)NULL
 };
 

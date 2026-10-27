@@ -24,11 +24,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <limits.h>
 #include <signal.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 
 #include "loadables.h"
+#include "child-wait.h"
 
 extern char *ionice_doc[];
 
@@ -65,11 +67,14 @@ parse_class (const char *s, int *out)
     return -1;
 }
 
-static void
+static int
 print_ioprio (int pid)
 {
     int v = ioprio_get_p (pid);
-    if (v < 0) { printf ("unknown\n"); return; }
+    if (v < 0) {
+        builtin_error ("ioprio_get (pid %d): %s", pid, strerror (errno));
+        return EXECUTION_FAILURE;
+    }
     int cls = IOPRIO_PRIO_CLASS (v);
     int data = IOPRIO_PRIO_DATA (v);
     if (cls < 0 || cls > 3) cls = 0;
@@ -79,6 +84,7 @@ print_ioprio (int pid)
         printf ("%s\n", class_names[cls]);
     else
         printf ("%s: prio %d\n", class_names[cls], data);
+    return EXECUTION_SUCCESS;
 }
 
 int
@@ -109,13 +115,19 @@ ionice_builtin (WORD_LIST *list)
         if (opt == 'c') {
             if (parse_class (val, &klass) < 0) { builtin_error ("invalid class: %s", val); return EX_USAGE; }
         } else if (opt == 'n') {
-            char *end = NULL; long l = strtol (val, &end, 10);
-            if (*end || l < 0 || l > 7) { builtin_error ("invalid priority (0-7): %s", val); return EX_USAGE; }
+            char *end = NULL; errno = 0;
+            long l = strtol (val, &end, 10);
+            if (errno || end == val || *end || l < 0 || l > 7) { builtin_error ("invalid priority (0-7): %s", val); return EX_USAGE; }
             level = (int) l;
         } else if (opt == 'p') {
-            char *end = NULL; long l = strtol (val, &end, 10);
-            if (*end || l < 0) { builtin_error ("invalid pid: %s", val); return EX_USAGE; }
-            if (npid < (int)(sizeof pids / sizeof pids[0])) pids[npid++] = (int) l;
+            char *end = NULL; errno = 0;
+            long l = strtol (val, &end, 10);
+            if (errno || end == val || *end || l < 0 || l > INT_MAX) { builtin_error ("invalid pid: %s", val); return EX_USAGE; }
+            if (npid == (int)(sizeof pids / sizeof pids[0])) {
+                builtin_error ("too many process IDs (maximum 256)");
+                return EX_USAGE;
+            }
+            pids[npid++] = (int) l;
         }
         list = list->next;
     }
@@ -124,6 +136,8 @@ ionice_builtin (WORD_LIST *list)
     /* When setting, default the class to best-effort and the level to 4. */
     int eff_class = (klass >= 0) ? klass : IOPRIO_CLASS_BE;
     int eff_level = (level >= 0) ? level : 4;
+    if (eff_class == IOPRIO_CLASS_NONE || eff_class == IOPRIO_CLASS_IDLE)
+        eff_level = 0;
 
     if (npid > 0) {
         int rc = EXECUTION_SUCCESS;
@@ -134,7 +148,7 @@ ionice_builtin (WORD_LIST *list)
                     rc = EXECUTION_FAILURE;
                 }
             } else {
-                print_ioprio (pids[i]);
+                if (print_ioprio (pids[i]) != EXECUTION_SUCCESS) rc = EXECUTION_FAILURE;
             }
         }
         return rc;
@@ -142,8 +156,7 @@ ionice_builtin (WORD_LIST *list)
 
     if (!list) {
         /* No pid, no command: print our own class/priority. */
-        print_ioprio (0);
-        return EXECUTION_SUCCESS;
+        return print_ioprio (0);
     }
 
     /* Command form: set our intended class, then fork+exec it. */
@@ -153,24 +166,32 @@ ionice_builtin (WORD_LIST *list)
     int i = 0; for (WORD_LIST *p = list; p; p = p->next) argv[i++] = p->word->word;
     argv[argc] = NULL;
 
-    struct sigaction chld_dfl, chld_save;
-    memset (&chld_dfl, 0, sizeof chld_dfl);
-    chld_dfl.sa_handler = SIG_DFL; sigemptyset (&chld_dfl.sa_mask);
-    sigaction (SIGCHLD, &chld_dfl, &chld_save);
+    bos_child_wait child_wait;
+    if (bos_child_wait_begin (&child_wait) < 0) {
+        builtin_error ("SIGCHLD setup: %s", strerror (errno));
+        free (argv); return EXECUTION_FAILURE;
+    }
 
+    maybe_make_export_env ();
+    fflush (stdout);
+    fflush (stderr);
     pid_t pid = fork ();
-    if (pid < 0) { builtin_error ("fork: %s", strerror (errno)); sigaction (SIGCHLD, &chld_save, NULL); free (argv); return EXECUTION_FAILURE; }
+    if (pid < 0) { builtin_error ("fork: %s", strerror (errno)); bos_child_wait_end (&child_wait); free (argv); return EXECUTION_FAILURE; }
     if (pid == 0) {
-        if (ioprio_set_p (0, eff_class, eff_level) < 0 && !ignore_fail)
+        bos_child_wait_child (&child_wait);
+        if (ioprio_set_p (0, eff_class, eff_level) < 0 && !ignore_fail) {
             fprintf (stderr, "ionice: ioprio_set: %s\n", strerror (errno));
+            _exit (EXECUTION_FAILURE);
+        }
         execvp (argv[0], argv);
-        fprintf (stderr, "ionice: %s: %s\n", argv[0], strerror (errno));
-        _exit (errno == ENOENT ? 127 : 126);
+        int saved = errno;
+        fprintf (stderr, "ionice: %s: %s\n", argv[0], strerror (saved));
+        _exit (saved == ENOENT ? 127 : 126);
     }
     free (argv);
     int wst = 0, status = EXECUTION_SUCCESS; pid_t w;
     while ((w = waitpid (pid, &wst, 0)) < 0 && errno == EINTR) ;
-    sigaction (SIGCHLD, &chld_save, NULL);
+    bos_child_wait_end (&child_wait);
     if (w < 0) { builtin_error ("waitpid: %s", strerror (errno)); return EXECUTION_FAILURE; }
     if (WIFEXITED (wst)) status = WEXITSTATUS (wst);
     else if (WIFSIGNALED (wst)) status = 128 + WTERMSIG (wst);

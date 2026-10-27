@@ -230,6 +230,10 @@ int main(void) {
         if (console > 2)
             close(console);
     }
+    mkdir("/dev/shm", 01777);
+    mount_fs("tmpfs", "/dev/shm", "tmpfs", MS_NOSUID | MS_NODEV, "mode=1777");
+    mkdir("/dev/mqueue", 01777);
+    mount_fs("mqueue", "/dev/mqueue", "mqueue", MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL);
     mkdir("/dev/pts", 0755);
     mount_fs("devpts", "/dev/pts", "devpts", MS_NOSUID | MS_NOEXEC, "mode=0620,ptmxmode=0666");
     unlink("/dev/ptmx");

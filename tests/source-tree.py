@@ -74,6 +74,7 @@ class SourceTreeTests(unittest.TestCase):
             "scripts/build-portable.py", "scripts/build-sandbox.py", "scripts/dev.py",
             "scripts/elf_dependencies.py", "scripts/runtime.py", "config/os-release", "tests/workspace.py",
             "SOURCE.json", "CMakeLists.txt", "flake.nix", "flake.lock",
+            "scripts/release_version.py", "tests/release-version.py",
             "patches/capsule-test.patch",
             "vendor/bash-os/build.sh", "vendor/bash-os/config/dependencies.json",
             "vendor/bash-os/loadables/tool.c",

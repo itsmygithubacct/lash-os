@@ -1,11 +1,13 @@
 {
   "bash_os": {
     "source": "https://github.com/itsmygithubacct/bash-os",
-    "revision": "fa178afafddfce8ee870975a38a7f271b25140a9",
+    "revision": "8381e8136626d18083d470ac26ba079ad0b2f602",
     "local_transformations": [
       "scripts/adapt-workspaces.py"
     ],
-    "vendored_scope": "Build inputs and licenses; upstream CI, benchmarks, development reports, examples and tests omitted"
+    "vendored_scope": "Build inputs and licenses; upstream CI, benchmarks, development reports, examples and tests omitted",
+    "version": "0.1.2",
+    "release_tag": "v0.1.2"
   },
   "bpf_capsule": {
     "source": "https://github.com/ayles/bpf-capsule",

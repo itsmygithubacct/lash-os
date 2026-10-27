@@ -30,11 +30,14 @@
 #include <unistd.h>
 #include <sys/socket.h>
 #include <sys/statvfs.h>
+#include <sys/statfs.h>
 #include <sys/epoll.h>
 #include <sys/timex.h>
 #include <sys/msg.h>
 #include <sys/shm.h>
 #include <sys/sem.h>
+#include <mqueue.h>
+#include <semaphore.h>
 #include <netdb.h>
 #include <ifaddrs.h>
 #include <netpacket/packet.h>
@@ -63,11 +66,14 @@
 #define MAX_FDS 256
 #define MAX_DIRS 64
 #include "fds_host.h"
+#include "named_sem_host.h"
+#include "calendar_host.h"
 struct bridge_host {
     struct bpf_capsule *capsule;
     const void *image;
     size_t image_size;
     int fds[MAX_FDS];
+    struct named_semaphores semaphores;
     DIR *dirs[MAX_DIRS];
     int dir_fds[MAX_DIRS];
 };
@@ -1062,6 +1068,7 @@ int main(int argc, char **argv) {
                 calls + 1, (unsigned long long)c->io_calls);
     }
 cleanup:
+    close_named_semaphores(&host.semaphores);
     release_descriptor_slots(&reserved);
     for (int i = 0; i < MAX_DIRS; i++)
         if (host.dirs[i]) {

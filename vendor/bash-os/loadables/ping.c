@@ -13,10 +13,8 @@
  *   bashping HOST              — 5 ICMP echoes, 1s interval, summary
  *   bashping -T HOST           — traceroute (UDP probe, incremental TTL)
  *
- * Both need raw sockets, which need either uid 0 or CAP_NET_RAW. A
- * setcap on bash itself is the recommended path for non-root users:
- *
- *     setcap cap_net_raw=ep /bin/bash
+ * Echo probes try raw sockets, then Linux datagram ping sockets on permission
+ * denial. Traceroute requires raw sockets. No capability changes are made.
  *
  * IPv4 and IPv6 are supported. IPv6 uses ICMPv6 echo and the IPv6
  * hop-limit traceroute analogue.
@@ -33,9 +31,6 @@
  *   subset instead of importing iputils wholesale.
  *
  * Limitations / non-goals at v1:
- *   - No identifier-vs-pid disambiguation for kernel ICMP demux
- *     (Linux's ping_socket(2) for unprivileged ping isn't used; we
- *      stick to SOCK_RAW for portability and full payload control)
  *   - No SOCK_RAW IP_HDRINCL — kernel writes the IP header
  *   - No DSCP / ToS flags
  *   - No record-route / source-route options
@@ -84,25 +79,28 @@
 #include <poll.h>
 
 #include "loadables.h"
+#include "unwind_prot.h"
+#include "trap.h"
 
 /* ---- common helpers ------------------------------------------------- */
 
 static unsigned short
 bp_checksum (const void *vbuf, int len)
 {
-  const unsigned short *buf = vbuf;
+  const unsigned char *buf = vbuf;
   unsigned long sum = 0;
-  while (len > 1) { sum += *buf++; len -= 2; }
-  if (len == 1) { unsigned short last = 0; *(unsigned char *) &last = *(unsigned char *) buf; sum += last; }
+  while (len > 1) { sum += ((unsigned) buf[0] << 8) | buf[1]; buf += 2; len -= 2; }
+  if (len == 1) sum += (unsigned) buf[0] << 8;
   while (sum >> 16) sum = (sum & 0xffff) + (sum >> 16);
-  return (unsigned short) ~sum;
+  return htons ((unsigned short) ~sum);
 }
 
 static double
 bp_now_ms (void)
 {
   struct timespec ts;
-  clock_gettime (CLOCK_MONOTONIC, &ts);
+  if (clock_gettime (CLOCK_MONOTONIC, &ts) < 0)
+    return NAN;
   return ts.tv_sec * 1000.0 + ts.tv_nsec / 1.0e6;
 }
 
@@ -231,141 +229,6 @@ bp_parse_double (const char *s, double lo, double hi, double *out,
 /* ---- bashping ------------------------------------------------------- */
 
 static int
-bashping4_main (int count, double interval_ms, double timeout_ms,
-                const char *host, const struct in_addr *dstp, int quiet)
-{
-  struct in_addr dst = *dstp;
-
-  int sock = socket (AF_INET, SOCK_RAW, IPPROTO_ICMP);
-  if (sock < 0)
-    {
-      if (errno == EPERM || errno == EACCES)
-        builtin_error ("CAP_NET_RAW required (try: sudo setcap cap_net_raw=ep $(which bash))");
-      else
-        builtin_error ("socket: %s", strerror (errno));
-      return 1;
-    }
-
-  /* Pretty: print "PING host (ip): N data bytes" header, ping(8)-style. */
-  char ip_str[INET_ADDRSTRLEN];
-  inet_ntop (AF_INET, &dst, ip_str, sizeof ip_str);
-  printf ("PING %s (%s) 56(84) bytes of data.\n", host, ip_str);
-
-  /* Build a 64-byte payload: 8-byte ICMP header + 56-byte data. */
-  unsigned char tx[64], rx[1500];
-  struct icmphdr *hdr = (struct icmphdr *) tx;
-  unsigned short id = (unsigned short) (getpid () & 0xffff);
-
-  int sent = 0, received = 0;
-  double rtt_min = 1e18, rtt_max = 0, rtt_sum = 0, rtt_sumsq = 0;
-  double run_start = bp_now_ms ();
-
-  for (int seq = 1; seq <= count; seq++)
-    {
-      memset (tx, 0, sizeof tx);
-      hdr->type = ICMP_ECHO;
-      hdr->code = 0;
-      hdr->un.echo.id = htons (id);
-      hdr->un.echo.sequence = htons ((unsigned short) seq);
-      /* Stamp send time into the payload so we don't need a sent[]
-         table to look up rtt; ping(8) does the same trick. */
-      double tsend = bp_now_ms ();
-      memcpy (tx + 8, &tsend, sizeof tsend);
-      /* Fill the rest with a recognizable pattern. */
-      for (size_t i = 8 + sizeof tsend; i < sizeof tx; i++)
-        tx[i] = (unsigned char) i;
-      hdr->checksum = 0;
-      hdr->checksum = bp_checksum (tx, sizeof tx);
-
-      struct sockaddr_in to = { 0 };
-      to.sin_family = AF_INET;
-      to.sin_addr = dst;
-      ssize_t n = sendto (sock, tx, sizeof tx, 0,
-                          (struct sockaddr *) &to, sizeof to);
-      if (n < 0)
-        {
-          fprintf (stderr, "  seq %d: sendto: %s\n", seq, strerror (errno));
-        }
-      else
-        {
-          sent++;
-        }
-
-      /* Wait for echo reply (or timeout). Loop in case we get other
-         ICMP traffic on the raw socket. */
-      double deadline = bp_now_ms () + timeout_ms;
-      for (;;)
-        {
-          double now = bp_now_ms ();
-          if (now >= deadline) { if (!quiet) printf ("  seq %d: timeout\n", seq); break; }
-          struct pollfd pfd = { sock, POLLIN, 0 };
-          int pr = poll (&pfd, 1, (int) (deadline - now));
-          if (pr <= 0) { if (!quiet) printf ("  seq %d: timeout\n", seq); break; }
-          struct sockaddr_in from = { 0 };
-          socklen_t flen = sizeof from;
-          ssize_t r = recvfrom (sock, rx, sizeof rx, 0,
-                                (struct sockaddr *) &from, &flen);
-          if (r < 0)
-            {
-              if (errno == EINTR) continue;
-              fprintf (stderr, "  seq %d: recvfrom: %s\n", seq, strerror (errno));
-              break;
-            }
-          /* Truncation guard — shared with bashping selftest-truncated
-             (bp_selftest_truncated). Adds an IHL sanity check
-             (`hlen >= sizeof(struct ip)`) that the old inline form
-             didn't have — guards against a hostile-but-non-truncated
-             reply with `ip_hl=0` that would otherwise pass the
-             per-byte-count gate. */
-          if (!bp_reply_acceptable (rx, r)) continue;
-          struct ip *iph = (struct ip *) rx;
-          int hlen = iph->ip_hl * 4;
-          struct icmphdr *rh = (struct icmphdr *) (rx + hlen);
-          if (rh->type != ICMP_ECHOREPLY) continue;
-          if (ntohs (rh->un.echo.id) != id) continue;
-          unsigned short rseq = ntohs (rh->un.echo.sequence);
-          /* Look up our timestamp from the payload (we put it there). */
-          double tsent;
-          memcpy (&tsent, rx + hlen + 8, sizeof tsent);
-          double rtt = bp_now_ms () - tsent;
-          received++;
-          if (rtt < rtt_min) rtt_min = rtt;
-          if (rtt > rtt_max) rtt_max = rtt;
-          rtt_sum += rtt;
-          rtt_sumsq += rtt * rtt;
-          char src[INET_ADDRSTRLEN];
-          inet_ntop (AF_INET, &iph->ip_src, src, sizeof src);
-          if (!quiet)
-            printf ("64 bytes from %s: icmp_seq=%u ttl=%d time=%.3f ms\n",
-                    src, (unsigned) rseq, iph->ip_ttl, rtt);
-          break;
-        }
-
-      if (seq < count)
-        {
-          struct timespec ts = { (time_t) (interval_ms / 1000),
-                                 (long) ((long long) interval_ms % 1000) * 1000000L };
-          nanosleep (&ts, NULL);
-        }
-    }
-
-  close (sock);
-
-  double elapsed = bp_now_ms () - run_start;
-  double loss = sent > 0 ? 100.0 * (sent - received) / sent : 0.0;
-  printf ("\n--- %s ping statistics ---\n", host);
-  printf ("%d packets transmitted, %d received, %.0f%% packet loss, time %.0fms\n",
-          sent, received, loss, elapsed);
-  if (received > 0)
-    printf ("rtt min/avg/max/mdev = %.3f/%.3f/%.3f/%.3f ms\n",
-            rtt_min, rtt_sum / received, rtt_max,
-            bp_mdev (received, rtt_sum, rtt_sumsq));
-
-  /* Exit code: 0 if any received, 1 otherwise (matches ping(8)). */
-  return received > 0 ? 0 : 1;
-}
-
-static int
 bp6_build_echo (unsigned short id, unsigned short seq, double tsend,
                 unsigned char *tx, size_t txlen)
 {
@@ -418,63 +281,128 @@ bp6_trace_type_acceptable (unsigned char type, int *reached_out)
   return 0;
 }
 
+/* Match the complete request identity and payload, including the local send
+   timestamp. A late reply or duplicate cannot satisfy a later probe. ICMPv6
+   checksum verification is performed by the receive socket in the kernel. */
 static int
-bashping6_main (int count, double interval_ms, double timeout_ms,
-                const char *host, const struct sockaddr_in6 *dstp, int quiet)
+bp_echo_matches (const unsigned char *rx, ssize_t len,
+                 const unsigned char *tx, int family)
 {
-  struct sockaddr_in6 dst = *dstp;
-  int sock = socket (AF_INET6, SOCK_RAW, IPPROTO_ICMPV6);
+  return len == 64 && rx[0] == (family == AF_INET ? ICMP_ECHOREPLY : ICMP6_ECHO_REPLY)
+         && rx[1] == 0 && memcmp (rx + 4, tx + 4, 60) == 0
+         && (family != AF_INET || bp_checksum (rx, 64) == 0);
+}
+
+static void
+bp_close_echo_socket (void *arg)
+{
+  close (*(int *) arg);
+}
+
+static int
+bp_echo_main (int count, double interval_ms, double timeout_ms,
+              double deadline_ms, const char *host,
+              const struct sockaddr_storage *dst, socklen_t dstlen, int quiet)
+{
+  int family = dst->ss_family;
+  int proto = family == AF_INET ? IPPROTO_ICMP : IPPROTO_ICMPV6;
   int raw_socket = 1;
+  int sock = socket (family, SOCK_RAW, proto);
   if (sock < 0 && (errno == EPERM || errno == EACCES))
     {
-      sock = socket (AF_INET6, SOCK_DGRAM, IPPROTO_ICMPV6);
+      sock = socket (family, SOCK_DGRAM, proto);
       raw_socket = 0;
     }
   if (sock < 0)
     {
-      if (errno == EPERM || errno == EACCES)
-        builtin_error ("CAP_NET_RAW required (try: sudo setcap cap_net_raw=ep $(which bash))");
-      else
-        builtin_error ("socket: %s", strerror (errno));
+      builtin_error ("ICMP socket: %s (raw sockets require CAP_NET_RAW; ping sockets require kernel permission)",
+                     strerror (errno));
       return 1;
     }
 
-  int csum_offset = 2;
-  setsockopt (sock, IPPROTO_IPV6, IPV6_CHECKSUM, &csum_offset, sizeof csum_offset);
-  int one = 1;
-  setsockopt (sock, IPPROTO_IPV6, IPV6_RECVHOPLIMIT, &one, sizeof one);
+  begin_unwind_frame ("ping socket");
+  add_unwind_protect (bp_close_echo_socket, &sock);
+
+  unsigned short id = (unsigned short) getpid ();
+  if (!raw_socket)
+    {
+      /* Linux ping sockets rewrite the identifier to their local port. Connect
+         it before constructing requests so the reply identity stays checked. */
+      struct sockaddr_storage local;
+      socklen_t local_len = sizeof local;
+      if (connect (sock, (const struct sockaddr *) dst, dstlen) < 0
+          || getsockname (sock, (struct sockaddr *) &local, &local_len) < 0)
+        {
+          builtin_error ("ping socket setup: %s", strerror (errno));
+          run_unwind_frame ("ping socket");
+          return 1;
+        }
+      id = ntohs (family == AF_INET
+                   ? ((struct sockaddr_in *) &local)->sin_port
+                   : ((struct sockaddr_in6 *) &local)->sin6_port);
+    }
+  if (family == AF_INET6)
+    {
+      int one = 1;
+      setsockopt (sock, IPPROTO_IPV6, IPV6_RECVHOPLIMIT, &one, sizeof one);
+      /* ICMPv6 sockets already have checksum offset 2 by protocol definition. */
+    }
 
   char ip_str[INET6_ADDRSTRLEN];
-  inet_ntop (AF_INET6, &dst.sin6_addr, ip_str, sizeof ip_str);
+  const void *dstaddr = family == AF_INET
+    ? (const void *) &((const struct sockaddr_in *) dst)->sin_addr
+    : (const void *) &((const struct sockaddr_in6 *) dst)->sin6_addr;
+  inet_ntop (family, dstaddr, ip_str, sizeof ip_str);
   printf ("PING %s (%s) 56 data bytes\n", host, ip_str);
 
   unsigned char tx[64], rx[1500];
-  unsigned short id = (unsigned short) (getpid () & 0xffff);
-  int sent = 0, received = 0;
+  int sent = 0, received = 0, failed = 0;
   double rtt_min = 1e18, rtt_max = 0, rtt_sum = 0, rtt_sumsq = 0;
   double run_start = bp_now_ms ();
+  if (!isfinite (run_start)) goto clock_error;
+  double run_end = deadline_ms > 0 ? run_start + deadline_ms : INFINITY;
 
   for (int seq = 1; seq <= count; seq++)
     {
+      QUIT;
+      if (signal_is_pending (SIGINT)) goto interrupted;
       double tsend = bp_now_ms ();
+      if (!isfinite (tsend)) goto clock_error;
+      if (tsend >= run_end) break;
       bp6_build_echo (id, (unsigned short) seq, tsend, tx, sizeof tx);
+      if (family == AF_INET)
+        {
+          tx[0] = ICMP_ECHO;
+          unsigned short checksum = bp_checksum (tx, sizeof tx);
+          memcpy (tx + 2, &checksum, sizeof checksum);
+        }
       ssize_t n = sendto (sock, tx, sizeof tx, 0,
-                          (struct sockaddr *) &dst, sizeof dst);
-      if (n < 0)
-        fprintf (stderr, "  seq %d: sendto: %s\n", seq, strerror (errno));
-      else
-        sent++;
+                          (const struct sockaddr *) dst, dstlen);
+      if (n != sizeof tx)
+        {
+          builtin_error ("seq %d: sendto: %s", seq, n < 0 ? strerror (errno) : "short write");
+          failed = 1;
+          break;
+        }
+      sent++;
 
-      double deadline = bp_now_ms () + timeout_ms;
+      double deadline = fmin (tsend + timeout_ms, run_end);
       for (;;)
         {
+          QUIT;
+          if (signal_is_pending (SIGINT)) goto interrupted;
           double now = bp_now_ms ();
-          if (now >= deadline) { if (!quiet) printf ("  seq %d: timeout\n", seq); break; }
+          if (!isfinite (now)) goto clock_error;
+          if (now >= deadline)
+            { if (!quiet) printf ("  seq %d: timeout\n", seq); break; }
           struct pollfd pfd = { sock, POLLIN, 0 };
-          int pr = poll (&pfd, 1, (int) (deadline - now));
-          if (pr <= 0) { if (!quiet) printf ("  seq %d: timeout\n", seq); break; }
+          int pr = poll (&pfd, 1, (int) ceil (deadline - now));
+          if (pr < 0 && errno == EINTR) { QUIT; continue; }
+          if (pr < 0 || (pr > 0 && !(pfd.revents & POLLIN)))
+            { builtin_error ("ICMP poll: %s", pr < 0 ? strerror (errno) : "socket error"); failed = 1; break; }
+          if (pr == 0) continue;
 
-          struct sockaddr_in6 from = { 0 };
+          struct sockaddr_storage from = { 0 };
           unsigned char cbuf[128];
           struct iovec iov = { rx, sizeof rx };
           struct msghdr msg = { 0 };
@@ -484,80 +412,111 @@ bashping6_main (int count, double interval_ms, double timeout_ms,
           msg.msg_iovlen = 1;
           msg.msg_control = cbuf;
           msg.msg_controllen = sizeof cbuf;
-          ssize_t r = recvmsg (sock, &msg, 0);
+          ssize_t r = recvmsg (sock, &msg, MSG_DONTWAIT);
           if (r < 0)
             {
-              if (errno == EINTR) continue;
-              fprintf (stderr, "  seq %d: recvmsg: %s\n", seq, strerror (errno));
-              break;
+              if (errno == EINTR) { QUIT; continue; }
+              if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
+              builtin_error ("recvmsg: %s", strerror (errno)); failed = 1; break;
             }
+          if (msg.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) continue;
+          const void *srcaddr = family == AF_INET
+            ? (const void *) &((struct sockaddr_in *) &from)->sin_addr
+            : (const void *) &((struct sockaddr_in6 *) &from)->sin6_addr;
+          if (from.ss_family != family
+              || memcmp (srcaddr, dstaddr, family == AF_INET ? 4 : 16)) continue;
 
-          unsigned short rseq = 0;
-          double tsent = 0;
-          if (!bp6_parse_echo_reply (rx, r, id, raw_socket, &rseq, &tsent))
-            continue;
-
-          int hoplimit = 0;
+          int hlen = 0, hoplimit = 0;
+          if (family == AF_INET && raw_socket)
+            {
+              if (!bp_reply_acceptable (rx, r)) continue;
+              hlen = (rx[0] & 15) * 4;
+              unsigned short total, frag;
+              memcpy (&total, rx + 2, 2);
+              memcpy (&frag, rx + 6, 2);
+              if ((rx[0] >> 4) != 4 || rx[9] != IPPROTO_ICMP
+                  || ntohs (total) != r || (ntohs (frag) & 0x3fff)
+                  || memcmp (rx + 12, dstaddr, 4)
+                  || bp_checksum (rx, hlen) != 0) continue;
+              hoplimit = rx[8];
+            }
+          if (!bp_echo_matches (rx + hlen, r - hlen, tx, family)) continue;
           for (struct cmsghdr *cm = CMSG_FIRSTHDR (&msg); cm;
                cm = CMSG_NXTHDR (&msg, cm))
             if (cm->cmsg_level == IPPROTO_IPV6 && cm->cmsg_type == IPV6_HOPLIMIT
                 && cm->cmsg_len >= CMSG_LEN (sizeof (int)))
               memcpy (&hoplimit, CMSG_DATA (cm), sizeof hoplimit);
 
-          double rtt = bp_now_ms () - tsent;
+          double arrived = bp_now_ms ();
+          if (!isfinite (arrived)) goto clock_error;
+          if (arrived >= deadline) continue;
+          double rtt = arrived - tsend;
+          if (rtt < 0) goto clock_error;
           received++;
           if (rtt < rtt_min) rtt_min = rtt;
           if (rtt > rtt_max) rtt_max = rtt;
           rtt_sum += rtt;
           rtt_sumsq += rtt * rtt;
-          char src[INET6_ADDRSTRLEN];
-          inet_ntop (AF_INET6, &from.sin6_addr, src, sizeof src);
           if (!quiet)
             printf ("64 bytes from %s: icmp_seq=%u ttl=%d time=%.3f ms\n",
-                    src, (unsigned) rseq, hoplimit, rtt);
+                    ip_str, (unsigned) seq, hoplimit, rtt);
           break;
         }
-
+      if (failed) break;
+      /* Interval is measured between sends, including time spent waiting. */
       if (seq < count)
         {
-          struct timespec ts = { (time_t) (interval_ms / 1000),
-                                 (long) ((long long) interval_ms % 1000) * 1000000L };
-          nanosleep (&ts, NULL);
+          double next = fmin (tsend + interval_ms, run_end);
+          for (;;)
+            {
+              QUIT;
+              if (signal_is_pending (SIGINT)) goto interrupted;
+              double now = bp_now_ms ();
+              if (!isfinite (now)) goto clock_error;
+              double delay = next - now;
+              if (delay <= 0) break;
+              long long ns = (long long) ceil (delay * 1e6);
+              struct timespec ts = { (time_t) (ns / 1000000000),
+                                     (long) (ns % 1000000000) };
+              if (nanosleep (&ts, NULL) < 0 && errno != EINTR)
+                { builtin_error ("nanosleep: %s", strerror (errno)); failed = 1; break; }
+              QUIT;
+              if (signal_is_pending (SIGINT)) goto interrupted;
+            }
+          if (failed) break;
         }
     }
-
-  close (sock);
-  double elapsed = bp_now_ms () - run_start;
-  double loss = sent > 0 ? 100.0 * (sent - received) / sent : 0.0;
-  printf ("\n--- %s ping statistics ---\n", host);
-  printf ("%d packets transmitted, %d received, %.0f%% packet loss, time %.0fms\n",
-          sent, received, loss, elapsed);
-  if (received > 0)
-    printf ("rtt min/avg/max/mdev = %.3f/%.3f/%.3f/%.3f ms\n",
-            rtt_min, rtt_sum / received, rtt_max,
-            bp_mdev (received, rtt_sum, rtt_sumsq));
-  return received > 0 ? 0 : 1;
+  {
+    double end = bp_now_ms ();
+    if (!isfinite (end)) goto clock_error;
+    run_unwind_frame ("ping socket");
+    printf ("\n--- %s ping statistics ---\n", host);
+    printf ("%d packets transmitted, %d received, %.0f%% packet loss, time %.0fms\n",
+            sent, received, sent > 0 ? 100.0 * (sent - received) / sent : 0.0,
+            end - run_start);
+    if (received > 0)
+      printf ("rtt min/avg/max/mdev = %.3f/%.3f/%.3f/%.3f ms\n",
+              rtt_min, rtt_sum / received, rtt_max,
+              bp_mdev (received, rtt_sum, rtt_sumsq));
+    return fflush (stdout) == 0 && !ferror (stdout) && !failed && received > 0 ? 0 : 1;
+  }
+clock_error:
+  builtin_error ("monotonic clock unavailable or invalid");
+interrupted:
+  run_unwind_frame ("ping socket");
+  return 1;
 }
 
 static int
 bashping_main (int count, double interval_ms, double timeout_ms,
-               const char *host, int family, int quiet)
+               double deadline_ms, const char *host, int family, int quiet)
 {
   struct sockaddr_storage ss;
   socklen_t slen = 0;
   if (bp_resolve_sockaddr (host, family, SOCK_RAW, 0, &ss, &slen) < 0)
-    {
-      builtin_error ("cannot resolve %s", host);
-      return 1;
-    }
-  if (ss.ss_family == AF_INET)
-    return bashping4_main (count, interval_ms, timeout_ms, host,
-                           &((struct sockaddr_in *) &ss)->sin_addr, quiet);
-  if (ss.ss_family == AF_INET6)
-    return bashping6_main (count, interval_ms, timeout_ms, host,
-                           (struct sockaddr_in6 *) &ss, quiet);
-  builtin_error ("unsupported address family for %s", host);
-  return 1;
+    { builtin_error ("cannot resolve %s", host); return 1; }
+  return bp_echo_main (count, interval_ms, timeout_ms, deadline_ms,
+                       host, &ss, slen, quiet);
 }
 
 /* Forward decl — body comes after bashtraceroute_main. */
@@ -579,11 +538,10 @@ bp_reply_acceptable (const unsigned char *rx, ssize_t r)
 {
     if (r < (ssize_t) (sizeof (struct ip) + 8 + sizeof (double)))
         return 0;
-    const struct ip *iph = (const struct ip *) rx;
-    int hlen = iph->ip_hl * 4;
+    int hlen = (rx[0] & 15) * 4;
     if (hlen < (int) sizeof (struct ip))   /* IHL field nonsense */
         return 0;
-    if (r < hlen + 8)
+    if (r < hlen + 8 + (ssize_t) sizeof (double))
         return 0;
     return 1;
 }
@@ -910,9 +868,11 @@ ping_builtin (WORD_LIST *list)
   int family = AF_UNSPEC;
   double interval_ms = 1000.0;
   double timeout_ms = 1000.0;
+  double deadline_ms = 0;
 
+  clearerr (stdout);
   reset_internal_getopt ();
-  while ((opt = internal_getopt (list, "46VTc:W:i:m:qQ:")) != -1)
+  while ((opt = internal_getopt (list, "46VTc:W:w:i:m:qQ:")) != -1)
     {
       long lv; double dv;
       switch (opt)
@@ -932,6 +892,10 @@ ping_builtin (WORD_LIST *list)
           if (bp_parse_double (list_optarg, 0.1, 60.0, &dv, "-W TIMEOUT") < 0)
             return (EX_USAGE);
           timeout_ms = dv * 1000.0; break;
+        case 'w':
+          if (bp_parse_double (list_optarg, 0.001, 86400.0, &dv, "-w DEADLINE") < 0)
+            return (EX_USAGE);
+          deadline_ms = dv * 1000.0; break;
         case 'i':
           if (bp_parse_double (list_optarg, 0.1, 60.0, &dv, "-i INTERVAL") < 0)
             return (EX_USAGE);
@@ -959,6 +923,14 @@ ping_builtin (WORD_LIST *list)
       return (EX_USAGE);
     }
 
+  const char *host = list->word->word;
+  if (list->next != 0)
+    {
+      builtin_error ("at most one HOST argument is accepted");
+      return (EX_USAGE);
+    }
+
+
   /* Special verb: selftest-checksum exercises bp_checksum with known vectors. */
   if (strcmp (list->word->word, "selftest-checksum") == 0)
     return bp_selftest_checksum ();
@@ -972,15 +944,11 @@ ping_builtin (WORD_LIST *list)
   if (strcmp (list->word->word, "selftest-ipv6-codec") == 0)
     return bp_selftest_ipv6_codec ();
 
-  const char *host = list->word->word;
-  if (list->next != 0)
-    {
-      builtin_error ("at most one HOST argument is accepted");
-      return (EX_USAGE);
-    }
 
   if (trace_mode)
     {
+      if (deadline_ms > 0)
+        { builtin_error ("-w is only supported for echo probes"); return EX_USAGE; }
       if (max_ttl <= 0)        max_ttl = 1;
       if (max_ttl > 64)        max_ttl = 64;
       if (probes_per_hop <= 0) probes_per_hop = 1;
@@ -995,7 +963,7 @@ ping_builtin (WORD_LIST *list)
   if (interval_ms < 100) interval_ms = 100;
   if (timeout_ms < 100) timeout_ms = 100;
 
-  return bashping_main (count, interval_ms, timeout_ms, host, family, quiet) == 0
+  return bashping_main (count, interval_ms, timeout_ms, deadline_ms, host, family, quiet) == 0
          ? EXECUTION_SUCCESS : EXECUTION_FAILURE;
 }
 
@@ -1010,9 +978,8 @@ char *ping_doc[] = {
   "  bashping selftest-trace-truncated",
   "                               # unit-test traceroute reply truncation guard",
   "",
-  "Requires CAP_NET_RAW (uid 0 has it; for non-root, run:",
-  "    sudo setcap cap_net_raw=ep \\$(which bash)",
-  ").",
+  "Echo requires CAP_NET_RAW or kernel permission for datagram ping sockets.",
+  "Traceroute requires CAP_NET_RAW.",
   "",
   "Options:",
   "    -4           force IPv4 resolution",
@@ -1020,6 +987,7 @@ char *ping_doc[] = {
   "    -V           print version and exit",
   "    -c COUNT     ping: number of probes (default 5)",
   "    -W TIMEOUT   per-probe timeout in seconds (default 1)",
+  "    -w DEADLINE  ping: overall deadline in seconds (0.001..86400)",
   "    -i INTERVAL  ping: inter-probe interval in seconds (default 1)",
   "    -q           ping: quiet output (summary only)",
   "    -T           traceroute mode (UDP probes, incremental TTL)",
@@ -1035,7 +1003,7 @@ struct builtin bashping_struct = {
   ping_builtin,
   BUILTIN_ENABLED,
   ping_doc,
-  "bashping [-4|-6] [-T] [-q] [-c N] [-W T] [-i I] [-m MAX_TTL] [-Q PROBES] HOST",
+  "bashping [-4|-6] [-T] [-q] [-c N] [-W T] [-w D] [-i I] [-m MAX_TTL] [-Q PROBES] HOST",
   0
 };
 

@@ -13,8 +13,9 @@ import tarfile
 import tempfile
 
 sys.dont_write_bytecode = True
-from runtime import ARCHES, digest, fetch
+from runtime import ARCHES, digest, fetch, guest_dependencies
 from workspace import ROOT, BUILD, DOWNLOADS, OUT
+from release_version import release_metadata
 
 
 def json_bytes(value):
@@ -44,7 +45,7 @@ def source_inputs():
     for name, sha256 in re.findall(r'"(bash\d+-\d{3}) ([a-f0-9]{64})"', versions):
         add(fetch(f"https://ftp.gnu.org/gnu/bash/bash-{version}-patches/{name}", sha256,
                   DOWNLOADS / "patches" / name), "downloads/patches/" + name, sha256)
-    dependencies = json.loads((ROOT / "vendor/bash-os/config/dependencies.json").read_text())
+    dependencies = guest_dependencies(ROOT)
     for package in dependencies.values():
         name = package["url"].rsplit("/", 1)[1]
         add(fetch(package["url"], package["sha256"], DOWNLOADS / "deps" / name),
@@ -167,7 +168,7 @@ def main():
     parser.add_argument("--dependencies-only", action="store_true",
                         help="Prepare the large source archive before committing final release documentation")
     args = parser.parse_args()
-    version = (ROOT / "VERSION").read_text().strip()
+    version = release_metadata(ROOT)["version"]
     destination = OUT / "releases" / version
     destination.mkdir(parents=True, exist_ok=True)
     dependency_archive(destination / f"lashos-{version}-dependency-sources.tar.zst", version)

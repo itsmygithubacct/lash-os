@@ -536,9 +536,9 @@ tail_builtin (WORD_LIST *list)
         }
         if (!strcmp (w, "-n")) {
             long long n;
-            if (!list->next) { builtin_error ("-n needs N"); builtin_usage (); return EX_USAGE; }
+            if (!list->next) { builtin_error ("-n needs N"); builtin_usage (); return EXECUTION_FAILURE; }
             list = list->next;
-            if (bt_parse_count (list->word->word, "-n", 1, &from_start, &n) != 0) return EX_USAGE;
+            if (bt_parse_count (list->word->word, "-n", 1, &from_start, &n) != 0) return EXECUTION_FAILURE;
             if (from_start) start_count = n;
             else            n_lines = (int) n;
             n_bytes = -1;
@@ -547,9 +547,9 @@ tail_builtin (WORD_LIST *list)
         }
         if (!strcmp (w, "--lines")) {
             long long n;
-            if (!list->next) { builtin_error ("--lines needs N"); builtin_usage (); return EX_USAGE; }
+            if (!list->next) { builtin_error ("--lines needs N"); builtin_usage (); return EXECUTION_FAILURE; }
             list = list->next;
-            if (bt_parse_count (list->word->word, "--lines", 1, &from_start, &n) != 0) return EX_USAGE;
+            if (bt_parse_count (list->word->word, "--lines", 1, &from_start, &n) != 0) return EXECUTION_FAILURE;
             if (from_start) start_count = n;
             else            n_lines = (int) n;
             n_bytes = -1;
@@ -559,7 +559,7 @@ tail_builtin (WORD_LIST *list)
         if (!strncmp (w, "--lines=", 8)) {
             long long n;
             const char *v = w + 8;
-            if (bt_parse_count (v, "--lines", 1, &from_start, &n) != 0) return EX_USAGE;
+            if (bt_parse_count (v, "--lines", 1, &from_start, &n) != 0) return EXECUTION_FAILURE;
             if (from_start) start_count = n;
             else            n_lines = (int) n;
             n_bytes = -1;
@@ -568,7 +568,7 @@ tail_builtin (WORD_LIST *list)
         }
         if (!strncmp (w, "-n", 2) && (w[2] == '+' || w[2] == '-' || (w[2] >= '0' && w[2] <= '9'))) {
             long long n;
-            if (bt_parse_count (w + 2, "-n", 1, &from_start, &n) != 0) return EX_USAGE;
+            if (bt_parse_count (w + 2, "-n", 1, &from_start, &n) != 0) return EXECUTION_FAILURE;
             if (from_start) start_count = n;
             else            n_lines = (int) n;
             n_bytes = -1;
@@ -577,9 +577,9 @@ tail_builtin (WORD_LIST *list)
         }
         if (!strcmp (w, "-c")) {
             long long n;
-            if (!list->next) { builtin_error ("-c needs N"); builtin_usage (); return EX_USAGE; }
+            if (!list->next) { builtin_error ("-c needs N"); builtin_usage (); return EXECUTION_FAILURE; }
             list = list->next;
-            if (bt_parse_count (list->word->word, "-c", 1, &from_start, &n) != 0) return EX_USAGE;
+            if (bt_parse_count (list->word->word, "-c", 1, &from_start, &n) != 0) return EXECUTION_FAILURE;
             if (from_start) { start_count = n; n_bytes = 0; }
             else            n_bytes = n;
             list = list->next;
@@ -587,9 +587,9 @@ tail_builtin (WORD_LIST *list)
         }
         if (!strcmp (w, "--bytes")) {
             long long n;
-            if (!list->next) { builtin_error ("--bytes needs N"); builtin_usage (); return EX_USAGE; }
+            if (!list->next) { builtin_error ("--bytes needs N"); builtin_usage (); return EXECUTION_FAILURE; }
             list = list->next;
-            if (bt_parse_count (list->word->word, "--bytes", 1, &from_start, &n) != 0) return EX_USAGE;
+            if (bt_parse_count (list->word->word, "--bytes", 1, &from_start, &n) != 0) return EXECUTION_FAILURE;
             if (from_start) { start_count = n; n_bytes = 0; }
             else            n_bytes = n;
             list = list->next;
@@ -598,7 +598,7 @@ tail_builtin (WORD_LIST *list)
         if (!strncmp (w, "--bytes=", 8)) {
             long long n;
             const char *v = w + 8;
-            if (bt_parse_count (v, "--bytes", 1, &from_start, &n) != 0) return EX_USAGE;
+            if (bt_parse_count (v, "--bytes", 1, &from_start, &n) != 0) return EXECUTION_FAILURE;
             if (from_start) { start_count = n; n_bytes = 0; }
             else            n_bytes = n;
             list = list->next;
@@ -606,7 +606,7 @@ tail_builtin (WORD_LIST *list)
         }
         if (!strncmp (w, "-c", 2) && (w[2] == '+' || w[2] == '-' || (w[2] >= '0' && w[2] <= '9'))) {
             long long n;
-            if (bt_parse_count (w + 2, "-c", 1, &from_start, &n) != 0) return EX_USAGE;
+            if (bt_parse_count (w + 2, "-c", 1, &from_start, &n) != 0) return EXECUTION_FAILURE;
             if (from_start) { start_count = n; n_bytes = 0; }
             else            n_bytes = n;
             list = list->next;
@@ -645,14 +645,14 @@ tail_builtin (WORD_LIST *list)
             long long n;
             from_start = 0;
             n_bytes = -1;
-            if (bt_parse_count (w + 1, "-n", 0, NULL, &n) != 0) return EX_USAGE;
+            if (bt_parse_count (w + 1, "-n", 0, NULL, &n) != 0) return EXECUTION_FAILURE;
             n_lines = (int) n;
             list = list->next;
             continue;
         }
         builtin_error ("unknown flag: %s", w);
         builtin_usage ();
-        return EX_USAGE;
+        return EXECUTION_FAILURE;
     }
 
     int n_files = 0;
@@ -662,7 +662,7 @@ tail_builtin (WORD_LIST *list)
     if (n_files == 0) {
         if (follow) {
             builtin_error ("-f requires at least one FILE (cannot follow stdin)");
-            return EX_USAGE;
+            return EXECUTION_FAILURE;
         }
         stdin_f = bt_open_stdin ();
         if (!stdin_f) return EXECUTION_FAILURE;

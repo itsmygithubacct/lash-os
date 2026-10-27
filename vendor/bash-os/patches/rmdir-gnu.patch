@@ -1,0 +1,91 @@
+--- builtins/rmdir.c
++++ builtins/rmdir.c
+@@ -27,6 +27,8 @@
+ #include "../builtins.h"
+ #include "../shell.h"
+ #include "common.h"
++#include "bashgetopt.h"
++#include <unistd.h>
+ 
+ #if !defined (errno)
+ extern int errno;
+@@ -35,19 +37,50 @@
+ int
+ rmdir_builtin (WORD_LIST *list)
+ {
+-  int rval;
+-  WORD_LIST *l;
++  int rval = EXECUTION_SUCCESS, parents = 0, ignore_nonempty = 0;
++  char *path, *slash;
++  size_t length;
+ 
+-  if (no_options (list))
+-    return (EX_USAGE);
++  for (; list; list = list->next)
++    {
++      const char *word = list->word->word;
++      if (!strcmp (word, "--")) { list = list->next; break; }
++      if (!strcmp (word, "--ignore-fail-on-non-empty"))
++        { ignore_nonempty = 1; continue; }
++      if (!strcmp (word, "--help"))
++        { builtin_help (); return sh_chkwrite (EXECUTION_SUCCESS); }
++      if (word[0] != '-' || word[1] == 0) break;
++      for (const char *option = word + 1; *option; option++)
++        if (*option == 'p') parents = 1;
++        else
++          { builtin_error ("%s: invalid option", word); builtin_usage (); return EXECUTION_FAILURE; }
++    }
++  if (list == 0)
++    { builtin_error ("missing operand"); return EXECUTION_FAILURE; }
+ 
+-  for (rval = EXECUTION_SUCCESS, l = list; l; l = l->next)
+-    if (rmdir (l->word->word) < 0)
+-      {
+-	builtin_error ("%s: %s", l->word->word, strerror (errno));
+-	rval = EXECUTION_FAILURE;
+-      }
+-
++  for (; list; list = list->next)
++    {
++      path = savestring (list->word->word);
++      for (;;)
++        {
++          if (rmdir (path) < 0)
++            {
++              if (ignore_nonempty && (errno == ENOTEMPTY || errno == EEXIST)) break;
++              builtin_error ("%s: %s", path, strerror (errno));
++              rval = EXECUTION_FAILURE;
++              break;
++            }
++          if (parents == 0) break;
++          length = strlen (path);
++          while (length && path[length - 1] == '/') path[--length] = 0;
++          slash = strrchr (path, '/');
++          if (slash == 0) break;
++          while (slash > path && slash[-1] == '/') slash--;
++          if (slash == path) break;
++          *slash = 0;
++        }
++      free (path);
++    }
+   return rval;
+ }
+ 
+@@ -55,7 +88,8 @@
+ 	"Remove directory.",
+ 	"",
+ 	"rmdir removes the directory entry specified by each argument,",
+-	"provided the directory is empty.",
++	"provided the directory is empty. With -p, remove empty parents too.",
++        "--ignore-fail-on-non-empty suppresses failure for nonempty directories.",
+ 	(char *)NULL
+ };
+ 
+@@ -66,6 +100,6 @@
+ 	rmdir_builtin,		/* function implementing the builtin */
+ 	BUILTIN_ENABLED,	/* initial flags for builtin */
+ 	rmdir_doc,		/* array of long documentation strings. */
+-	"rmdir directory ...",	/* usage synopsis; becomes short_doc */
++	"rmdir [-p] [--ignore-fail-on-non-empty] DIRECTORY...",	/* usage synopsis; becomes short_doc */
+ 	0			/* reserved for internal use */
+ };

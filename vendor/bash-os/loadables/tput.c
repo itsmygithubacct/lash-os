@@ -37,7 +37,9 @@ static const char *caps[] = {
   "rmcup", "smkx", "rmkx", "smacs", "rmacs", "acsc", "sc", "rc",
   "hpa", "vpa", "ich", "dch", "dl", "il", "kf1", "kf2", "kf3", "kf4",
   "kf5", "kf6", "kf7", "kf8", "kf9", "kf10", "kf11", "kf12", "cols",
-  "lines", "colors", "longname", "reset", "init", NULL
+  "lines", "colors", "longname", "reset", "init",
+  "am", "bw", "xenl", "bce", "km", "mir", "msgr", "xon", "ccc",
+  "hc", "npc", "hs", NULL
 };
 
 typedef struct {
@@ -212,11 +214,44 @@ known_term (const char *term)
   return 0;
 }
 
+/* Curated boolean values, qualified against the same terminal profiles as
+ * the string table.  Bit positions follow terms[].  A missing boolean is
+ * false, not an unknown cap-code. */
+static const struct {
+  const char *code;
+  const char *alias;
+  unsigned int terminals;
+} boolcaps[] = {
+  { "am", "auto_right_margin", 0x7f },
+  { "bw", "auto_left_margin", 0 },
+  { "xenl", "eat_newline_glitch", 0x3f },
+  { "bce", "back_color_erase", 0x13 },
+  { "km", "has_meta_key", 0x0f },
+  { "mir", "move_insert_mode", 0x1f },
+  { "msgr", "move_standout_mode", 0x3f },
+  { "xon", "xon_xoff", 0x30 },
+  { "ccc", "can_change", 0x11 },
+  { "hc", "hard_copy", 0 },
+  { "npc", "no_pad_char", 0x03 },
+  { "hs", "has_status_line", 0x08 }
+};
+
+static int
+boolean_index (const char *cap)
+{
+  int i;
+  for (i = 0; i < (int) (sizeof boolcaps / sizeof boolcaps[0]); i++)
+    if (!strcmp (cap, boolcaps[i].code) || !strcmp (cap, boolcaps[i].alias))
+      return i;
+  return -1;
+}
+
 static int
 known_cap (const char *cap)
 {
   int i;
   if (!cap) return 0;
+  if (boolean_index (cap) >= 0) return 1;
   for (i = 0; caps[i]; i++)
     if (!strcmp (cap, caps[i])) return 1;
   if (!strcmp (cap, "clear_screen") || !strcmp (cap, "cursor_home")
@@ -240,15 +275,6 @@ known_cap (const char *cap)
       || !strcmp (cap, "columns") || !strcmp (cap, "rows"))
     return 1;
   return 0;
-}
-
-static int
-side_known_cap (const char *term, const char *cap)
-{
-  sideterm st;
-  if (!term || !*term || !cap)
-    return 0;
-  return load_side_term (&st, term) && side_lookup (&st, cap) != NULL;
 }
 
 static int
@@ -330,18 +356,81 @@ emit_side_cap (const sideterm *st, const char *cap, WORD_LIST *args,
   return bind_or_print (var, buf, 0);
 }
 
+/* Raw templates are observable CLI data when no arguments are supplied.
+ * Keep profile-specific templates here rather than assuming ANSI defaults.
+ * These strings describe the curated entries, not a compiled terminfo parser. */
+static const char *
+parameter_template (const char *cap, const char *term)
+{
+  int xterm = !strncmp (term, "xterm", 5);
+  if (!strcmp (cap, "cup")) return "\033[%i%p1%d;%p2%dH";
+  if (!strcmp (cap, "cuu")) return "\033[%p1%dA";
+  if (!strcmp (cap, "cud")) return "\033[%p1%dB";
+  if (!strcmp (cap, "cuf")) return "\033[%p1%dC";
+  if (!strcmp (cap, "cub")) return "\033[%p1%dD";
+  if (!strcmp (cap, "hpa")) return "\033[%i%p1%dG";
+  if (!strcmp (cap, "vpa")) return "\033[%i%p1%dd";
+  if (!strcmp (cap, "ich")) return "\033[%p1%d@";
+  if (!strcmp (cap, "dch")) return "\033[%p1%dP";
+  if (!strcmp (cap, "dl")) return "\033[%p1%dM";
+  if (!strcmp (cap, "il")) return "\033[%p1%dL";
+  if (!strcmp (cap, "setaf") || !strcmp (cap, "setab"))
+    {
+      int fg = !strcmp (cap, "setaf");
+      if (!strcmp (term, "xterm") || !strcmp (term, "linux"))
+        return fg ? "\033[3%p1%dm" : "\033[4%p1%dm";
+      return fg
+        ? "\033[%?%p1%{8}%<%t3%p1%d%e%p1%{16}%<%t9%p1%{8}%-%d%e38;5;%p1%d%;m"
+        : "\033[%?%p1%{8}%<%t4%p1%d%e%p1%{16}%<%t10%p1%{8}%-%d%e48;5;%p1%d%;m";
+    }
+  if (!strcmp (cap, "sgr"))
+    {
+      if (xterm)
+        return "%?%p9%t\033(0%e\033(B%;\033[0%?%p6%t;1%;%?%p5%t;2%;%?%p2%t;4%;%?%p1%p3%|%t;7%;%?%p4%t;5%;%?%p7%t;8%;m";
+      if (!strcmp (term, "linux"))
+        return "\033[0;10%?%p1%t;7%;%?%p2%t;4%;%?%p3%t;7%;%?%p4%t;5%;%?%p5%t;2%;%?%p6%t;1%;m%?%p9%t\016%e\017%;";
+      if (!strcmp (term, "screen-256color"))
+        return "\033[0%?%p6%t;1%;%?%p1%t;3%;%?%p2%t;4%;%?%p3%t;7%;%?%p4%t;5%;%?%p5%t;2%;m%?%p9%t\016%e\017%;";
+      if (!strcmp (term, "vt100"))
+        return "\033[0%?%p1%p6%|%t;1%;%?%p2%t;4%;%?%p1%p3%|%t;7%;%?%p4%t;5%;m%?%p9%t\016%e\017%;";
+      return "\033[0%?%p6%t;1%;%?%p2%t;4%;%?%p1%p3%|%t;7%;%?%p4%t;5%;%?%p5%t;2%;%?%p7%t;8%;m%?%p9%t\016%e\017%;";
+    }
+  return NULL;
+}
+
+static const char *
+parameter_code (const char *cap)
+{
+  static const char *aliases[][2] = {
+    { "cursor_address", "cup" }, { "cursor_up", "cuu" },
+    { "cursor_down", "cud" }, { "cursor_right", "cuf" },
+    { "cursor_left", "cub" }, { "column_address", "hpa" },
+    { "row_address", "vpa" }, { "parm_ich", "ich" },
+    { "parm_dch", "dch" }, { "parm_delete_line", "dl" },
+    { "parm_insert_line", "il" }
+  };
+  int i;
+  for (i = 0; i < (int) (sizeof aliases / sizeof aliases[0]); i++)
+    if (!strcmp (cap, aliases[i][0])) return aliases[i][1];
+  return cap;
+}
+
 extern char *tput_doc[];   /* forward decl */
 
 static int
-emit_cap (const char *cap, WORD_LIST *args, const char *var, const char *term)
+emit_cap (const char *cap, WORD_LIST *args, const char *var, const char *term, int explicit_term)
 {
   char buf[128];
-  int n, r, c;
+  const char *tmpl;
+  int n, r, c, bi;
   sideterm st;
 
   memset (&st, 0, sizeof st);
   if (!term || !*term)
-    term = "xterm-256color";
+    {
+      builtin_error ("no terminal type specified");
+      return 2;
+    }
   if (!known_term (term) && !load_side_term (&st, term))
     {
       fprintf (stderr, "tput: unknown terminal: %s\n", term ? term : "");
@@ -353,21 +442,54 @@ emit_cap (const char *cap, WORD_LIST *args, const char *var, const char *term)
       if (rc >= 0)
         return rc;
     }
-  if (!strcmp (term, "dumb") && strcmp (cap, "cols") && strcmp (cap, "lines")
+  if (!known_cap (cap))
+    {
+      fprintf (stderr, "tput: unknown capability: %s\n", cap);
+      return 4;
+    }
+  bi = boolean_index (cap);
+  if (bi >= 0)
+    {
+      for (n = 0; terms[n]; n++)
+        if (!strcmp (term, terms[n]))
+          return (boolcaps[bi].terminals & (1U << n)) ? 0 : 1;
+      return 1;
+    }
+  if (!strcmp (term, "dumb") && strcmp (cap, "cols") && strcmp (cap, "columns")
+      && strcmp (cap, "lines") && strcmp (cap, "rows")
       && strcmp (cap, "colors") && strcmp (cap, "longname"))
-    return bind_or_print (var, "", 0);
+    {
+      if (!strcmp (cap, "clear") || !strcmp (cap, "clear_screen"))
+        { builtin_error ("terminal has no clear capability"); return 2; }
+      return 1;
+    }
+  cap = parameter_code (cap);
+  /* VT100 has cursor motion, but no ANSI color or editing extensions. */
+  if (!strcmp (term, "vt100") &&
+      (!strcmp (cap, "setaf") || !strcmp (cap, "setab") ||
+       !strcmp (cap, "hpa") || !strcmp (cap, "vpa") ||
+       !strcmp (cap, "ich") || !strcmp (cap, "dch") ||
+       !strcmp (cap, "dl") || !strcmp (cap, "il")))
+    return 1;
+  tmpl = parameter_template (cap, term);
+  if (!args && tmpl)
+    return bind_or_print (var, tmpl, 0);
 
   if (!strcmp (cap, "clear") || !strcmp (cap, "clear_screen"))
-    return bind_or_print (var, "\033[2J\033[H", 0);
+    {
+      if (!strncmp (term, "xterm", 5))
+        return bind_or_print (var, "\033[H\033[2J\033[3J", 0);
+      return bind_or_print (var, !strcmp (term, "linux") || !strcmp (term, "tmux-256color")
+                            ? "\033[H\033[J\033[3J" : "\033[H\033[J", 0);
+    }
   if (!strcmp (cap, "reset") || !strcmp (cap, "init"))
     return bind_or_print (var, "\033[0m\033[2J\033[H", 0);
   if (!strcmp (cap, "home") || !strcmp (cap, "cursor_home"))
     return bind_or_print (var, "\033[H", 0);
   if (!strcmp (cap, "cup") || !strcmp (cap, "cursor_address"))
     {
-      if (!args || !args->next) { builtin_error ("cup needs ROW COL"); return EX_USAGE; }
       r = atoi (args->word->word);
-      c = atoi (args->next->word->word);
+      c = args->next ? atoi (args->next->word->word) : 0;
       snprintf (buf, sizeof buf, "\033[%d;%dH", r + 1, c + 1);
       return bind_or_print (var, buf, 0);
     }
@@ -385,10 +507,10 @@ emit_cap (const char *cap, WORD_LIST *args, const char *var, const char *term)
     return bind_or_print (var, "\033[1K", 0);
   if (!strcmp (cap, "ed") || !strcmp (cap, "clr_eos"))
     return bind_or_print (var, "\033[J", 0);
-  if (!strcmp (cap, "bold") || !strcmp (cap, "smso"))
+  if (!strcmp (cap, "bold"))
     return bind_or_print (var, "\033[1m", 0);
-  if (!strcmp (cap, "enter_standout_mode"))
-    return bind_or_print (var, "\033[1m", 0);
+  if (!strcmp (cap, "smso") || !strcmp (cap, "enter_standout_mode"))
+    return bind_or_print (var, !strcmp (term, "screen-256color") ? "\033[3m" : "\033[7m", 0);
   if (!strcmp (cap, "enter_bold_mode"))
     return bind_or_print (var, "\033[1m", 0);
   if (!strcmp (cap, "dim"))
@@ -407,10 +529,11 @@ emit_cap (const char *cap, WORD_LIST *args, const char *var, const char *term)
     return bind_or_print (var, "\033[5m", 0);
   if (!strcmp (cap, "invis"))
     return bind_or_print (var, "\033[8m", 0);
-  if (!strcmp (cap, "sgr0") || !strcmp (cap, "rmso"))
-    return bind_or_print (var, "\033[0m", 0);
-  if (!strcmp (cap, "exit_standout_mode"))
-    return bind_or_print (var, "\033[0m", 0);
+  if (!strcmp (cap, "sgr0"))
+    return bind_or_print (var, !strncmp (term, "xterm", 5) ? "\033(B\033[m" : "\033[m\017", 0);
+  if (!strcmp (cap, "rmso") || !strcmp (cap, "exit_standout_mode"))
+    return bind_or_print (var, !strcmp (term, "screen-256color") ? "\033[23m" :
+                         !strcmp (term, "vt100") ? "\033[m" : "\033[27m", 0);
   if (!strcmp (cap, "sgr"))
     {
       int p[9] = {0};
@@ -420,16 +543,35 @@ emit_cap (const char *cap, WORD_LIST *args, const char *var, const char *term)
           p[i++] = atoi (args->word->word) ? 1 : 0;
           args = args->next;
         }
+      if (!strncmp (term, "xterm", 5))
+        off += snprintf (buf + off, sizeof buf - (size_t) off, "\033(%c", p[8] ? '0' : 'B');
       off += snprintf (buf + off, sizeof buf - (size_t) off, "\033[0");
-      if (p[0]) off += snprintf (buf + off, sizeof buf - (size_t) off, ";1");
-      if (p[1]) off += snprintf (buf + off, sizeof buf - (size_t) off, ";4");
-      if (p[2]) off += snprintf (buf + off, sizeof buf - (size_t) off, ";7");
-      if (p[3]) off += snprintf (buf + off, sizeof buf - (size_t) off, ";5");
-      if (p[4]) off += snprintf (buf + off, sizeof buf - (size_t) off, ";2");
-      if (p[5]) off += snprintf (buf + off, sizeof buf - (size_t) off, ";1");
-      if (p[6]) off += snprintf (buf + off, sizeof buf - (size_t) off, ";8");
-      if (p[8]) off += snprintf (buf + off, sizeof buf - (size_t) off, ";10");
-      snprintf (buf + off, sizeof buf - (size_t) off, "m");
+      if (!strcmp (term, "linux"))
+        {
+          off += snprintf (buf + off, sizeof buf - (size_t) off, ";10");
+          if (p[0]) off += snprintf (buf + off, sizeof buf - (size_t) off, ";7");
+          if (p[1]) off += snprintf (buf + off, sizeof buf - (size_t) off, ";4");
+          if (p[2]) off += snprintf (buf + off, sizeof buf - (size_t) off, ";7");
+          if (p[3]) off += snprintf (buf + off, sizeof buf - (size_t) off, ";5");
+          if (p[4]) off += snprintf (buf + off, sizeof buf - (size_t) off, ";2");
+          if (p[5]) off += snprintf (buf + off, sizeof buf - (size_t) off, ";1");
+        }
+      else
+        {
+          int vt = !strcmp (term, "vt100");
+          int screen = !strcmp (term, "screen-256color");
+          int xt = !strncmp (term, "xterm", 5);
+          if (p[5] || (vt && p[0])) off += snprintf (buf + off, sizeof buf - (size_t) off, ";1");
+          if (xt && p[4]) off += snprintf (buf + off, sizeof buf - (size_t) off, ";2");
+          if (screen && p[0]) off += snprintf (buf + off, sizeof buf - (size_t) off, ";3");
+          if (p[1]) off += snprintf (buf + off, sizeof buf - (size_t) off, ";4");
+          if (p[2] || (!screen && p[0])) off += snprintf (buf + off, sizeof buf - (size_t) off, ";7");
+          if (p[3]) off += snprintf (buf + off, sizeof buf - (size_t) off, ";5");
+          if (!xt && !vt && p[4]) off += snprintf (buf + off, sizeof buf - (size_t) off, ";2");
+          if (!vt && !screen && p[6]) off += snprintf (buf + off, sizeof buf - (size_t) off, ";8");
+        }
+      snprintf (buf + off, sizeof buf - (size_t) off, "m%s",
+                !strncmp (term, "xterm", 5) ? "" : p[8] ? "\016" : "\017");
       return bind_or_print (var, buf, 0);
     }
   if (!strcmp (cap, "civis"))
@@ -502,25 +644,31 @@ emit_cap (const char *cap, WORD_LIST *args, const char *var, const char *term)
       if (!args) { builtin_error ("%s needs COLOR", cap); return EX_USAGE; }
       n = atoi (args->word->word);
       if (n < 0 || n > 255) { builtin_error ("%s color must be 0..255", cap); return EX_USAGE; }
-      if (n < 8) snprintf (buf, sizeof buf, "\033[%dm", (fg ? 30 : 40) + n);
+      if (!strcmp (term, "xterm") || !strcmp (term, "linux"))
+        snprintf (buf, sizeof buf, "\033[%d%dm", fg ? 3 : 4, n);
+      else if (n < 8) snprintf (buf, sizeof buf, "\033[%dm", (fg ? 30 : 40) + n);
       else if (n < 16) snprintf (buf, sizeof buf, "\033[%dm", (fg ? 90 : 100) + n - 8);
       else snprintf (buf, sizeof buf, "\033[%d;5;%dm", fg ? 38 : 48, n);
       return bind_or_print (var, buf, 0);
     }
   if (!strcmp (cap, "cols") || !strcmp (cap, "columns"))
-    return bind_or_print (var, getenv ("COLUMNS") ? getenv ("COLUMNS") : "80", 1);
+    return bind_or_print (var, !explicit_term && getenv ("COLUMNS") ? getenv ("COLUMNS") : "80", 1);
   if (!strcmp (cap, "lines") || !strcmp (cap, "rows"))
-    return bind_or_print (var, getenv ("LINES") ? getenv ("LINES") : "24", 1);
+    return bind_or_print (var, !explicit_term && getenv ("LINES") ? getenv ("LINES") : "24", 1);
   if (!strcmp (cap, "colors"))
-    return bind_or_print (var, !strcmp (term, "vt100") || !strcmp (term, "dumb") ? "0" : "256", 1);
+    return bind_or_print (var, !strcmp (term, "vt100") || !strcmp (term, "dumb") ? "-1" :
+                          !strcmp (term, "xterm") || !strcmp (term, "linux") ? "8" : "256", 1);
   if (!strcmp (cap, "longname"))
     {
+      static const char *names[] = {
+        "xterm with 256 colors", "xterm terminal emulator (X Window System)",
+        "GNU Screen with 256 colors", "tmux with 256 colors", "Linux console",
+        "DEC VT100 (w/advanced video)", "80-column dumb tty"
+      };
       if (st.found)
         return bind_or_print (var, st.name, 1);
-      if (!strcmp (term, "dumb"))
-        return bind_or_print (var, "80-column dumb tty", 1);
-      snprintf (buf, sizeof buf, "%s terminal", term ? term : "xterm-256color");
-      return bind_or_print (var, buf, 1);
+      for (n = 0; terms[n]; n++)
+        if (!strcmp (term, terms[n])) return bind_or_print (var, names[n], 0);
     }
 
   return EXECUTION_SUCCESS;
@@ -532,7 +680,7 @@ tput_builtin (WORD_LIST *list)
   const char *term = getenv ("TERM");
   const char *var = NULL;
   const char *verb;
-  int i;
+  int i, explicit_term = 0;
 
   if (!list) { builtin_usage (); return EX_USAGE; }
   if (!strcmp (list->word->word, "--help") || !strcmp (list->word->word, "-h"))
@@ -542,6 +690,25 @@ tput_builtin (WORD_LIST *list)
         puts (*dp);
       return (EX_USAGE);
     }
+  while (list && list->word->word[0] == '-')
+    {
+      const char *opt = list->word->word;
+      if (!strcmp (opt, "--")) { list = list->next; break; }
+      if (!strncmp (opt, "-T", 2))
+        {
+          if (opt[2]) term = opt + 2;
+          else
+            {
+              list = list->next;
+              if (!list) { builtin_error ("-T needs TERM"); return EX_USAGE; }
+              term = list->word->word;
+            }
+          explicit_term = 1;
+        }
+      else { builtin_error ("unknown option: %s", opt); return EX_USAGE; }
+      list = list->next;
+    }
+  if (!list) { builtin_usage (); return EX_USAGE; }
   verb = list->word->word;
   list = list->next;
 
@@ -571,7 +738,7 @@ tput_builtin (WORD_LIST *list)
       while (list)
         {
           const char *w = list->word->word;
-          if (!strcmp (w, "-T") && list->next) { list = list->next; term = list->word->word; }
+          if (!strcmp (w, "-T") && list->next) { list = list->next; term = list->word->word; explicit_term = 1; }
           else if (!strcmp (w, "-V") && list->next) { list = list->next; var = list->word->word; }
           else { builtin_error ("unknown cap-list arg: %s", w); return EX_USAGE; }
           list = list->next;
@@ -595,10 +762,15 @@ tput_builtin (WORD_LIST *list)
                 for (i = 0; i < st.ncap; i++) puts (st.caps[i].key);
               return EXECUTION_SUCCESS;
             }
+          if (!known_term (term))
+            {
+              fprintf (stderr, "tput: unknown terminal: %s\n", term);
+              return 3;
+            }
         }
       if (var)
         {
-          char joined[512] = "";
+          char joined[1024] = "";
           for (i = 0; caps[i]; i++)
             {
               if (i) strncat (joined, " ", sizeof joined - strlen (joined) - 1);
@@ -615,7 +787,7 @@ tput_builtin (WORD_LIST *list)
       while (list)
         {
           const char *w = list->word->word;
-          if (!strcmp (w, "-T") && list->next) { list = list->next; term = list->word->word; }
+          if (!strcmp (w, "-T") && list->next) { list = list->next; term = list->word->word; explicit_term = 1; }
           else { builtin_error ("unknown info arg: %s", w); return EX_USAGE; }
           list = list->next;
         }
@@ -637,7 +809,8 @@ tput_builtin (WORD_LIST *list)
           return 3;
         }
       printf ("name=%s\ncols=80\nlines=24\ncolors=%s\n", term,
-              strcmp (term, "dumb") ? "256" : "0");
+              !strcmp (term, "dumb") || !strcmp (term, "vt100") ? "-1" :
+              !strcmp (term, "linux") || !strcmp (term, "xterm") ? "8" : "256");
       return EXECUTION_SUCCESS;
     }
   if (!strcmp (verb, "query"))
@@ -649,36 +822,30 @@ tput_builtin (WORD_LIST *list)
       while (list && list->word->word[0] == '-')
         {
           const char *w = list->word->word;
-          if (!strcmp (w, "-T") && list->next) { list = list->next; term = list->word->word; }
+          if (!strcmp (w, "-T") && list->next) { list = list->next; term = list->word->word; explicit_term = 1; }
           else if (!strcmp (w, "-V") && list->next) { list = list->next; var = list->word->word; }
-          else break;
+          else if (isdigit ((unsigned char) w[1])) break;
+          else { builtin_error ("unknown or incomplete query option: %s", w); return EX_USAGE; }
           list = list->next;
         }
-      if (!known_cap (cap) && !side_known_cap (term, cap))
-        {
-          fprintf (stderr, "tput: unknown capability: %s\n", cap);
-          return 2;
-        }
-      return emit_cap (cap, list, var, term);
+      return emit_cap (cap, list, var, term, explicit_term);
     }
 
-  if (!known_cap (verb) && !side_known_cap (term, verb))
-    {
-      fprintf (stderr, "tput: unknown capability: %s\n", verb);
-      return 2;
-    }
-  return emit_cap (verb, list, NULL, term);
+  return emit_cap (verb, list, NULL, term, explicit_term);
 }
 
 char *tput_doc[] = {
   "Query a curated terminfo-compatible ANSI capability table.",
   "",
   "    tput query CAP [-T TERM] [-V VAR] [ARGS...]",
-  "    tput CAP [ARGS...]",
+  "    tput [-T TERM] CAP [ARGS...]",
   "    tput cap-list [-T TERM] [-V VAR]",
   "    tput entry-list",
   "    tput info [-T TERM]",
   "",
+  "Common boolean queries return 0 for true and 1 for false, without output.",
+  "With no parameters, built-in parameterized strings are returned verbatim.",
+  "Statuses: 2 for usage/missing TERM, 3 for unknown terminal, 4 for unknown CAP.",
   "Supported terminal entries: xterm-256color, xterm, screen-256color,",
   "tmux-256color, linux, vt100, dumb.",
   "Sidecar entries: BASHTPUT_TERMINFO_DIR/TERM or /etc/bash-os/terminfo.d/TERM,",

@@ -31,16 +31,21 @@
 static int
 ipcctl_parse_id (const char *s, int *id_out)
 {
-    char *end = NULL;
-    long v;
+    int v = 0;
+    const unsigned char *p = (const unsigned char *) s;
 
-    if (s == NULL || *s == '\0')
+    if (p == NULL || *p == '\0')
         return -1;
-    errno = 0;
-    v = strtol (s, &end, 10);
-    if (errno != 0 || end == s || *end != '\0' || v < 0 || v > INT_MAX)
-        return -1;
-    *id_out = (int) v;
+    for (; *p; p++) {
+        int digit;
+        if (*p < '0' || *p > '9')
+            return -1;
+        digit = *p - '0';
+        if (v > (INT_MAX - digit) / 10)
+            return -1;
+        v = v * 10 + digit;
+    }
+    *id_out = v;
     return 0;
 }
 
@@ -65,6 +70,18 @@ ipcctl_policy_denied (void)
     return EXECUTION_FAILURE;
 }
 
+static int
+ipcctl_finish_output (void)
+{
+    if (fflush (stdout) == EOF || ferror (stdout)) {
+        int error = errno ? errno : EIO;
+        clearerr (stdout);
+        fprintf (stderr, "ipcctl: write error: %s\n", strerror (error));
+        return EXECUTION_FAILURE;
+    }
+    return EXECUTION_SUCCESS;
+}
+
 int
 ipcctl_builtin (WORD_LIST *list)
 {
@@ -78,11 +95,11 @@ ipcctl_builtin (WORD_LIST *list)
     if (!strcmp (op, "--help") || !strcmp (op, "-h")) {
         puts ("Usage: ipcctl --rm shm|msg|sem <id>");
         puts ("Remove one System V IPC object when BASHOS_IPCRM_ALLOW_RMID=1.");
-        return EXECUTION_SUCCESS;
+        return ipcctl_finish_output ();
     }
     if (!strcmp (op, "--version") || !strcmp (op, "-V")) {
         puts ("ipcctl 1.0 (bash-os)");
-        return EXECUTION_SUCCESS;
+        return ipcctl_finish_output ();
     }
     if (strcmp (op, "--rm") != 0)
         return ipcctl_usage ();
@@ -98,6 +115,9 @@ ipcctl_builtin (WORD_LIST *list)
     id_s = list->word->word;
 
     if (list->next != NULL)
+        return ipcctl_usage ();
+
+    if (strcmp (kind, "shm") && strcmp (kind, "msg") && strcmp (kind, "sem"))
         return ipcctl_usage ();
 
     if (ipcctl_parse_id (id_s, &id) < 0) {
@@ -135,6 +155,7 @@ char *ipcctl_doc[] = {
     "",
     "    ipcctl --rm shm|msg|sem <id>",
     "",
+    "IDs must contain only decimal digits and fit in a nonnegative int.",
     "Mutating removal requires BASHOS_IPCRM_ALLOW_RMID=1.",
     (char *) NULL
 };

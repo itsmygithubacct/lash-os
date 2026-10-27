@@ -1,0 +1,48 @@
+--- builtins/mkfifo.c
++++ builtins/mkfifo.c
+@@ -67,14 +67,14 @@
+ 	CASE_HELPOPT;
+ 	default:
+ 	  builtin_usage();
+-	  return (EX_USAGE);
++	  return (EXECUTION_FAILURE);
+       }
+   list = loptend;
+ 
+   if (list == 0)
+     {
+       builtin_usage ();
+-      return (EX_USAGE);
++      return (EXECUTION_FAILURE);
+     }
+ 
+   basemode = S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH;
+@@ -106,13 +106,17 @@
+ 
+   nmode = basemode & ~original_umask;
+   /* Adjust new mode based on mode argument */
+-  nmode &= omode;
++  nmode = mflag ? omode : nmode;
+ 
+   for (rval = EXECUTION_SUCCESS, l = list; l; l = l->next)
+     {
+-      if (mkfifo (l->word->word, nmode) < 0)
++      mode_t mask = umask (0);
++      int result = mkfifo (l->word->word, nmode);
++      int error = errno;
++      umask (mask);
++      if (result < 0)
+         {
+-          builtin_error ("cannot create FIFO `%s': %s", l->word->word, strerror (errno));
++          builtin_error ("cannot create FIFO `%s': %s", l->word->word, strerror (error));
+           rval = EXECUTION_FAILURE;
+         }
+     }
+@@ -130,7 +134,6 @@
+ 	"an octal number or a symbolic mode like that used by chmod(1).  If",
+ 	"a symbolic mode is used, the operations are interpreted relative to",
+ 	"an initial mode of \"a=rw\".  mkfifo returns 0 if the FIFOs are",
+-	"umask, plus write and search permissions for the owner.  mkdir",
+ 	"created successfully, and non-zero if an error occurs.",
+ 	(char *)NULL
+ };

@@ -21,6 +21,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -74,6 +75,7 @@ bat_read_stdin (char **out, size_t *outlen)
         return -1;
     for (;;) {
         if (len + 2048 + 1 > cap) {
+            if (cap > SIZE_MAX / 2) { free (buf); errno = EOVERFLOW; return -1; }
             cap *= 2;
             char *nb = realloc (buf, cap);
             if (!nb) {
@@ -82,15 +84,11 @@ bat_read_stdin (char **out, size_t *outlen)
             }
             buf = nb;
         }
-        size_t n = fread (buf + len, 1, 2048, stdin);
-        len += n;
-        if (n < 2048) {
-            if (ferror (stdin)) {
-                free (buf);
-                return -1;
-            }
-            break;
-        }
+        ssize_t n = read (STDIN_FILENO, buf + len, 2048);
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0) { free (buf); return -1; }
+        if (n == 0) break;
+        len += (size_t) n;
     }
     buf[len] = '\0';
     *out = buf;
@@ -132,16 +130,20 @@ bat_parse_time (const char *s, time_t *out)
         s++;
     if (isdigit ((unsigned char)s[0])) {
         char *end = NULL;
+        errno = 0;
         long long v = strtoll (s, &end, 10);
         if (end && *end == '\0') {
+            if (errno == ERANGE || v < 0 || (long long) (time_t) v != v) return -1;
             *out = (time_t) v;
             return 0;
         }
     }
     if (s[0] == '+') {
         char *end = NULL;
+        if (!isdigit ((unsigned char) s[1])) return -1;
+        errno = 0;
         long long n = strtoll (s + 1, &end, 10);
-        if (end == s + 1 || n < 0)
+        if (errno == ERANGE || end == s + 1 || n < 0)
             return -1;
         long mult = 1;
         if (*end == 'm') mult = 60;
@@ -151,13 +153,21 @@ bat_parse_time (const char *s, time_t *out)
         else return -1;
         if (end[0] && end[1])
             return -1;
-        *out = now + (time_t)(n * mult);
+        if (now < 0 || (unsigned long long) n >
+            ((unsigned long long) LLONG_MAX - (unsigned long long) now) / (unsigned long) mult)
+            return -1;
+        long long value = (long long) now + n * mult;
+        if ((long long) (time_t) value != value) return -1;
+        *out = (time_t) value;
         return 0;
     }
-    int hh = -1, mm = -1;
-    char tail = 0;
-    if (sscanf (s, "%d:%d%c", &hh, &mm, &tail) == 2 &&
-        hh >= 0 && hh <= 23 && mm >= 0 && mm <= 59) {
+    char *hend, *mend;
+    errno = 0;
+    long hh = strtol (s, &hend, 10);
+    if (errno || !isdigit ((unsigned char) *s) || *hend != ':' || hh < 0 || hh > 23 ||
+        !isdigit ((unsigned char) hend[1])) return -1;
+    long mm = strtol (hend + 1, &mend, 10);
+    if (!errno && !*mend && mm >= 0 && mm <= 59) {
         struct tm tm;
         localtime_r (&now, &tm);
         tm.tm_hour = hh;
@@ -184,40 +194,62 @@ bat_job_path (const char *jobid, char *buf, size_t buflen)
 }
 
 static int
+bat_output_status (int bad)
+{
+    if (fflush (stdout) == EOF || ferror (stdout)) bad = 1;
+    if (bad) clearerr (stdout);
+    return bad ? EXECUTION_FAILURE : EXECUTION_SUCCESS;
+}
+
+static int
 bat_schedule (time_t run_at, const char *script, size_t script_len)
 {
-    char dir[PATH_MAX], path[PATH_MAX], jobid[128];
+    char dir[PATH_MAX], path[PATH_MAX], tmp[PATH_MAX];
     if (bat_at_dir (dir, sizeof dir) < 0) {
         builtin_error ("mkdir atjobs: %s", strerror (errno));
         return EXECUTION_FAILURE;
     }
-    snprintf (jobid, sizeof jobid, "%lld.%ld", (long long) run_at, (long) getpid ());
-    if (snprintf (path, sizeof path, "%s/%s.job", dir, jobid) >= (int) sizeof path) {
+    int length = snprintf (tmp, sizeof tmp, "%s/.%lld.%ld.XXXXXX", dir,
+                           (long long) run_at, (long) getpid ());
+    if (length < 0 || (size_t) length + 3 >= sizeof path) {
         builtin_error ("job path too long");
         return EXECUTION_FAILURE;
     }
-    FILE *f = fopen (path, "wx");
+    /* Cron scans only *.job. Keep an incomplete script hidden until close,
+       and use a unique name for multiple jobs from the same Bash process. */
+    int fd = mkstemp (tmp);
+    if (fd < 0) { builtin_error ("create job: %s", strerror (errno)); return EXECUTION_FAILURE; }
+    const char *jobid = strrchr (tmp, '/') + 2;  /* drop the leading dot */
+    FILE *f = NULL;
+    if (snprintf (path, sizeof path, "%s/%s.job", dir, jobid) < (int) sizeof path &&
+        fcntl (fd, F_SETFD, FD_CLOEXEC) >= 0) f = fdopen (fd, "w");
     if (!f) {
+        close (fd);
+        unlink (tmp);
         builtin_error ("create job: %s", strerror (errno));
         return EXECUTION_FAILURE;
     }
-    chmod (path, 0600);
-    fprintf (f, "# run_at=%lld\n", (long long) run_at);
-    if (script_len && fwrite (script, 1, script_len, f) != script_len) {
-        fclose (f);
-        unlink (path);
+    int bad = fprintf (f, "# run_at=%lld\n", (long long) run_at) < 0;
+    if (script_len && fwrite (script, 1, script_len, f) != script_len) bad = 1;
+    if (script_len == 0 || script[script_len - 1] != '\n')
+        if (fputc ('\n', f) == EOF) bad = 1;
+    if (ferror (f)) bad = 1;
+    if (fclose (f) != 0) bad = 1;
+    if (bad) {
+        unlink (tmp);
         builtin_error ("write job: %s", strerror (errno));
         return EXECUTION_FAILURE;
     }
-    if (script_len == 0 || script[script_len - 1] != '\n')
-        fputc ('\n', f);
-    if (fclose (f) != 0) {
-        unlink (path);
-        builtin_error ("close job: %s", strerror (errno));
+    /* link publishes atomically without replacing an existing job. */
+    if (link (tmp, path) < 0) {
+        int saved = errno;
+        unlink (tmp);
+        builtin_error ("publish job: %s", strerror (saved));
         return EXECUTION_FAILURE;
     }
-    printf ("job %s scheduled for %lld\n", jobid, (long long) run_at);
-    return EXECUTION_SUCCESS;
+    if (unlink (tmp) < 0) builtin_warning ("remove job temp: %s", strerror (errno));
+    int output_error = printf ("job %s scheduled for %lld\n", jobid, (long long) run_at) < 0;
+    return bat_output_status (output_error);
 }
 
 static int
@@ -241,8 +273,8 @@ bat_list (void)
             continue;
         printf ("%.*s\n", (int) (len - 4), name);
     }
-    closedir (d);
-    return EXECUTION_SUCCESS;
+    int bad = closedir (d) < 0;
+    return bat_output_status (bad);
 }
 
 static int
@@ -263,10 +295,13 @@ bat_cat (const char *jobid)
         fclose (f);
         return EXECUTION_FAILURE;
     }
-    while (fgets (line, sizeof line, f))
-        fputs (line, stdout);
-    fclose (f);
-    return EXECUTION_SUCCESS;
+    size_t n;
+    int bad = 0;
+    while ((n = fread (line, 1, sizeof line, f)) > 0)
+        if (fwrite (line, 1, n, stdout) != n) { bad = 1; break; }
+    if (ferror (f)) bad = 1;
+    if (fclose (f) != 0) bad = 1;
+    return bat_output_status (bad);
 }
 
 int

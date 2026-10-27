@@ -90,29 +90,46 @@ err:
     return -1;
 }
 
+static int
+action_number (const char *word)
+{
+    static const char *const options[] = {
+        "--getsz", "--getsize64", "--getsize", "--getss", "--getbsz",
+        "--getro", "--setro", "--setrw", "--flushbufs", "--rereadpt"
+    };
+    for (int i = 0; i < (int)(sizeof options / sizeof options[0]); i++)
+        if (!strcmp (word, options[i])) return i;
+    return -1;
+}
+
+static int
+finish_output (int rc)
+{
+    if (fflush (stdout) == EOF || ferror (stdout)) {
+        builtin_error ("write error: %s", strerror (errno));
+        clearerr (stdout);
+        return EXECUTION_FAILURE;
+    }
+    return rc;
+}
+
 int
 blockdev_builtin (WORD_LIST *list)
 {
-    int actions[32]; int nact = 0;
+    WORD_LIST *first_action = list;
+    size_t nact = 0;
 
     while (list && list->word->word[0] == '-' && list->word->word[1]) {
         const char *w = list->word->word;
-        int a = -1;
         if (!strcmp (w, "--")) { list = list->next; break; }
-        else if (!strcmp (w, "--help")) { for (char **lp = blockdev_doc; *lp; lp++) puts (*lp); return EXECUTION_SUCCESS; }
-        else if (!strcmp (w, "--version")) { puts ("blockdev 1.0 (bash-loadable)"); return EXECUTION_SUCCESS; }
-        else if (!strcmp (w, "--getsz"))     a = A_GETSZ;
-        else if (!strcmp (w, "--getsize64")) a = A_GETSIZE64;
-        else if (!strcmp (w, "--getsize"))   a = A_GETSIZE;
-        else if (!strcmp (w, "--getss"))     a = A_GETSS;
-        else if (!strcmp (w, "--getbsz"))    a = A_GETBSZ;
-        else if (!strcmp (w, "--getro"))     a = A_GETRO;
-        else if (!strcmp (w, "--setro"))     a = A_SETRO;
-        else if (!strcmp (w, "--setrw"))     a = A_SETRW;
-        else if (!strcmp (w, "--flushbufs")) a = A_FLUSH;
-        else if (!strcmp (w, "--rereadpt"))  a = A_REREAD;
-        else { builtin_error ("unknown option: %s", w); builtin_usage (); return EX_USAGE; }
-        if (a >= 0 && nact < (int)(sizeof actions / sizeof actions[0])) actions[nact++] = a;
+        else if (!strcmp (w, "--help")) { for (char **lp = blockdev_doc; *lp; lp++) puts (*lp); return finish_output (EXECUTION_SUCCESS); }
+        else if (!strcmp (w, "--version")) { puts ("blockdev 1.0 (bash-loadable)"); return finish_output (EXECUTION_SUCCESS); }
+        else if (action_number (w) < 0) {
+            builtin_error ("unknown option: %s", w);
+            builtin_usage ();
+            return EX_USAGE;
+        }
+        nact++;
         list = list->next;
     }
 
@@ -122,18 +139,23 @@ blockdev_builtin (WORD_LIST *list)
     int rc = EXECUTION_SUCCESS;
     for (WORD_LIST *p = list; p; p = p->next) {
         const char *dev = p->word->word;
-        int fd = open (dev, O_RDONLY);
-        if (fd < 0 && errno == EACCES) fd = open (dev, O_RDWR);
+        int fd = open (dev, O_RDONLY | O_CLOEXEC);
+        if (fd < 0 && errno == EACCES) fd = open (dev, O_RDWR | O_CLOEXEC);
         if (fd < 0) {
             builtin_error ("%s: %s", dev, strerror (errno));
             rc = EXECUTION_FAILURE;
             continue;
         }
-        for (int i = 0; i < nact; i++)
-            if (run_action (fd, actions[i], dev) < 0) rc = EXECUTION_FAILURE;
-        close (fd);
+        WORD_LIST *action = first_action;
+        for (size_t i = 0; i < nact; i++, action = action->next)
+            if (run_action (fd, action_number (action->word->word), dev) < 0)
+                rc = EXECUTION_FAILURE;
+        if (close (fd) < 0) {
+            builtin_error ("%s: close: %s", dev, strerror (errno));
+            rc = EXECUTION_FAILURE;
+        }
     }
-    return rc;
+    return finish_output (rc);
 }
 
 char *blockdev_doc[] = {
@@ -142,6 +164,7 @@ char *blockdev_doc[] = {
     "    blockdev [actions...] device [device...]",
     "",
     "    --getsz       size in 512-byte sectors      --getsize64  size in bytes",
+    "    --getsize     size in 512-byte sectors (legacy ioctl)",
     "    --getss       logical sector size            --getbsz     block size",
     "    --getro       read-only flag (1/0)            --setro/--setrw  set ro/rw",
     "    --flushbufs   flush buffers                   --rereadpt   re-read partitions",
@@ -155,6 +178,6 @@ struct builtin blockdev_struct = {
     blockdev_builtin,
     BUILTIN_ENABLED,
     blockdev_doc,
-    "blockdev [--getsz|--getsize64|--getss|--getbsz|--getro|--setro|--setrw|--flushbufs|--rereadpt] device...",
+    "blockdev [--getsz|--getsize64|--getsize|--getss|--getbsz|--getro|--setro|--setrw|--flushbufs|--rereadpt] device...",
     0
 };

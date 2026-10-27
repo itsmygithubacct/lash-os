@@ -1,5 +1,6 @@
 #pragma once
 #include_next <stdio.h>
+int renameat(int, const char *, int, const char *);
 /* Picolibc 1.8.12's unlocked putchar macro incorrectly has two parameters. */
 #undef putchar_unlocked
 static inline int bash_putchar_unlocked(int c) {

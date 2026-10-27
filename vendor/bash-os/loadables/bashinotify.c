@@ -47,6 +47,11 @@
 #include "loadables.h"
 
 static int g_ifd = -1;
+/* A read can contain more events than one wait -n call requests. Retain
+   the unconsumed records for the next call on this inotify instance. */
+static char g_events[16 * 1024]
+  __attribute__ ((aligned (__alignof__ (struct inotify_event))));
+static size_t g_event_pos, g_event_len;
 
 struct mask_name { const char *name; uint32_t flag; };
 static const struct mask_name MASKS[] = {
@@ -193,6 +198,7 @@ bin_close (WORD_LIST *args)
 {
   (void) args;
   if (g_ifd >= 0) { close (g_ifd); g_ifd = -1; }
+  g_event_pos = g_event_len = 0;
   return EXECUTION_SUCCESS;
 }
 
@@ -215,7 +221,8 @@ bin_wait (WORD_LIST *args)
   if (g_ifd < 0)
     { builtin_error ("wait: no watches added; call `add` first"); return EXECUTION_FAILURE; }
 
-  if (timeout_ms != 0)
+  if (max_events == 0) return EXECUTION_SUCCESS;
+  if (g_event_pos == g_event_len && timeout_ms != 0)
     {
       struct pollfd pfd = { .fd = g_ifd, .events = POLLIN };
       int r;
@@ -224,32 +231,32 @@ bin_wait (WORD_LIST *args)
       if (r == 0) return EXECUTION_SUCCESS;  /* timeout, no output */
     }
 
-  /* Drain pending events. inotify_event is variable-length (name field
-     length stored in `len`). Read into a generously-sized buffer.
-     Linux guarantees a read returns whole events, never partial. */
-  char buf[16 * 1024] __attribute__ ((aligned (__alignof__ (struct inotify_event))));
+  /* Linux reads whole events; keep records beyond this call's limit. */
   int emitted = 0;
   while (max_events < 0 || emitted < max_events)
     {
-      ssize_t n = read (g_ifd, buf, sizeof buf);
-      if (n < 0)
+      if (g_event_pos == g_event_len)
         {
-          if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-          if (errno == EINTR) continue;
-          builtin_error ("read inotify: %s", strerror (errno));
-          return EXECUTION_FAILURE;
+          ssize_t n = read (g_ifd, g_events, sizeof g_events);
+          if (n < 0)
+            {
+              if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+              if (errno == EINTR) continue;
+              builtin_error ("read inotify: %s", strerror (errno));
+              return EXECUTION_FAILURE;
+            }
+          if (n == 0) break;
+          g_event_pos = 0;
+          g_event_len = (size_t) n;
         }
-      if (n == 0) break;
-      char *p = buf;
-      while (p < buf + n)
+      while (g_event_pos < g_event_len)
         {
-          /* Bound check before deref: a malformed (or partial) event
-             whose declared len would walk past buf+n means we'd read
-             past the read() result. Linux guarantees whole events on
-             read so this branch should never fire — defense-in-depth. */
-          if (p + sizeof (struct inotify_event) > buf + n) break;
-          struct inotify_event *ev = (struct inotify_event *) p;
-          if (p + sizeof (struct inotify_event) + ev->len > buf + n) break;
+          size_t remaining = g_event_len - g_event_pos;
+          if (remaining < sizeof (struct inotify_event))
+            { g_event_pos = g_event_len; return EXECUTION_FAILURE; }
+          struct inotify_event *ev = (struct inotify_event *) (g_events + g_event_pos);
+          if (ev->len > remaining - sizeof *ev)
+            { g_event_pos = g_event_len; return EXECUTION_FAILURE; }
           printf ("%d ", ev->wd);
           bin_emit_mask_names (ev->mask);
           if (ev->cookie) printf (" cookie=%u", ev->cookie);
@@ -262,11 +269,11 @@ bin_wait (WORD_LIST *args)
             }
           putchar ('\n');
           emitted++;
-          p += sizeof (struct inotify_event) + ev->len;
+          g_event_pos += sizeof *ev + ev->len;
           if (max_events > 0 && emitted >= max_events) break;
         }
-      /* Don't loop again unless we drained the full buffer. */
-      if ((size_t) n < sizeof buf) break;
+      /* Don't read again unless the previous read filled the buffer. */
+      if (g_event_len < sizeof g_events) break;
     }
   fflush (stdout);
   return EXECUTION_SUCCESS;

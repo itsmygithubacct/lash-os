@@ -159,7 +159,7 @@ bu_size_arg (const char *arg, const char *gnu_msg, size_t *out)
 {
     if (bu_parse_size (arg, out) < 0) {
         builtin_error ("%s: %s", arg, gnu_msg);
-        return EX_USAGE;
+        return EXECUTION_FAILURE;
     }
     return 0;
 }
@@ -242,7 +242,7 @@ uniq_builtin (WORD_LIST *list)
         /* Obsolete POSIX "+N" → skip N chars, like -s N (GNU uniq compat). */
         if (bu_is_plus_number (w)) {
             if (bu_size_arg (w + 1, BU_MSG_SKIP, &o.skip_chars) != 0)
-                return EX_USAGE;
+                return EXECUTION_FAILURE;
             list = list->next;
             continue;
         }
@@ -287,7 +287,7 @@ uniq_builtin (WORD_LIST *list)
             }
             builtin_error ("invalid argument '%s' for '--all-repeated'", method);
             builtin_usage ();
-            return EX_USAGE;
+            return EXECUTION_FAILURE;
         }
         if (!strcmp (w, "--group")) {
             grouping = BU_GROUP_SEPARATE;
@@ -298,7 +298,7 @@ uniq_builtin (WORD_LIST *list)
             if (bu_parse_group_mode (w + 8, &grouping) < 0) {
                 builtin_error ("invalid argument '%s' for '--group'", w + 8);
                 builtin_usage ();
-                return EX_USAGE;
+                return EXECUTION_FAILURE;
             }
             list = list->next;
             continue;
@@ -319,44 +319,44 @@ uniq_builtin (WORD_LIST *list)
             continue;
         }
         if (!strcmp (w, "--skip-fields")) {
-            if (!list->next) { builtin_error ("option '%s' requires an argument", w); return EX_USAGE; }
-            if (bu_size_arg (list->next->word->word, BU_MSG_FIELDS, &o.skip_fields) != 0) return EX_USAGE;
+            if (!list->next) { builtin_error ("option '%s' requires an argument", w); return EXECUTION_FAILURE; }
+            if (bu_size_arg (list->next->word->word, BU_MSG_FIELDS, &o.skip_fields) != 0) return EXECUTION_FAILURE;
             sfo_new = 1;
             list = list->next->next;
             continue;
         }
         if (!strncmp (w, "--skip-fields=", 14)) {
-            if (bu_size_arg (w + 14, BU_MSG_FIELDS, &o.skip_fields) != 0) return EX_USAGE;
+            if (bu_size_arg (w + 14, BU_MSG_FIELDS, &o.skip_fields) != 0) return EXECUTION_FAILURE;
             sfo_new = 1;
             list = list->next;
             continue;
         }
         if (!strcmp (w, "--skip-chars")) {
-            if (!list->next) { builtin_error ("option '%s' requires an argument", w); return EX_USAGE; }
-            if (bu_size_arg (list->next->word->word, BU_MSG_SKIP, &o.skip_chars) != 0) return EX_USAGE;
+            if (!list->next) { builtin_error ("option '%s' requires an argument", w); return EXECUTION_FAILURE; }
+            if (bu_size_arg (list->next->word->word, BU_MSG_SKIP, &o.skip_chars) != 0) return EXECUTION_FAILURE;
             list = list->next->next;
             continue;
         }
         if (!strncmp (w, "--skip-chars=", 13)) {
-            if (bu_size_arg (w + 13, BU_MSG_SKIP, &o.skip_chars) != 0) return EX_USAGE;
+            if (bu_size_arg (w + 13, BU_MSG_SKIP, &o.skip_chars) != 0) return EXECUTION_FAILURE;
             list = list->next;
             continue;
         }
         if (!strcmp (w, "--check-chars")) {
-            if (!list->next) { builtin_error ("option '%s' requires an argument", w); return EX_USAGE; }
-            if (bu_size_arg (list->next->word->word, BU_MSG_CHECK, &o.check_chars) != 0) return EX_USAGE;
+            if (!list->next) { builtin_error ("option '%s' requires an argument", w); return EXECUTION_FAILURE; }
+            if (bu_size_arg (list->next->word->word, BU_MSG_CHECK, &o.check_chars) != 0) return EXECUTION_FAILURE;
             list = list->next->next;
             continue;
         }
         if (!strncmp (w, "--check-chars=", 14)) {
-            if (bu_size_arg (w + 14, BU_MSG_CHECK, &o.check_chars) != 0) return EX_USAGE;
+            if (bu_size_arg (w + 14, BU_MSG_CHECK, &o.check_chars) != 0) return EXECUTION_FAILURE;
             list = list->next;
             continue;
         }
         if (w[1] == '-') {
             builtin_error ("unknown option: %s", w);
             builtin_usage ();
-            return EX_USAGE;
+            return EXECUTION_FAILURE;
         }
         for (const char *p = w + 1; *p; p++) {
             /* Obsolete POSIX "-N" → skip N fields (like -f N). Digits
@@ -376,36 +376,36 @@ uniq_builtin (WORD_LIST *list)
                 case 'z': o.delimiter = '\0'; break;
                 case 'f':
                     if (p[1]) {
-                        if (bu_size_arg (p + 1, BU_MSG_FIELDS, &o.skip_fields) != 0) return EX_USAGE;
+                        if (bu_size_arg (p + 1, BU_MSG_FIELDS, &o.skip_fields) != 0) return EXECUTION_FAILURE;
                         p += strlen (p) - 1;
                     } else {
-                        if (!list->next) { builtin_error ("option requires an argument -- 'f'"); return EX_USAGE; }
-                        if (bu_size_arg (list->next->word->word, BU_MSG_FIELDS, &o.skip_fields) != 0) return EX_USAGE;
+                        if (!list->next) { builtin_error ("option requires an argument -- 'f'"); return EXECUTION_FAILURE; }
+                        if (bu_size_arg (list->next->word->word, BU_MSG_FIELDS, &o.skip_fields) != 0) return EXECUTION_FAILURE;
                         list = list->next;
                     }
                     sfo_new = 1;
                     break;
                 case 's':
                     if (p[1]) {
-                        if (bu_size_arg (p + 1, BU_MSG_SKIP, &o.skip_chars) != 0) return EX_USAGE;
+                        if (bu_size_arg (p + 1, BU_MSG_SKIP, &o.skip_chars) != 0) return EXECUTION_FAILURE;
                         p += strlen (p) - 1;
                     } else {
-                        if (!list->next) { builtin_error ("option requires an argument -- 's'"); return EX_USAGE; }
-                        if (bu_size_arg (list->next->word->word, BU_MSG_SKIP, &o.skip_chars) != 0) return EX_USAGE;
+                        if (!list->next) { builtin_error ("option requires an argument -- 's'"); return EXECUTION_FAILURE; }
+                        if (bu_size_arg (list->next->word->word, BU_MSG_SKIP, &o.skip_chars) != 0) return EXECUTION_FAILURE;
                         list = list->next;
                     }
                     break;
                 case 'w':
                     if (p[1]) {
-                        if (bu_size_arg (p + 1, BU_MSG_CHECK, &o.check_chars) != 0) return EX_USAGE;
+                        if (bu_size_arg (p + 1, BU_MSG_CHECK, &o.check_chars) != 0) return EXECUTION_FAILURE;
                         p += strlen (p) - 1;
                     } else {
-                        if (!list->next) { builtin_error ("option requires an argument -- 'w'"); return EX_USAGE; }
-                        if (bu_size_arg (list->next->word->word, BU_MSG_CHECK, &o.check_chars) != 0) return EX_USAGE;
+                        if (!list->next) { builtin_error ("option requires an argument -- 'w'"); return EXECUTION_FAILURE; }
+                        if (bu_size_arg (list->next->word->word, BU_MSG_CHECK, &o.check_chars) != 0) return EXECUTION_FAILURE;
                         list = list->next;
                     }
                     break;
-                default: builtin_error ("unknown flag: -%c", *p); builtin_usage (); return EX_USAGE;
+                default: builtin_error ("unknown flag: -%c", *p); builtin_usage (); return EXECUTION_FAILURE;
             }
         }
         list = list->next;
@@ -413,12 +413,12 @@ uniq_builtin (WORD_LIST *list)
     if (cflag && all_repeated) {
         builtin_error ("printing all duplicated lines and repeat counts is meaningless");
         builtin_usage ();
-        return EX_USAGE;
+        return EXECUTION_FAILURE;
     }
     if (grouping != BU_GROUP_NONE && (cflag || dflag || all_repeated || uflag)) {
         builtin_error ("--group is mutually exclusive with -c/-d/-D/-u");
         builtin_usage ();
-        return EX_USAGE;
+        return EXECUTION_FAILURE;
     }
     FILE *f = stdin;
     FILE *fopened = NULL;
@@ -442,7 +442,7 @@ uniq_builtin (WORD_LIST *list)
                 builtin_error ("extra operand '%s'", list->word->word);
                 builtin_usage ();
                 if (fopened) fclose (fopened);
-                return EX_USAGE;
+                return EXECUTION_FAILURE;
             }
             if (strcmp (output, "-") != 0) {
                 outopened = fopen (output, "w");

@@ -1,17 +1,17 @@
 # Compatibility boundaries
 
 This is an experimental userspace-assisted kernel port, not a replacement for
-the Linux POSIX process ABI. All 279 selected bash-os builtins are included in
+the Linux POSIX process ABI. All 286 selected bash-os builtins are included in
 the build; their existing source-level feature subsets still apply. Runtime
 verification covers the cases in `tests/`, not every option of every builtin.
 
-For 0.1.1, x86_64 is the primary tested target; ARM64 and RISC-V64 are experimental.
+In the previous 0.1.2 release, x86_64 is the primary tested target; ARM64 and RISC-V64 are experimental.
 On x86_64 under KVM, the production sandbox suite, the production guest runtime,
 and the full builtin and terminal job-control suite passed. ARM64 and RISC-V64
 passed their host tests under user-mode emulation and booted their own guest
 kernels under full-system emulation, registering all 279 builtins; native KVM,
 production launcher confinement, and complete process and job tests remain
-unverified on those targets. See the [release notes](docs/releases/0.1.1.md).
+unverified on those targets. See the [release notes](docs/releases/0.1.2.md).
 
 Hosted launches default to a bundled KVM VM matching the executable's x86_64,
 ARM64 or RISC-V64 architecture. The portable executable
@@ -78,6 +78,7 @@ and pipelines into `sort` are covered by the regression suites; see
 | Files | Logical descriptors 0–255, including caller-inherited descriptors and their flags in direct mode, and `select`/`pselect` sets covering all of them; stat, statvfs and directory ABI conversion; ownership, permissions, links, timestamps, xattrs, advisory locks, and ordinary I/O. `realpath` into a caller buffer fails with `ENAMETOOLONG` for resolved paths of 1024 bytes or more, and unknown `AT_*` flags return `EINVAL` |
 | Networking | Native socket I/O through the bridge; explicit message/iovec conversion; descriptor translation for SCM_RIGHTS; resolver results allocated in the Capsule arena; converted `epoll` events, at most 1024 per `epoll_wait` call |
 | Libraries | Compiled C implementations of SQLite, mbedTLS/libssh, tree-sitter, PCRE2, zlib, zstd, xz and bzip2 as selected by the original project |
+| Named IPC | POSIX shared-memory objects, named semaphore creation/open/close/unlink, and message-queue creation/close/unlink. Named semaphore handles are private checked table entries; the VM mounts `/dev/shm` and `/dev/mqueue`. |
 | Plugins and workers | Native `.so` loading and `pthread_create`/join are deferred; single-thread library mutex primitives remain available |
 | Mappings | Arena-backed anonymous/private mappings and file copies, including partial `munmap` and `mremap` shrinking or moving growth; shared file mappings, executable mappings, and fixed-address remapping are unsupported |
 | Device controls | Encoded buffer ioctls and selected terminal/network controls; ioctl interfaces containing further pointers need explicit marshalling and may return unsupported |

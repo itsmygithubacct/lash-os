@@ -37,12 +37,12 @@ endif
 PORT_SOURCES := $(wildcard src/* vendor/musl-c/* vendor/capsule-host/*)
 SDK_INPUTS := flake.nix flake.lock $(wildcard patches/capsule-*.patch)
 NATIVE_TOOLCHAIN := flake.nix flake.lock
-BUILD_CONFIG := scripts/workspace.py CMakeLists.txt $(wildcard VERSION cmake/*.cmake)
+BUILD_CONFIG := scripts/workspace.py scripts/release_version.py SOURCE.json config/os-release CMakeLists.txt $(wildcard VERSION cmake/*.cmake)
 BASH_SOURCE_INPUTS := $(shell python3 -B scripts/source_tree.py list vendor/bash-os)
 ifneq ($(.SHELLSTATUS),0)
 $(error Cannot track vendor/bash-os build inputs)
 endif
-HOST_TEST_INPUTS := $(wildcard tests/*.c) tests/source-tree.py tests/workspace.py scripts/source_tree.py
+HOST_TEST_INPUTS := $(wildcard tests/*.c) tests/source-tree.py tests/workspace.py tests/release-version.py scripts/source_tree.py
 PORTABLE_INPUTS := $(wildcard cmake/portable/*) scripts/build-portable.py scripts/elf_dependencies.py scripts/dev.py $(wildcard VERSION)
 KERNEL_JOBS ?= 4
 
@@ -57,7 +57,7 @@ pure: $(OUT)/pure/linux-bash-os
 portable: $(OUT)/portable-host/linux-bash-os
 .PHONY: portable-all portable-x86_64 portable-aarch64 portable-riscv64 release-candidates
 release-candidates: portable-all
-	$(DEV) python3 -B scripts/package-release.py
+	$(DEV) python3 -B scripts/package-release.py --check-latest
 portable-all: portable-x86_64 portable-aarch64 portable-riscv64
 portable-x86_64 portable-aarch64 portable-riscv64: portable-%: $(BUILD)/kernel-full/linux-bash-os
 	$(DEV) python3 -B scripts/prepare-runtime.py --arch $*

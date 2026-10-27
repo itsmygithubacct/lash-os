@@ -28,6 +28,7 @@
 #include <sys/wait.h>
 
 #include "loadables.h"
+#include "child-wait.h"
 
 #ifndef SCHED_BATCH
 #  define SCHED_BATCH 3
@@ -151,7 +152,7 @@ static int
 bchrt_parse_pid (const char *s, pid_t *out)
 {
   long v;
-  if (bchrt_parse_long (s, 0, LONG_MAX, &v) < 0)
+  if (bchrt_parse_long (s, 0, INT_MAX, &v) < 0)
     return -1;
   *out = (pid_t) v;
   return 0;
@@ -350,30 +351,27 @@ bchrt_run_command (int policy, int reset_on_fork, int prio,
   if (bchrt_argv_from_list (cmd, &argv) < 0)
     return EXECUTION_FAILURE;
 
-  struct sigaction chld_dfl, chld_save;
-  memset (&chld_dfl, 0, sizeof chld_dfl);
-  chld_dfl.sa_handler = SIG_DFL;
-  sigemptyset (&chld_dfl.sa_mask);
-  sigaction (SIGCHLD, &chld_dfl, &chld_save);
+  bos_child_wait child_wait;
+  if (bos_child_wait_begin (&child_wait) < 0) {
+      builtin_error ("SIGCHLD setup: %s", strerror (errno));
+      free (argv); return EXECUTION_FAILURE;
+  }
 
-  sigset_t chld_set, prev_mask;
-  sigemptyset (&chld_set);
-  sigaddset (&chld_set, SIGCHLD);
-  sigprocmask (SIG_BLOCK, &chld_set, &prev_mask);
-
+  maybe_make_export_env ();
+  fflush (stdout);
+  fflush (stderr);
   pid_t pid = fork ();
   if (pid < 0)
     {
       int e = errno;
-      sigprocmask (SIG_SETMASK, &prev_mask, NULL);
-      sigaction (SIGCHLD, &chld_save, NULL);
+      bos_child_wait_end (&child_wait);
       free (argv);
       fprintf (stderr, "chrt: fork: %s\n", strerror (e));
       return EXECUTION_FAILURE;
     }
   if (pid == 0)
     {
-      sigprocmask (SIG_SETMASK, &prev_mask, NULL);
+      bos_child_wait_child (&child_wait);
       if (bchrt_set_pid (0, policy, reset_on_fork, prio,
                          runtime, deadline, period) != EXECUTION_SUCCESS)
         _exit (1);
@@ -387,8 +385,7 @@ bchrt_run_command (int policy, int reset_on_fork, int prio,
   int status = 0;
   pid_t w;
   while ((w = waitpid (pid, &status, 0)) < 0 && errno == EINTR) ;
-  sigprocmask (SIG_SETMASK, &prev_mask, NULL);
-  sigaction (SIGCHLD, &chld_save, NULL);
+  bos_child_wait_end (&child_wait);
   if (w < 0)
     {
       fprintf (stderr, "chrt: waitpid: %s\n", strerror (errno));
@@ -482,16 +479,23 @@ chrt_builtin (WORD_LIST *list)
         {
           pid_t pid;
           if (bchrt_parse_pid (list->word->word, &pid) < 0)
-            { bchrt_bad_usage (); return EXECUTION_FAILURE; }
+            {
+              fprintf (stderr, "chrt: invalid PID argument: '%s'\n", list->word->word);
+              return EXECUTION_FAILURE;
+            }
           return bchrt_print_pid (pid);
         }
       if (argc == 2)
         {
           long prio_l;
           pid_t pid;
-          if (bchrt_parse_long (list->word->word, 0, INT_MAX, &prio_l) < 0 ||
-              bchrt_parse_pid (list->next->word->word, &pid) < 0)
+          if (bchrt_parse_long (list->word->word, 0, INT_MAX, &prio_l) < 0)
             { bchrt_bad_usage (); return EXECUTION_FAILURE; }
+          if (bchrt_parse_pid (list->next->word->word, &pid) < 0)
+            {
+              fprintf (stderr, "chrt: invalid PID argument: '%s'\n", list->next->word->word);
+              return EXECUTION_FAILURE;
+            }
           return bchrt_set_pid (pid, policy, reset_on_fork, (int) prio_l,
                                 runtime, deadline, period);
         }

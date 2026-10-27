@@ -1,0 +1,55 @@
+--- builtins/mkdir.c
++++ builtins/mkdir.c
+@@ -72,5 +72,5 @@
+ 	default:
+ 	  builtin_usage();
+-	  return (EX_USAGE);
++	  return (EXECUTION_FAILURE);
+       }
+   list = loptend;
+@@ -78,6 +78,6 @@
+   if (list == 0)
+     {
+-      builtin_usage ();
+-      return (EX_USAGE);
++      builtin_error ("missing operand");
++      return (EXECUTION_FAILURE);
+     }
+ 
+@@ -112,5 +112,5 @@
+ 
+   /* Adjust new mode based on mode argument */
+-  nmode &= omode;
++  nmode = mflag ? omode : nmode;
+ 
+   for (rval = EXECUTION_SUCCESS, l = list; l; l = l->next)
+@@ -121,8 +121,15 @@
+ 	  continue;
+ 	}
+-      else if (pflag == 0 && mkdir (l->word->word, nmode) < 0)
++      else if (pflag == 0)
+         {
+-          builtin_error ("cannot create directory `%s': %s", l->word->word, strerror (errno));
+-          rval = EXECUTION_FAILURE;
++          mode_t mask = umask (0);
++          int result = mkdir (l->word->word, nmode);
++          int error = errno;
++          umask (mask);
++          if (result < 0)
++            {
++              builtin_error ("cannot create directory `%s': %s", l->word->word, strerror (error));
++              rval = EXECUTION_FAILURE;
++            }
+         }
+     }
+@@ -150,9 +157,5 @@
+ 	}
+ 	
+-      if (user_mode && chmod (path, nmode))
+-        {
+-          builtin_error ("%s: %s", path, strerror (errno));
+-          return 1;
+-        }
++      /* Existing directories are not modified by -p, including with -m. */
+ 
+       return 0;

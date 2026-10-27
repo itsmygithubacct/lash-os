@@ -1,0 +1,709 @@
+--- a/id.c
++++ b/id.c
+@@ -1,9 +1,7 @@
+ /*
+  * id - POSIX.2 user identity
+  *
+- * (INCOMPLETE -- supplementary groups for other users not yet done)
+- *
+- * usage: id [-Ggu] [-nr] [user]
++ * usage: id [-aGgnruz] [USER ...]
+  *
+  * The default output format looks something like:
+  *	uid=xxx(chet) gid=xx groups=aa(aname), bb(bname), cc(cname)
+@@ -29,6 +27,11 @@
+ 
+ #include <config.h>
+ #include <stdio.h>
++#include <stdint.h>
++#include <inttypes.h>
++#include <errno.h>
++#include <unistd.h>
++#include <string.h>
+ #include "bashtypes.h"
+ #include <pwd.h>
+ #include <grp.h>
+@@ -51,273 +54,432 @@
+ #include "common.h"
+ #include "bashgetopt.h"
+ 
+-#define ID_ALLGROUPS	0x001		/* -G */
+-#define ID_GIDONLY	0x002		/* -g */
+-#define ID_USENAME	0x004		/* -n */
+-#define ID_USEREAL	0x008		/* -r */
+-#define ID_USERONLY	0x010		/* -u */
+-
+-#define ID_FLAGSET(s)	((id_flags & (s)) != 0)
++#define ID_ALLGROUPS  0x001
++#define ID_GIDONLY    0x002
++#define ID_USENAME    0x004
++#define ID_USEREAL    0x008
++#define ID_USERONLY   0x010
++#define ID_ZERO       0x020
+ 
+ static int id_flags;
+-
+ static uid_t ruid, euid;
+ static gid_t rgid, egid;
+ 
+-static char *id_user;
+-
+-static int inituser (char *);
+-
+-static int id_pruser (int);
+-static int id_prgrp (int);
+-static int id_prgroups (char *);
+-static int id_prall (char *);
++/* Match exact names before accepting an unambiguous GNU long-option prefix. */
++static int
++id_longopt (const char *arg)
++{
++  static const char *names[] = {
++    "groups", "group", "name", "real", "user", "zero", "context",
++    "help", "version", 0
++  };
++  static const int values[] = { 'G', 'g', 'n', 'r', 'u', 'z', 'Z', 'h', 'V' };
++  int i, match, count;
++  size_t len;
++
++  len = strlen (arg);
++  match = count = 0;
++  for (i = 0; names[i]; i++)
++    {
++      if (strcmp (names[i], arg) == 0)
++        return values[i];
++      if (len && strncmp (names[i], arg, len) == 0)
++        {
++          match = values[i];
++          count++;
++        }
++    }
++  return count == 1 ? match : -1;
++}
++
++/* Resolve names first, then numeric UIDs (including GNU's leading '+').
++   Copy the canonical name before later passwd/group lookups reuse NSS storage. */
++static int
++id_inituser (const char *user, char **name)
++{
++  struct passwd *pwd;
++  const char *p;
++  char *end;
++  uintmax_t number;
++
++  *name = 0;
++  if (user == 0)
++    {
++      ruid = getuid ();
++      euid = geteuid ();
++      rgid = getgid ();
++      egid = getegid ();
++      return 0;
++    }
++  pwd = getpwnam (user);
++  if (pwd == 0)
++    {
++      p = user + (user[0] == '+');
++      if (*p)
++        {
++          for (; *p >= '0' && *p <= '9'; p++)
++            ;
++          if (*p == 0)
++            {
++              errno = 0;
++              number = strtoumax (user, &end, 10);
++              if (errno == 0 && *end == 0 && (uintmax_t)(uid_t)number == number)
++                pwd = getpwuid ((uid_t)number);
++            }
++        }
++    }
++  if (pwd == 0)
++    {
++      builtin_error ("%s: no such user", user);
++      return -1;
++    }
++  ruid = euid = pwd->pw_uid;
++  rgid = egid = pwd->pw_gid;
++  *name = savestring (pwd->pw_name);
++  return 0;
++}
++
++static int
++id_pruser (uid_t uid)
++{
++  struct passwd *pwd;
++
++  if (id_flags & ID_USENAME)
++    {
++      pwd = getpwuid (uid);
++      if (pwd)
++        {
++          printf ("%s", pwd->pw_name);
++          return 0;
++        }
++      builtin_error ("cannot find name for user ID %ju", (uintmax_t)uid);
++      printf ("%ju", (uintmax_t)uid);
++      return 1;
++    }
++  printf ("%ju", (uintmax_t)uid);
++  return 0;
++}
++
++static int
++id_prgrp (gid_t gid)
++{
++  struct group *grp;
++
++  if (id_flags & ID_USENAME)
++    {
++      grp = getgrgid (gid);
++      if (grp)
++        {
++          printf ("%s", grp->gr_name);
++          return 0;
++        }
++      builtin_error ("cannot find name for group ID %ju", (uintmax_t)gid);
++      printf ("%ju", (uintmax_t)gid);
++      return 1;
++    }
++  printf ("%ju", (uintmax_t)gid);
++  return 0;
++}
++
++static int
++id_gidcmp (const void *a, const void *b)
++{
++  gid_t x, y;
++
++  x = *(const gid_t *)a;
++  y = *(const gid_t *)b;
++  return (x > y) - (x < y);
++}
++
++/* Keep the real/effective primary groups first and deduplicate supplementary
++   IDs, including groups mapped to the same overflow ID in a user namespace. */
++static int
++id_groups (const char *name, gid_t **result)
++{
++  gid_t *groups, *raw;
++  int n, capacity, got, i, count;
++#if !defined (__linux__) && !defined (HAVE_GETGROUPLIST)
++  struct group *grp;
++  char **member;
++#endif
++
++  capacity = 16;
++  raw = (gid_t *)xmalloc (capacity * sizeof (gid_t));
++  if (name)
++    {
++#if defined (__linux__) || defined (HAVE_GETGROUPLIST)
++      for (;;)
++        {
++          n = capacity;
++          got = getgrouplist (name, rgid, raw, &n);
++          if (got >= 0)
++            break;
++          if (n <= capacity || n > INT_MAX / (int)sizeof (gid_t) - 2)
++            {
++              free (raw);
++              builtin_error ("cannot get groups for %s", name);
++              return -1;
++            }
++          capacity = n;
++          raw = (gid_t *)xrealloc (raw, capacity * sizeof (gid_t));
++        }
++#else
++      n = 0;
++      setgrent ();
++      while ((grp = getgrent ()) != 0)
++        for (member = grp->gr_mem; member && *member; member++)
++          if (strcmp (*member, name) == 0)
++            {
++              if (n == capacity)
++                {
++                  if (capacity > INT_MAX / (int)sizeof (gid_t) / 2)
++                    {
++                      endgrent ();
++                      free (raw);
++                      builtin_error ("too many groups for %s", name);
++                      return -1;
++                    }
++                  capacity *= 2;
++                  raw = (gid_t *)xrealloc (raw, capacity * sizeof (gid_t));
++                }
++              raw[n++] = grp->gr_gid;
++              break;
++            }
++      endgrent ();
++#endif
++    }
++  else
++    {
++      n = getgroups (0, (gid_t *)0);
++      if (n < 0 || n > INT_MAX / (int)sizeof (gid_t) - 2)
++        {
++          free (raw);
++          builtin_error ("cannot get supplementary groups: %s", strerror (errno));
++          return -1;
++        }
++      if (n > capacity)
++        raw = (gid_t *)xrealloc (raw, n * sizeof (gid_t));
++      /* Avoid a zero-size query being mistaken for populated storage. */
++      if (n > 0)
++        {
++          n = getgroups (n, raw);
++          if (n < 0)
++            {
++              free (raw);
++              builtin_error ("cannot get supplementary groups: %s", strerror (errno));
++              return -1;
++            }
++        }
++    }
++  qsort (raw, n, sizeof (gid_t), id_gidcmp);
++  groups = (gid_t *)xmalloc ((n + 2) * sizeof (gid_t));
++  count = 0;
++  groups[count++] = rgid;
++  if (egid != rgid)
++    groups[count++] = egid;
++  for (i = 0; i < n; i++)
++    if (raw[i] != rgid && raw[i] != egid && (i == 0 || raw[i] != raw[i-1]))
++      groups[count++] = raw[i];
++  free (raw);
++  *result = groups;
++  return count;
++}
++
++static void
++id_userfield (const char *label, uid_t uid)
++{
++  struct passwd *pwd;
++
++  printf ("%s=%ju", label, (uintmax_t)uid);
++  pwd = getpwuid (uid);
++  if (pwd)
++    printf ("(%s)", pwd->pw_name);
++}
++
++static void
++id_groupfield (gid_t gid)
++{
++  struct group *grp;
++
++  printf ("%ju", (uintmax_t)gid);
++  grp = getgrgid (gid);
++  if (grp)
++    printf ("(%s)", grp->gr_name);
++}
++
++static int
++id_print (const char *user, int *printed)
++{
++  char *name;
++  gid_t *groups;
++  int n, i, status, separator;
++
++  *printed = 0;
++  if (id_inituser (user, &name) < 0)
++    return 1;
++  status = 0;
++  separator = (id_flags & ID_ZERO) ? '\0' : ' ';
++  if (id_flags & ID_USERONLY)
++    status = id_pruser ((id_flags & ID_USEREAL) ? ruid : euid);
++  else if (id_flags & ID_GIDONLY)
++    status = id_prgrp ((id_flags & ID_USEREAL) ? rgid : egid);
++  else
++    {
++      n = id_groups (name, &groups);
++      if (n < 0)
++        {
++          free (name);
++          return 1;
++        }
++      if (id_flags & ID_ALLGROUPS)
++        {
++          for (i = 0; i < n; i++)
++            {
++              if (i)
++                putchar (separator);
++              status |= id_prgrp (groups[i]);
++            }
++        }
++      else
++        {
++          id_userfield ("uid", ruid);
++          printf (" gid=");
++          id_groupfield (rgid);
++          if (euid != ruid)
++            id_userfield (" euid", euid);
++          if (egid != rgid)
++            {
++              printf (" egid=");
++              id_groupfield (egid);
++            }
++          printf (" groups=");
++          for (i = 0; i < n; i++)
++            {
++              if (i)
++                putchar (',');
++              id_groupfield (groups[i]);
++            }
++        }
++      free (groups);
++    }
++  free (name);
++  *printed = 1;
++  putchar ((id_flags & ID_ZERO) ? '\0' : '\n');
++  return status;
++}
+ 
+ int
+ id_builtin (WORD_LIST *list)
+ {
+-  int opt;
+-  char *user;
+-
+-  id_flags = 0;
+-  reset_internal_getopt ();
+-  while ((opt = internal_getopt (list, "Ggnru")) != -1)
+-    {
+-      switch (opt)
+-	{
+-	case 'G': id_flags |= ID_ALLGROUPS; break;
+-	case 'g': id_flags |= ID_GIDONLY; break;
+-	case 'n': id_flags |= ID_USENAME; break;
+-	case 'r': id_flags |= ID_USEREAL; break;
+-	case 'u': id_flags |= ID_USERONLY; break;
+-	CASE_HELPOPT;
+-	default:
+-	  builtin_usage ();
+-	  return (EX_USAGE);
+-	}
+-    }
+-  list = loptend;
+-
+-  user = list ? list->word->word : (char *)NULL;
+-
+-  /* Check for some invalid option combinations */
+-  opt = ID_FLAGSET (ID_ALLGROUPS) + ID_FLAGSET (ID_GIDONLY) + ID_FLAGSET (ID_USERONLY);
+-  if (opt > 1 || (opt == 0 && ((id_flags & (ID_USEREAL|ID_USENAME)) != 0)))
+-    {
+-      builtin_usage ();
+-      return (EX_USAGE);
+-    }
+-
+-  if (list && list->next)
+-    {
+-      builtin_usage ();
+-      return (EX_USAGE);
+-    }
+-
+-  if (inituser (user) < 0)
+-    return (EXECUTION_FAILURE);
+-
+-  opt = 0;
+-  if (id_flags & ID_USERONLY)
+-    opt += id_pruser ((id_flags & ID_USEREAL) ? ruid : euid);
+-  else if (id_flags & ID_GIDONLY)
+-    opt += id_prgrp ((id_flags & ID_USEREAL) ? rgid : egid);
+-  else if (id_flags & ID_ALLGROUPS)
+-    opt += id_prgroups (user);
++  WORD_LIST *word;
++  char *arg, *p;
++  char **users;
++  int end_options, nusers, nwords, option, long_option, selected, status, i;
++  int posix_options, printed;
++
++  nwords = 0;
++  for (word = list; word; word = word->next)
++    nwords++;
++  users = (char **)xmalloc ((nwords + 1) * sizeof (char *));
++  id_flags = end_options = nusers = status = 0;
++  posix_options = getenv ("POSIXLY_CORRECT") != 0;
++  for (; list; list = list->next)
++    {
++      arg = list->word->word;
++      if (!end_options && strcmp (arg, "--") == 0)
++        {
++          end_options = 1;
++          continue;
++        }
++      if (end_options || arg[0] != '-' || arg[1] == 0)
++        {
++          users[nusers++] = arg;
++          if (posix_options)
++            end_options = 1;
++          continue;
++        }
++      long_option = arg[1] == '-';
++      p = arg + 1;
++      do
++        {
++          option = long_option ? id_longopt (arg + 2) : (unsigned char)*p++;
++          switch (option)
++            {
++            case 'G': id_flags |= ID_ALLGROUPS; break;
++            case 'g': id_flags |= ID_GIDONLY; break;
++            case 'n': id_flags |= ID_USENAME; break;
++            case 'r': id_flags |= ID_USEREAL; break;
++            case 'u': id_flags |= ID_USERONLY; break;
++            case 'z': id_flags |= ID_ZERO; break;
++            case 'a': break;  /* GNU compatibility: ignored. */
++            case 'h':
++              if (long_option)
++                {
++                  free (users);
++                  builtin_help ();
++                  return (sh_chkwrite (EXECUTION_SUCCESS));
++                }
++              goto bad_option;
++            case 'V':
++              if (long_option)
++                {
++                  free (users);
++                  printf ("id (bash-os builtin, Bash %s)\n", dist_version);
++                  return (sh_chkwrite (EXECUTION_SUCCESS));
++                }
++              goto bad_option;
++            case 'Z':
++              builtin_error ("security context is not available");
++              free (users);
++              return (EXECUTION_FAILURE);
++            default:
++            bad_option:
++              builtin_error ("%s: invalid or ambiguous option", arg);
++              free (users);
++              return (EXECUTION_FAILURE);
++            }
++        }
++      while (!long_option && *p);
++    }
++  selected = !!(id_flags & ID_ALLGROUPS) + !!(id_flags & ID_GIDONLY) +
++             !!(id_flags & ID_USERONLY);
++  if (selected > 1 || (selected == 0 && (id_flags & (ID_USENAME|ID_USEREAL|ID_ZERO))))
++    {
++      builtin_error ("invalid option combination");
++      free (users);
++      return (EXECUTION_FAILURE);
++    }
++  if (nusers == 0)
++    status = id_print ((char *)0, &printed);
+   else
+-    opt += id_prall (user);
+-  putchar ('\n');
+-  fflush (stdout);
+-
+-  return (opt == 0 ? EXECUTION_SUCCESS : EXECUTION_FAILURE);
+-}
+-
+-static int
+-inituser (char *uname)
+-{
+-  struct passwd *pwd;
+-
+-  if (uname)
+-    {
+-      pwd = getpwnam (uname);
+-      if (pwd == 0)
+-	{
+-	  builtin_error ("%s: no such user", uname);
+-	  return -1;
+-	}
+-      ruid = euid = pwd->pw_uid;
+-      rgid = egid = pwd->pw_gid;
+-    }
+-  else
+-    {
+-      ruid = current_user.uid;
+-      euid = current_user.euid;
+-      rgid = current_user.gid;
+-      egid = current_user.egid;
+-    }
+-  return 0;
+-}
+-
+-/* Print the name or value of user ID UID. */
+-static int
+-id_pruser (int uid)
+-{
+-  struct passwd *pwd = NULL;
+-  int r;
+-
+-  r = 0;
+-  if (id_flags & ID_USENAME)
+-    {
+-      pwd = getpwuid (uid);
+-      if (pwd == NULL)
+-        r = 1;
+-    }
+-  if (pwd)
+-    printf ("%s", pwd->pw_name);
+-  else
+-    printf ("%u", (unsigned) uid);
+-      
+-  return r;
+-}
+-
+-/* Print the name or value of group ID GID. */
+-
+-static int
+-id_prgrp (int gid)
+-{
+-  struct group *grp = NULL;
+-  int r;
+-
+-  r = 0;
+-  if (id_flags & ID_USENAME)
+-    {
+-      grp = getgrgid (gid);
+-      if (grp == NULL)
+-	r = 1;
+-    }
+-
+-  if (grp)
+-    printf ("%s", grp->gr_name);
+-  else
+-    printf ("%u", (unsigned) gid);
+-
+-  return r;
+-}
+-
+-static int
+-id_prgroups (char *uname)
+-{
+-  int *glist, ng, i, r;
+-
+-  r = 0;
+-  id_prgrp (rgid);
+-  if (egid != rgid)
+-    {
+-      putchar (' ');
+-      id_prgrp (egid);
+-    }
+-
+-  if (uname)
+-    {
+-      builtin_error ("supplementary groups for other users not yet implemented");
+-      glist = (int *)NULL;
+-      ng = 0;
+-      r = 1;
+-    }
+-  else
+-    glist = get_group_array (&ng);
+-
+-  for (i = 0; i < ng; i++)
+-    if (glist[i] != rgid && glist[i] != egid)
++    for (i = 0; i < nusers; i++)
+       {
+-	putchar (' ');
+-	id_prgrp (glist[i]);
++        status |= id_print (users[i], &printed);
++        if (printed && (id_flags & (ID_ZERO|ID_ALLGROUPS)) == (ID_ZERO|ID_ALLGROUPS) &&
++            nusers > 1)
++          putchar ('\0');
+       }
+-  
+-  return r;
+-}
+-
+-static int
+-id_prall (char *uname)
+-{
+-  int r, i, ng, *glist;
+-  struct passwd *pwd;
+-  struct group *grp;
+-
+-  r = 0;
+-  printf ("uid=%u", (unsigned) ruid);
+-  pwd = getpwuid (ruid);
+-  if (pwd == NULL)
+-    r = 1;
+-  else
+-    printf ("(%s)", pwd->pw_name);
+-
+-  printf (" gid=%u", (unsigned) rgid);
+-  grp = getgrgid (rgid);
+-  if (grp == NULL)
+-    r = 1;
+-  else
+-    printf ("(%s)", grp->gr_name);
+-
+-  if (euid != ruid)
+-    { 
+-      printf (" euid=%u", (unsigned) euid);
+-      pwd = getpwuid (euid);
+-      if (pwd == NULL)
+-	r = 1;
+-      else 
+-	printf ("(%s)", pwd->pw_name);
+-    }
+-
+-  if (egid != rgid) 
+-    {
+-      printf (" egid=%u", (unsigned) egid);
+-      grp = getgrgid (egid);
+-      if (grp == NULL)
+-	r = 1;
+-      else
+-	printf ("(%s)", grp->gr_name);
+-    }
+-
+-  if (uname)
+-    {
+-      builtin_error ("supplementary groups for other users not yet implemented");
+-      glist = (int *)NULL;
+-      ng = 0;
+-      r = 1;
+-    }
+-  else
+-    glist = get_group_array (&ng);
+-
+-  if (ng > 0)
+-    printf (" groups=");
+-  for (i = 0; i < ng; i++)
+-    {
+-      if (i > 0)
+-	printf (", ");
+-      printf ("%u", (unsigned) glist[i]);
+-      grp = getgrgid (glist[i]);
+-      if (grp == NULL)
+-	r = 1;
+-      else
+-	printf ("(%s)", grp->gr_name);
+-    }
+-
+-  return r;
++  free (users);
++  return (sh_chkwrite (status ? EXECUTION_FAILURE : EXECUTION_SUCCESS));
+ }
+ 
+ char *id_doc[] = {
+-	"Display information about user."
+-	"",
+-	"Return information about user identity",
+-	(char *)NULL
++        "Display information about user.",
++        "",
++        "Display real/effective user and group IDs and supplementary groups.",
++        "With USER operands, resolve each account by name or numeric UID.",
++        "-u, --user selects the user ID; -g, --group the primary group;",
++        "-G, --groups all groups; -n, --name prints names; -r, --real uses real IDs.",
++        "-z, --zero uses NUL delimiters with -u, -g or -G; -a is ignored.",
++        "--help displays help; --version displays the Bash builtin version.",
++        (char *)NULL
+ };
+ 
+ struct builtin id_struct = {
+-	"id",
+-	id_builtin,
+-	BUILTIN_ENABLED,
+-	id_doc,
+-	"id [user]\n\tid -G [-n] [user]\n\tid -g [-nr] [user]\n\tid -u [-nr] [user]",
+-	0
++        "id",
++        id_builtin,
++        BUILTIN_ENABLED,
++        id_doc,
++        "id [-aGgnruz] [USER ...]",
++        0
+ };

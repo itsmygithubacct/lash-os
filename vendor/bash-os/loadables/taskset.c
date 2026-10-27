@@ -22,6 +22,7 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <limits.h>
 #include <sched.h>
 #include <signal.h>
 #include <stdio.h>
@@ -31,6 +32,7 @@
 #include <sys/wait.h>
 
 #include "loadables.h"
+#include "child-wait.h"
 
 static int
 bts_parse_pid (const char *s, pid_t *out)
@@ -40,7 +42,7 @@ bts_parse_pid (const char *s, pid_t *out)
   if (!s || !*s) return -1;
   errno = 0;
   v = strtol (s, &end, 10);
-  if (errno || !end || *end != '\0' || v < 0)
+  if (errno || !end || *end != '\0' || v < 0 || v > INT_MAX)
     return -1;
   *out = (pid_t) v;
   return 0;
@@ -225,30 +227,27 @@ bts_run_command (const cpu_set_t *set, WORD_LIST *cmd)
   if (bts_argv_from_list (cmd, &argv) < 0)
     return EXECUTION_FAILURE;
 
-  struct sigaction chld_dfl, chld_save;
-  memset (&chld_dfl, 0, sizeof chld_dfl);
-  chld_dfl.sa_handler = SIG_DFL;
-  sigemptyset (&chld_dfl.sa_mask);
-  sigaction (SIGCHLD, &chld_dfl, &chld_save);
+  bos_child_wait child_wait;
+  if (bos_child_wait_begin (&child_wait) < 0) {
+      builtin_error ("SIGCHLD setup: %s", strerror (errno));
+      free (argv); return EXECUTION_FAILURE;
+  }
 
-  sigset_t chld_set, prev_mask;
-  sigemptyset (&chld_set);
-  sigaddset (&chld_set, SIGCHLD);
-  sigprocmask (SIG_BLOCK, &chld_set, &prev_mask);
-
+  maybe_make_export_env ();
+  fflush (stdout);
+  fflush (stderr);
   pid_t pid = fork ();
   if (pid < 0)
     {
       int e = errno;
-      sigprocmask (SIG_SETMASK, &prev_mask, NULL);
-      sigaction (SIGCHLD, &chld_save, NULL);
+      bos_child_wait_end (&child_wait);
       free (argv);
       builtin_error ("fork: %s", strerror (e));
       return EXECUTION_FAILURE;
     }
   if (pid == 0)
     {
-      sigprocmask (SIG_SETMASK, &prev_mask, NULL);
+      bos_child_wait_child (&child_wait);
       if (sched_setaffinity (0, sizeof *set, set) < 0)
         {
           fprintf (stderr, "taskset: sched_setaffinity: %s\n", strerror (errno));
@@ -264,8 +263,7 @@ bts_run_command (const cpu_set_t *set, WORD_LIST *cmd)
   int status = 0;
   pid_t w;
   while ((w = waitpid (pid, &status, 0)) < 0 && errno == EINTR) ;
-  sigprocmask (SIG_SETMASK, &prev_mask, NULL);
-  sigaction (SIGCHLD, &chld_save, NULL);
+  bos_child_wait_end (&child_wait);
   if (w < 0)
     {
       builtin_error ("waitpid: %s", strerror (errno));
@@ -293,7 +291,7 @@ int
 taskset_builtin (WORD_LIST *list)
 {
   if (!list)
-    { bts_help (); return EX_USAGE; }
+    { bts_help (); return EXECUTION_FAILURE; }
 
   const char *w = list->word->word;
   if (strcmp (w, "--help") == 0 || strcmp (w, "-h") == 0)
@@ -307,7 +305,7 @@ taskset_builtin (WORD_LIST *list)
       cpu_list = 1;
       list = list->next;
       if (!list)
-        { builtin_error ("missing argument after %s", w); return EX_USAGE; }
+        { builtin_error ("missing argument after %s", w); return EXECUTION_FAILURE; }
       w = list->word->word;
     }
   else if (strncmp (w, "--cpu-list=", 11) == 0)
@@ -315,7 +313,7 @@ taskset_builtin (WORD_LIST *list)
       cpu_list = 1;
       w += 11;
       if (!*w)
-        { builtin_error ("--cpu-list needs LIST"); return EX_USAGE; }
+        { builtin_error ("--cpu-list needs LIST"); return EXECUTION_FAILURE; }
     }
   else if (strncmp (w, "-c", 2) == 0 && w[2])
     {
@@ -328,13 +326,13 @@ taskset_builtin (WORD_LIST *list)
       int argc = 0;
       for (WORD_LIST *p = list->next; p; p = p->next) argc++;
       if (argc != 1 && argc != 2)
-        { builtin_error ("usage: taskset -p [MASK] PID"); return EX_USAGE; }
+        { builtin_error ("usage: taskset -p [MASK] PID"); return EXECUTION_FAILURE; }
 
       pid_t pid;
       const char *pid_s = argc == 1 ? list->next->word->word
                                     : list->next->next->word->word;
       if (bts_parse_pid (pid_s, &pid) < 0)
-        { builtin_error ("invalid pid: %s", pid_s); return EX_USAGE; }
+        { builtin_error ("invalid pid: %s", pid_s); return EXECUTION_FAILURE; }
 
       cpu_set_t oldset;
       if (bts_get_affinity (pid, &oldset) != EXECUTION_SUCCESS)
@@ -355,7 +353,7 @@ taskset_builtin (WORD_LIST *list)
         {
           cpu_set_t newset;
           if ((cpu_list ? bts_parse_cpu_list : bts_parse_mask) (list->next->word->word, &newset) < 0)
-            { builtin_error ("invalid %s: %s", cpu_list ? "cpu list" : "mask", list->next->word->word); return EX_USAGE; }
+            { builtin_error ("invalid %s: %s", cpu_list ? "cpu list" : "mask", list->next->word->word); return EXECUTION_FAILURE; }
           if (bts_set_affinity (pid, &newset) != EXECUTION_SUCCESS)
             return EXECUTION_FAILURE;
           char newbuf[CPU_SETSIZE * 6 + 2];
@@ -374,11 +372,11 @@ taskset_builtin (WORD_LIST *list)
     }
 
   if (!list->next)
-    { builtin_error ("missing command for mask %s", w); return EX_USAGE; }
+    { builtin_error ("missing command for mask %s", w); return EXECUTION_FAILURE; }
 
   cpu_set_t set;
   if ((cpu_list ? bts_parse_cpu_list : bts_parse_mask) (w, &set) < 0)
-    { builtin_error ("invalid %s: %s", cpu_list ? "cpu list" : "mask", w); return EX_USAGE; }
+    { builtin_error ("invalid %s: %s", cpu_list ? "cpu list" : "mask", w); return EXECUTION_FAILURE; }
   return bts_run_command (&set, list->next);
 }
 

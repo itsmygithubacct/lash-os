@@ -2,7 +2,9 @@
 
 Source: https://github.com/itsmygithubacct/bash-os
 
-Revision: `fa178afafddfce8ee870975a38a7f271b25140a9`
+Release: `0.1.2`
+
+Revision: `8381e8136626d18083d470ac26ba079ad0b2f602`
 
 This directory contains the source, build scripts, configuration, patches and
 licenses needed by lashos. Upstream CI, benchmarks, development reports, examples

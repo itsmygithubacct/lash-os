@@ -1,0 +1,134 @@
+--- builtins/getconf.c
++++ builtins/getconf.c
+@@ -251,11 +251,7 @@
+ #ifdef _SC_UIO_MAXIOV
+     { "UIO_MAXIOV", _SC_UIO_MAXIOV, SYSCONF },
+ #endif
+-#ifdef _SC_ULONG_MAX
+-    { "ULONG_MAX", _SC_ULONG_MAX, SYSCONF },
+-#else
+     { "ULONG_MAX", VAL_ULONG_MAX, CONSTANT },
+-#endif
+ #ifdef HAVE_LONG_LONG_INT
+     { "ULLONG_MAX", VAL_ULLONG_MAX, CONSTANT },
+ #endif
+@@ -274,9 +270,11 @@
+ #endif
+ #ifdef _SC_NPROCESSORS_CONF
+     { "_NPROCESSORS_CONF", _SC_NPROCESSORS_CONF, SYSCONF },
++    { "NPROCESSORS_CONF", _SC_NPROCESSORS_CONF, SYSCONF },
+ #endif
+ #ifdef _SC_NPROCESSORS_ONLN
+     { "_NPROCESSORS_ONLN", _SC_NPROCESSORS_ONLN, SYSCONF },
++    { "NPROCESSORS_ONLN", _SC_NPROCESSORS_ONLN, SYSCONF },
+ #endif
+ #ifdef _SC_PHYS_PAGES
+     { "_PHYS_PAGES", _SC_PHYS_PAGES, SYSCONF },
+@@ -935,6 +933,12 @@
+     { "_POSIX_RAW_SOCKETS", _SC_RAW_SOCKETS, SYSCONF },
+ #endif
+ 
++#ifdef _CS_GNU_LIBC_VERSION
++    { "GNU_LIBC_VERSION", _CS_GNU_LIBC_VERSION, CONFSTR },
++#endif
++#ifdef _CS_GNU_LIBPTHREAD_VERSION
++    { "GNU_LIBPTHREAD_VERSION", _CS_GNU_LIBPTHREAD_VERSION, CONFSTR },
++#endif
+     { NULL, 0, SYSCONF }
+   };
+ 
+@@ -1050,8 +1054,8 @@
+ 	continue;	/* Only print pathconf vars if path supplied */
+ #endif
+       /* The output format for getconf -a is required by POSIX interp 1808 */
+-      printf("%s: ", c->name);
+-      if (getconf_print (c, path, 1) == EXECUTION_FAILURE)
++      printf("%-35s", c->name);
++      if (getconf_print (c, path, 1) != EXECUTION_SUCCESS)
+         r = EXECUTION_FAILURE;
+     }
+   return (r);
+@@ -1104,53 +1108,46 @@
+   switch (c->call)
+     {
+     case PATHCONF:
+-      errno = 0;
+-      value = pathconf (vpath, cn);
+-      if (value == -1L)
+-	{
+-	  if (errno)
+-	    builtin_error ("pathconf %s: %s: %s", c->name, vpath, strerror (errno));
+-	  printf ("undefined\n");
+-	  return (EXECUTION_FAILURE);
+-	}
+-      else
+-        printf ("%ld\n", value);
+-      return (EXECUTION_SUCCESS);
+-
+     case SYSCONF:
+       errno = 0;
+-      value = sysconf (cn);
++      value = c->call == PATHCONF ? pathconf (vpath, cn) : sysconf (cn);
+       if (value == -1L)
+-	{
+-	  if (errno)
+-	    builtin_error ("%s: %s", c->name, strerror (errno));
+-	  printf ("undefined\n");
+-	  return (EXECUTION_FAILURE);
+-	}
+-      else
+-	printf ("%ld\n", value);
+-      return (EXECUTION_SUCCESS);
++        {
++          /* -a includes unsupported variables as blank fields. A single
++             unsupported query is "undefined"; an actual query error is 3. */
++          if (errno && all == 0)
++            {
++              builtin_error ("%s: %s", c->name, strerror (errno));
++              return 3;
++            }
++          printf (all ? "\n" : "undefined\n");
++        }
++      else printf ("%ld\n", value);
++      return EXECUTION_SUCCESS;
+ 
+     case CONFSTR:
+       errno = 0;
+       clen = confstr (cn, (char *) NULL, 0);
+-      cvalue = (char *) malloc (clen);
+-      if (cvalue == NULL)
++      if (clen == 0)
+         {
+-          builtin_error ("memory allocation failure");
+-          return (EXECUTION_FAILURE);
++          if (errno && all == 0)
++            {
++              builtin_error ("%s: confstr: %s", c->name, strerror (errno));
++              return 3;
++            }
++          printf (all ? "\n" : "undefined\n");
++          return EXECUTION_SUCCESS;
+         }
+-      if (confstr (c->call_name, cvalue, clen) != clen)
+-	{
+-	  if (errno != 0)
+-	    builtin_error ("%s: confstr: %s", c->name, strerror (errno));
+-	  printf ("undefined\n");
+-	  return (EXECUTION_FAILURE);
+-	}
+-      else
+-	printf ("%.*s\n", (int) clen, cvalue);
++      cvalue = xmalloc (clen);
++      if (confstr (cn, cvalue, clen) != clen)
++        {
++          builtin_error ("%s: confstr: %s", c->name, strerror (errno));
++          free (cvalue);
++          return 3;
++        }
++      printf ("%s\n", cvalue);
+       free (cvalue);
+-      return (EXECUTION_SUCCESS);
++      return EXECUTION_SUCCESS;
+ 
+     case CONSTANT:
+       return (getconf_internal (c, all));

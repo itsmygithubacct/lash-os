@@ -233,6 +233,26 @@ static void
 od_emit_spec_line (const od_spec *s, const unsigned char *buf, size_t n,
                    int width, int groupbytes, int gwidth)
 {
+    if (s->kind == 'i' && s->base == 'x' && s->bytes == 1 &&
+        groupbytes == 1 && gwidth == 3) {
+        /* Hex bytes need no general integer formatting or column padding.
+           Encode bounded chunks, including for arbitrarily wide -w lines. */
+        static const char hex[] = "0123456789abcdef";
+        char text[768];
+        size_t used = 0;
+        for (size_t i = 0; i < n; i++) {
+            text[used++] = ' ';
+            text[used++] = hex[buf[i] >> 4];
+            text[used++] = hex[buf[i] & 15];
+            if (used == sizeof text) {
+                fwrite (text, 1, used, stdout);
+                used = 0;
+            }
+        }
+        text[used++] = '\n';
+        fwrite (text, 1, used, stdout);
+        return;
+    }
     /* Each group of `groupbytes` bytes is a column of total width `gwidth`,
        shared by this spec's `elems_per_group` elements. GNU divides the
        column evenly; any remainder is added to the FIRST element's field. */
@@ -257,8 +277,76 @@ od_emit_spec_line (const od_spec *s, const unsigned char *buf, size_t n,
     putchar ('\n');
 }
 
+/* All operands form one logical input stream. Open lazily so -N does not
+   inspect later operands, and retain one stdin stream for repeated '-'. */
+typedef struct {
+    WORD_LIST *next;
+    FILE *file, *input;
+    const char *name;
+    int implicit_stdin, status;
+    long long remaining;             /* -1 until skipping is complete */
+} od_input;
+
+static FILE *od_open_stdin (void);
+
 static int
-od_dump (FILE *f, od_opts *o, int *seen_block, unsigned char *prev,
+od_next_input (od_input *in)
+{
+    if (in->file && in->file != in->input)
+        fclose (in->file);
+    in->file = NULL;
+    while (in->next || in->implicit_stdin) {
+        if (in->implicit_stdin) {
+            in->name = "-";
+            in->implicit_stdin = 0;
+        } else {
+            in->name = in->next->word->word;
+            in->next = in->next->next;
+        }
+        if (!strcmp (in->name, "-")) {
+            if (!in->input) in->input = od_open_stdin ();
+            in->file = in->input;
+        } else {
+            in->file = fopen (in->name, "rb");
+            if (!in->file)
+                builtin_error ("%s: %s", in->name, strerror (errno));
+        }
+        if (in->file) return 1;
+        in->status = EXECUTION_FAILURE;
+    }
+    return 0;
+}
+
+static size_t
+od_read_input (od_input *in, unsigned char *buf, size_t want)
+{
+    size_t n = 0;
+    if (in->remaining >= 0 && (unsigned long long) in->remaining < want)
+        want = (size_t) in->remaining;
+    while (n < want) {
+        if (!in->file && !od_next_input (in)) break;
+        size_t got = fread (buf + n, 1, want - n, in->file);
+        n += got;
+        if (n == want) break;
+        if (ferror (in->file)) {
+            builtin_error ("%s: %s", in->name, strerror (errno ? errno : EIO));
+            in->status = EXECUTION_FAILURE;
+        }
+        if (!od_next_input (in)) break;
+    }
+    if (in->remaining >= 0) in->remaining -= (long long) n;
+    return n;
+}
+
+static void
+od_close_input (od_input *in)
+{
+    if (in->file && in->file != in->input) fclose (in->file);
+    if (in->input) fclose (in->input);
+}
+
+static int
+od_dump (od_input *in, od_opts *o, int *seen_block, unsigned char *prev,
          size_t *prev_n, int *dedup_active)
 {
     /* Largest element width and the aligned group width across all specs. */
@@ -288,7 +376,7 @@ od_dump (FILE *f, od_opts *o, int *seen_block, unsigned char *prev,
             if (remaining <= 0) break;
             if ((long long) want > remaining) want = (size_t) remaining;
         }
-        n = fread (buf, 1, want, f);
+        n = od_read_input (in, buf, want);
         if (n == 0) break;
 
         /* '*' dedup: only full-width lines that match the previous full-width
@@ -366,15 +454,15 @@ od_strings (FILE *f, int min)
    and a run NOT terminated by NUL is discarded). The offset of the run's
    first byte is printed in the address radix (suppressed when 'n'). */
 static int
-od_strings_gnu (FILE *f, int min, char rad)
+od_strings_gnu (od_input *in, int min, char rad, long long start)
 {
     unsigned char buf[8192];
     size_t n;
     int run = 0;
     static char run_buf[1 << 20];    /* GNU has no fixed cap; this is generous */
-    long long off = 0, run_start = 0;
+    long long off = start, run_start = 0;
 
-    while ((n = fread (buf, 1, sizeof buf, f)) > 0) {
+    while ((n = od_read_input (in, buf, sizeof buf)) > 0) {
         for (size_t i = 0; i < n; i++) {
             unsigned char c = buf[i];
             if (c >= 0x20 && c <= 0x7e) {           /* ASCII graphic + space */
@@ -399,14 +487,16 @@ od_strings_gnu (FILE *f, int min, char rad)
 }
 
 static int
-od_skip_input (FILE *f, long long n)
+od_skip_file (FILE *f, long long n)
 {
     unsigned char discard[4096];
 
     if (n <= 0)
         return 0;
 
-    if (fseeko (f, (off_t)n, SEEK_SET) == 0)
+    /* Skip from the current position, as GNU od does: stdin is shared with
+       the shell, and a `read' before od leaves its offset past the start. */
+    if (fseeko (f, (off_t)n, SEEK_CUR) == 0)
         return 0;
 
     if (ferror (f))
@@ -422,6 +512,63 @@ od_skip_input (FILE *f, long long n)
         if (got == 0)
             return -1;
         n -= (long long)got;
+    }
+    return 0;
+}
+
+/* The custom -s mode has no GNU oracle. Retain its per-file behavior;
+   the concatenated reader below serves numeric dumps and GNU -S only. */
+static int
+od_custom_strings (WORD_LIST *list, od_opts *o)
+{
+    int rc = EXECUTION_SUCCESS;
+    FILE *input = NULL;
+    if (!list) {
+        input = od_open_stdin ();
+        if (!input) return EXECUTION_FAILURE;
+        if (od_skip_file (input, o->skip_bytes) < 0) {
+            builtin_error ("stdin: cannot skip %lld bytes", o->skip_bytes);
+            rc = EXECUTION_FAILURE;
+        } else
+            rc = od_strings (input, o->strings_min);
+        fclose (input);
+    } else {
+        for (WORD_LIST *p = list; p; p = p->next) {
+            FILE *f;
+            if (!strcmp (p->word->word, "-")) {
+                if (!input) input = od_open_stdin ();
+                f = input;
+            } else
+                f = fopen (p->word->word, "rb");
+            if (!f) {
+                builtin_error ("%s: %s", p->word->word, strerror (errno));
+                rc = EXECUTION_FAILURE;
+                continue;
+            }
+            if (od_skip_file (f, o->skip_bytes) < 0) {
+                builtin_error ("%s: cannot skip %lld bytes", p->word->word, o->skip_bytes);
+                rc = EXECUTION_FAILURE;
+            } else
+                od_strings (f, o->strings_min);
+            if (f != input) fclose (f);
+        }
+        if (input) fclose (input);
+    }
+    return rc;
+}
+
+static int
+od_skip_input (od_input *in, long long n)
+{
+    unsigned char discard[4096];
+    /* Reading also handles short and empty files without seeking past EOF
+       or restarting the skip count at the next operand. */
+    while (n > 0) {
+        size_t want = sizeof discard;
+        if ((long long) want > n) want = (size_t) n;
+        size_t got = od_read_input (in, discard, want);
+        if (got == 0) return -1;
+        n -= (long long) got;
     }
     return 0;
 }
@@ -692,61 +839,47 @@ od_builtin (WORD_LIST *list)
     if (!o.strings_min && !o.gnu_strings_min && o.nspecs == 0)
         od_add_spec (&o, 'i', 'o', 2);
 
+    /* od_dump rounds a short requested width up to one complete element.
+       The previous-line buffer must hold that same effective width. */
+    int buffer_width = o.width;
+    for (int k = 0; k < o.nspecs; k++)
+        if (o.specs[k].bytes > buffer_width) buffer_width = o.specs[k].bytes;
+
     int rc = EXECUTION_SUCCESS;
-    FILE *input = NULL;
-    if (!list) {
-        input = od_open_stdin ();
-        if (!input)
+    if (o.strings_min && !o.gnu_strings_min)
+        rc = od_custom_strings (list, &o);
+    else {
+        od_input in = { .next = list, .implicit_stdin = list == NULL,
+                        .status = EXECUTION_SUCCESS, .remaining = -1 };
+        if (!od_next_input (&in)) {
+            od_close_input (&in);
             return EXECUTION_FAILURE;
-        if (od_skip_input (input, o.skip_bytes) < 0) {
-            builtin_error ("stdin: cannot skip %lld bytes", o.skip_bytes);
-            rc = EXECUTION_FAILURE;
-        } else if (o.gnu_strings_min) rc = od_strings_gnu (input, o.gnu_strings_min, o.addr_radix);
-        else if (o.strings_min) rc = od_strings (input, o.strings_min);
-        else {
-            int seen = 0, dactive = 0; size_t pn = 0;
-            unsigned char *prev = (unsigned char *) malloc ((size_t) o.width);
-            if (!prev) {
-                builtin_error ("out of memory");
-                fclose (input);
-                return EXECUTION_FAILURE;
-            }
-            rc = od_dump (input, &o, &seen, prev, &pn, &dactive);
-            free (prev);
         }
-        fclose (input);
-    } else {
-        for (WORD_LIST *p = list; p; p = p->next) {
-            FILE *f;
-            if (!strcmp (p->word->word, "-")) {
-                if (!input) input = od_open_stdin ();
-                f = input;
-            } else
-                f = fopen (p->word->word, "rb");
-            if (!f) {
-                builtin_error ("%s: %s", p->word->word, strerror (errno));
-                rc = EXECUTION_FAILURE;
-                continue;
-            }
-            if (od_skip_input (f, o.skip_bytes) < 0) {
-                builtin_error ("%s: cannot skip %lld bytes", p->word->word, o.skip_bytes);
-                rc = EXECUTION_FAILURE;
-            } else if (o.gnu_strings_min) od_strings_gnu (f, o.gnu_strings_min, o.addr_radix);
-            else if (o.strings_min) od_strings (f, o.strings_min);
+        if (od_skip_input (&in, o.skip_bytes) < 0) {
+            builtin_error ("cannot skip %lld bytes", o.skip_bytes);
+            rc = EXECUTION_FAILURE;
+        } else {
+            in.remaining = o.max_bytes;
+            if (o.gnu_strings_min)
+                rc = od_strings_gnu (&in, o.gnu_strings_min, o.addr_radix, o.skip_bytes);
             else {
                 int seen = 0, dactive = 0; size_t pn = 0;
-                unsigned char *prev = (unsigned char *) malloc ((size_t) o.width);
-                if (prev) {
-                    od_dump (f, &o, &seen, prev, &pn, &dactive);
-                    free (prev);
-                } else {
+                unsigned char *prev = (unsigned char *) malloc ((size_t) buffer_width);
+                if (!prev) {
                     builtin_error ("out of memory");
                     rc = EXECUTION_FAILURE;
+                } else {
+                    rc = od_dump (&in, &o, &seen, prev, &pn, &dactive);
+                    free (prev);
                 }
             }
-            if (f != input) fclose (f);
         }
-        if (input) fclose (input);
+        if (in.status != EXECUTION_SUCCESS) rc = in.status;
+        od_close_input (&in);
+    }
+    if (fflush (stdout) == EOF || ferror (stdout)) {
+        builtin_error ("write error: %s", strerror (errno ? errno : EIO));
+        rc = EXECUTION_FAILURE;
     }
     return rc;
 }

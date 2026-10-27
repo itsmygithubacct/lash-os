@@ -1,0 +1,110 @@
+--- builtins/sleep.c
++++ builtins/sleep.c
+@@ -44,6 +44,7 @@
+ #endif
+ 
+ #include <stdio.h>
++#include <limits.h>
+ #include "chartypes.h"
+ 
+ #include "loadables.h"
+@@ -121,50 +122,54 @@
+ int
+ sleep_builtin (WORD_LIST *list)
+ {
+-	long	sec, usec;
+-	char	*ep;
+-	int	r, mul;
+-	time_t	t;
++  long sec, usec, total_sec = 0, total_usec = 0;
++  char *ep, *arg;
++  WORD_LIST *word;
++  int r;
+ 
+-	if (list == 0) {
+-		builtin_usage();
+-		return(EX_USAGE);
+-	}
++  if (list && strcmp (list->word->word, "--help") == 0)
++    { builtin_help (); return sh_chkwrite (EXECUTION_SUCCESS); }
++  if (list && strcmp (list->word->word, "--version") == 0)
++    { printf ("sleep (bash-os builtin)\n"); return sh_chkwrite (EXECUTION_SUCCESS); }
++  if (list == 0)
++    { builtin_error ("missing operand"); return EXECUTION_FAILURE; }
++  if (strcmp (list->word->word, "--") == 0)
++    list = list->next;
+ 
+-	/* Skip over `--' */
+-	if (list->word && ISOPTION (list->word->word, '-'))
+-		list = list->next;
+-
+-	/* Reject options and negative arguments */
+-	if (*list->word->word == '-' || list->next) {
+-		builtin_usage ();
+-		return (EX_USAGE);
+-	}
+-
+-    	r = uconvert(list->word->word, &sec, &usec, &ep);
+-	/*
+-	 * Maybe postprocess conversion failures here based on EP
+-	 *
+-	 * A heuristic: if the conversion failed, but the argument appears to
+-	 * contain a GNU-like interval specifier (e.g. "1m30s"), try to parse
+-	 * it. If we can't, it's an error.
+-	 */
+-	if (r == 0 && (strchr ("dhms", *ep) || strpbrk (list->word->word, "dhms")))
+-		r = parse_gnutimefmt (list->word->word, &sec, &usec);
+-    		
+-	if (r) {
+-		fsleep(sec, usec);
+-		QUIT;
+-		return(EXECUTION_SUCCESS);
+-	}
+-	builtin_error("%s: bad sleep interval", list->word->word);
+-	return (EXECUTION_FAILURE);
++  /* Validate and add all operands before waiting. */
++  for (word = list; word; word = word->next)
++    {
++      arg = word->word->word;
++      if (*arg == 0 || *arg == '-')
++        goto invalid;
++      sec = usec = 0;
++      r = uconvert (arg, &sec, &usec, &ep);
++      if (r == 0 && (strchr ("dhms", *ep) || strpbrk (arg, "dhms")))
++        r = parse_gnutimefmt (arg, &sec, &usec);
++      if (r == 0 || sec < 0 || usec < 0 || sec > LONG_MAX - total_sec)
++        goto invalid;
++      total_sec += sec;
++      total_usec += usec;
++      if (total_usec >= 1000000)
++        {
++          if (total_sec == LONG_MAX) goto invalid;
++          total_sec++;
++          total_usec -= 1000000;
++        }
++    }
++  fsleep (total_sec, total_usec);
++  QUIT;
++  return EXECUTION_SUCCESS;
++invalid:
++  builtin_error ("%s: bad sleep interval", arg);
++  return EXECUTION_FAILURE;
+ }
+ 
+ char *sleep_doc[] = {
+ 	"Suspend execution for specified period.",
+ 	""
+-	"sleep suspends execution for a minimum of SECONDS[.FRACTION] seconds.",
++	"sleep suspends execution for the sum of its interval operands.",
++	"Each NUMBER may have a fractional part and an s, m, h, or d suffix.",
+ 	"As an extension, sleep accepts GNU-style time intervals (e.g., 2m30s).",
+ 	(char *)NULL
+ };
+@@ -174,6 +179,6 @@
+ 	sleep_builtin,
+ 	BUILTIN_ENABLED,
+ 	sleep_doc,
+-	"sleep seconds[.fraction]",
++	"sleep NUMBER[SUFFIX]...",
+ 	0
+ };

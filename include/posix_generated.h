@@ -97,4 +97,13 @@ enum posix_operation {
     PX_FSETXATTR = 91,
     PX_FLISTXATTR = 92,
     PX_FREMOVEXATTR = 93,
+    PX_RENAMEAT = 94,
+    PX_COPY_FILE_RANGE = 95,
+    PX_MQ_UNLINK = 96,
+    PX_MQ_OPEN = 97,
+    PX_LINKAT = 98,
+    PX_STATFS = 99,
+    PX_MKFIFOAT = 100,
+    PX_MKDIRAT = 101,
+    PX_SYMLINKAT = 102,
 };

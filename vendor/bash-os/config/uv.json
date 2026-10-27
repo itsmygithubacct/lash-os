@@ -1,0 +1,19 @@
+{
+  "version": "0.12.15",
+  "license": "MIT OR Apache-2.0",
+  "url": "https://github.com/astral-sh/uv/releases/download/{version}/uv-{target}.tar.gz",
+  "targets": {
+    "x86_64": {
+      "target": "x86_64-unknown-linux-musl",
+      "sha256": "999c0c3da986953e508985c3932d283d2c62eb167b4f8d81e79f565e34104959"
+    },
+    "aarch64": {
+      "target": "aarch64-unknown-linux-musl",
+      "sha256": "93b801abb146e6431fb0434346a0162e65d3f0d1cd7360144d04c43488fd7f7d"
+    },
+    "riscv64": {
+      "target": "riscv64gc-unknown-linux-musl",
+      "sha256": "8c03514f57e517eb87a376deb3d6475045f6ce550956c6082910b4a529d08a47"
+    }
+  }
+}

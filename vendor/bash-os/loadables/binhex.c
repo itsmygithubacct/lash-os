@@ -208,7 +208,7 @@ binhex_decode (int in_fd, int out_fd)
             }
         }
     }
-  if (hi >= 0)
+  if (hi >= 0 || prev_zero)
     {
       builtin_error ("odd number of hex digits in input");
       return 1;

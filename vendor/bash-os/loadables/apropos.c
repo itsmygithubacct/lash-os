@@ -53,10 +53,13 @@ apropos_builtin (WORD_LIST *list)
         }
         builtin_error ("unknown flag: %s", w);
         builtin_usage ();
-        return EX_USAGE;
+        return EXECUTION_FAILURE;
     }
 
-    if (!list || !list->word) { builtin_usage (); return EX_USAGE; }
+    if (!list || !list->word) {
+        puts ("apropos what?");
+        return EXECUTION_FAILURE;
+    }
 
     FILE *f = bm_open_whatis ();
     if (!f)

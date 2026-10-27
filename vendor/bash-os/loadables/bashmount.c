@@ -262,6 +262,7 @@ bm_findmnt_table (const char *path)
 {
     FILE *f;
     char line[BM_LINE_MAX];
+    int rows = 0, failed;
 
     if (path == NULL || *path == '\0')
         path = "/proc/self/mountinfo";
@@ -316,10 +317,17 @@ bm_findmnt_table (const char *path)
         bm_unescape (src);
         printf ("%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
                 tok[0], tok[1], tok[2], tok[3], tok[4], tok[5], type, src);
+        rows = 1;
     }
 
-    fclose (f);
-    return EXECUTION_SUCCESS;
+    failed = ferror (f);
+    if (failed)
+        builtin_error ("read %s: %s", path, strerror (errno ? errno : EIO));
+    if (fclose (f) == EOF)
+        failed = 1;
+    if (fflush (stdout) == EOF)
+        failed = 1;
+    return rows && !failed ? EXECUTION_SUCCESS : EXECUTION_FAILURE;
 }
 
 /* ---------------- mount/umount wrappers --------------------------------- */
@@ -468,22 +476,22 @@ bm_mountpoint (const char *path, int quiet, int print_dir_dev, int print_block_d
             return EXECUTION_SUCCESS;
         }
         if (!quiet)
-            fprintf (stderr, "mountpoint: %s: not a mountpoint\n", canon);
+            printf ("%s is not a mountpoint\n", path);
         free (canon);
-        return EXECUTION_FAILURE;
+        return 32;
     }
 
     if (found) {
         if (!quiet)
-            printf ("%s is a mountpoint\n", canon);
+            printf ("%s is a mountpoint\n", path);
         free (canon);
         return EXECUTION_SUCCESS;
     }
 
     if (!quiet)
-        printf ("%s is not a mountpoint\n", canon);
+        printf ("%s is not a mountpoint\n", path);
     free (canon);
-    return EXECUTION_FAILURE;
+    return 32;
 }
 
 /* ---------------- argv parser & dispatch -------------------------------- */

@@ -1,0 +1,14 @@
+--- builtins/tty.c
++++ builtins/tty.c
+@@ -52,6 +52,11 @@
+ 	}
+     }
+   list = loptend;
++  if (list)
++    {
++      builtin_error ("extra operand: %s", list->word->word);
++      return EX_USAGE;
++    }
+ 
+   t = ttyname (0);
+   QUIT;

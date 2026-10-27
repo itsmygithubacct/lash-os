@@ -35,7 +35,11 @@ typedef struct { const char *name; int num; } sig_entry;
 static const sig_entry bs_table[] = {
     BS (HUP),  BS (INT),  BS (QUIT), BS (ILL),  BS (TRAP), BS (ABRT),
     BS (BUS),  BS (FPE),  BS (KILL), BS (USR1), BS (SEGV), BS (USR2),
-    BS (PIPE), BS (ALRM), BS (TERM), BS (CHLD), BS (CONT), BS (STOP),
+    BS (PIPE), BS (ALRM), BS (TERM),
+#ifdef SIGSTKFLT
+    BS (STKFLT),
+#endif
+    BS (CHLD), BS (CONT), BS (STOP),
     BS (TSTP), BS (TTIN), BS (TTOU), BS (URG),  BS (XCPU), BS (XFSZ),
     BS (VTALRM), BS (PROF), BS (WINCH),
 #ifdef SIGIO
@@ -65,23 +69,36 @@ bs_lookup_name (const char *raw)
         (s[2] == 'G' || s[2] == 'g')) {
         s += 3;
     }
-    while (s[n] && n < sizeof up - 1) {
+    while (n < sizeof up - 1 && s[n]) {
         up[n] = (char) toupper ((unsigned char) s[n]);
         n++;
     }
+    if (s[n]) return -1;
     up[n] = '\0';
     for (size_t i = 0; i < BS_NTAB; i++)
         if (!strcmp (bs_table[i].name, up)) return bs_table[i].num;
+#ifdef SIGIOT
+    if (!strcmp (up, "IOT")) return SIGIOT;
+#endif
+#ifdef SIGPOLL
+    if (!strcmp (up, "POLL")) return SIGPOLL;
+#endif
+#ifdef SIGCLD
+    if (!strcmp (up, "CLD")) return SIGCLD;
+#endif
     /* RT signal range: SIGRTMIN..SIGRTMAX */
-    if (!strncmp (up, "RTMIN", 5)) {
-        int off = up[5] == '+' ? atoi (up + 6) : 0;
-        int v = SIGRTMIN + off;
-        return (v >= SIGRTMIN && v <= SIGRTMAX) ? v : -1;
-    }
-    if (!strncmp (up, "RTMAX", 5)) {
-        int off = up[5] == '-' ? atoi (up + 6) : 0;
-        int v = SIGRTMAX - off;
-        return (v >= SIGRTMIN && v <= SIGRTMAX) ? v : -1;
+    int from_min = !strncmp (up, "RTMIN", 5);
+    if (from_min || !strncmp (up, "RTMAX", 5)) {
+        long off = 0;
+        if (up[5]) {
+            if (up[5] != (from_min ? '+' : '-') ||
+                up[6] < '0' || up[6] > '9') return -1;
+            char *end;
+            errno = 0;
+            off = strtol (up + 6, &end, 10);
+            if (errno || *end || off > SIGRTMAX - SIGRTMIN) return -1;
+        }
+        return from_min ? SIGRTMIN + (int) off : SIGRTMAX - (int) off;
     }
     return -1;
 }
@@ -96,7 +113,10 @@ bs_lookup_num (int n)
         int off = n - SIGRTMIN;
         if (off == 0) return "RTMIN";
         if (n == SIGRTMAX) return "RTMAX";
-        snprintf (buf, sizeof buf, "RTMIN+%d", off);
+        if (off > (SIGRTMAX - SIGRTMIN) / 2)
+            snprintf (buf, sizeof buf, "RTMAX-%d", SIGRTMAX - n);
+        else
+            snprintf (buf, sizeof buf, "RTMIN+%d", off);
         return buf;
     }
     return NULL;
@@ -128,9 +148,13 @@ signal_builtin (WORD_LIST *list)
     }
     if (!strcmp (w, "-s")) {
         if (!list->next) { builtin_error ("-s needs NUMBER"); return EX_USAGE; }
-        int num = atoi (list->next->word->word);
-        const char *nm = bs_lookup_num (num);
-        if (!nm) { builtin_error ("unknown signal number: %d", num); return EXECUTION_FAILURE; }
+        const char *number = list->next->word->word;
+        char *end;
+        errno = 0;
+        long num = strtol (number, &end, 10);
+        const char *nm = (errno || end == number || *end || num <= 0 || num >= NSIG)
+            ? NULL : bs_lookup_num ((int) num);
+        if (!nm) { builtin_error ("unknown signal number: %s", number); return EXECUTION_FAILURE; }
         printf ("%s\n", nm);
         return EXECUTION_SUCCESS;
     }
@@ -143,10 +167,11 @@ signal_builtin (WORD_LIST *list)
 
     /* Bare argument: numeric → name, else name → number. */
     char *end;
+    errno = 0;
     long n = strtol (w, &end, 10);
-    if (*end == '\0') {
-        const char *nm = bs_lookup_num ((int) n);
-        if (!nm) { builtin_error ("unknown signal number: %ld", n); return EXECUTION_FAILURE; }
+    if (end != w && *end == '\0') {
+        const char *nm = (errno || n <= 0 || n >= NSIG) ? NULL : bs_lookup_num ((int) n);
+        if (!nm) { builtin_error ("unknown signal number: %s", w); return EXECUTION_FAILURE; }
         printf ("%s\n", nm);
         return EXECUTION_SUCCESS;
     }

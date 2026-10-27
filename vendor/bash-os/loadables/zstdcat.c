@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 /* zstdcat.c — zstdcat(1): decompress zstd files to standard output. The
- * alias of `zstd -dc`; the work is in zstd.c, so this builtin exists only
+ * alias of `zstd -dcf`; the work is in zstd.c, so this builtin exists only
  * where zstd is compiled in alongside it (as in every bash-os list). */
 #include <config.h>
 #include "loadables.h"
@@ -16,13 +16,15 @@ zstdcat_builtin (WORD_LIST *list)
 char *zstdcat_doc[] = {
   "Decompress zstd files to standard output.",
   "",
-  "The same as `zstd -dc FILE...`: each FILE.zst is decompressed to",
+  "The same as `zstd -dcf [FILE...]`: each FILE.zst is decompressed to",
   "standard output and left in place. \"-\" reads standard input.",
+  "With no FILE, read standard input. Unrecognized input is passed through;",
+  "recognized but incomplete Zstandard frames still fail.",
   "",
   "Exit status: 0, or 1 if any file failed.",
   (char *)NULL
 };
 
 struct builtin zstdcat_struct = {
-  "zstdcat", zstdcat_builtin, BUILTIN_ENABLED, zstdcat_doc, "zstdcat FILE...", 0
+  "zstdcat", zstdcat_builtin, BUILTIN_ENABLED, zstdcat_doc, "zstdcat [FILE...]", 0
 };

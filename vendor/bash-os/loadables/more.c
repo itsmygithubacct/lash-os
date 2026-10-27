@@ -34,11 +34,15 @@
 #include <string.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
+#include <poll.h>
 #include <signal.h>
 #include <termios.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
 
 #include "loadables.h"
+#include "unwind_prot.h"
 
 /* Shared CSI/SS3 key decoder. Wired in 2026-05-18 so arrow keys,
  * PgUp/PgDn and Home/End map onto the existing letter bindings.
@@ -47,12 +51,20 @@
 
 extern char *more_doc[];
 
-/* Return non-zero when every byte of s is an ASCII digit. */
+enum { BM_QUIT = 3 }; /* internal result; q quits the entire operand list */
+
+/* Reject overflow before narrowing page sizes to int. */
 static int
-bm_str_is_num (const char *s)
+bm_parse_rows (const char *text, int *rows)
 {
-    if (!s || !*s) return 0;
-    while (*s) { if (!isdigit ((unsigned char)*s)) return 0; s++; }
+    unsigned long value = 0;
+    if (!text || !*text) return 0;
+    for (const unsigned char *p = (const unsigned char *) text; *p; p++) {
+        if (*p < '0' || *p > '9' || value > (INT_MAX - (*p - '0')) / 10UL)
+            return 0;
+        value = value * 10 + (*p - '0');
+    }
+    *rows = value < 2 ? 23 : (int) value;
     return 1;
 }
 
@@ -61,7 +73,7 @@ bm_screen_rows (void)
 {
     struct winsize ws;
     if (ioctl (STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_row > 0)
-        return ws.ws_row - 1;   /* save one row for the prompt */
+        return ws.ws_row > 1 ? ws.ws_row - 1 : 1;   /* save one row for the prompt */
     return 23;
 }
 
@@ -83,12 +95,8 @@ bm_install_sigwinch (struct sigaction *oldsa, int *installed)
     memset (&sa, 0, sizeof sa);
     sa.sa_handler = bm_sigwinch;
     sigemptyset (&sa.sa_mask);
-    /* SA_RESTART so a SIGWINCH delivered mid-drain transparently restarts
-       the interrupted getline()/read() instead of returning EINTR — without
-       it the drain loop (getline == -1) mistook the interruption for EOF and
-       aborted with only part of the input emitted. The resize flag is still
-       set and consumed at the top of bm_pager's loop, so terminal-resize
-       handling is unaffected. */
+    /* Resizing must not turn a blocking input read into a false EOF.
+       The flag is consumed when the next record or key arrives. */
     sa.sa_flags = SA_RESTART;
     if (sigaction (SIGWINCH, &sa, oldsa) == 0)
         *installed = 1;
@@ -101,52 +109,98 @@ bm_restore_sigwinch (const struct sigaction *oldsa, int installed)
         sigaction (SIGWINCH, oldsa, NULL);
 }
 
-/* Read one keypress from /dev/tty in cbreak mode. Returns the byte,
-   or -1 if /dev/tty isn't available (signals "no pause"). */
-static int
-bm_get_key (int hint)
+/* One invocation owns its terminal and temporary storage. Bash can unwind
+   through QUIT while waiting for input, so cleanup must precede every wait. */
+typedef struct {
+    int tty, have_termios, have_winch;
+    struct termios saved;
+    struct sigaction old_winch;
+    char *line;
+    size_t cap;
+} bm_session;
+
+static void
+bm_cleanup (void *arg)
 {
-    /* If stdout isn't a terminal, there's no human watching pages
-     * roll by — pausing here would block forever waiting for a
-     * keypress that never comes. This bites tests that capture
-     * more output via $(...) inside a guest where /dev/tty IS
-     * open-able (we'd otherwise read it and stall): host shells
-     * without a controlling tty fail-open on the /dev/tty open,
-     * but in-guest the open succeeds against the serial console
-     * and the read blocks indefinitely. Treat non-tty stdout the
-     * same as "no /dev/tty" — fall through to bm_pager's drain
-     * arm. */
-    if (!isatty (STDOUT_FILENO)) return -1;
-    int tty = open ("/dev/tty", O_RDONLY | O_NOCTTY | O_CLOEXEC);
-    if (tty < 0) return -1;
-    struct termios old, raw;
-    if (tcgetattr (tty, &old) < 0) { close (tty); return -1; }
-    raw = old;
-    raw.c_lflag &= ~(ICANON | ECHO);
-    raw.c_cc[VMIN]  = 1;
-    raw.c_cc[VTIME] = 0;
-    tcsetattr (tty, TCSANOW, &raw);
-    if (hint) fputs ("--More-- (space=page, enter=line, q=quit)", stderr);
-    else      fputs ("--More--", stderr);
+    bm_session *s = arg;
+    if (s->have_termios) tcsetattr (s->tty, TCSANOW, &s->saved);
+    if (s->tty >= 0) close (s->tty);
+    bm_restore_sigwinch (&s->old_winch, s->have_winch);
+    free (s->line);
+}
+
+static void
+bm_erase_prompt (void)
+{
+    fputs ("\r                                                  \r", stderr);
     fflush (stderr);
-    /* bl_read_key absorbs CSI/SS3 follow-ups so arrow / PgUp / PgDn /
-     * Home / End come back as BL_KEY_* constants instead of leaking
-     * the bare leading ESC byte (and dropping the rest of the burst
-     * to be re-read as garbage on the next prompt). Map specials to
-     * the existing letter bindings:
-     *   Down  -> '\n' (line)        PgDn -> ' ' (page)
-     *   End   -> ' ' (page; forward-only pager can't jump to bottom)
-     * Up / PgUp / Home / Left / Right / Ins / Del / bare ESC re-loop
-     * so an unrenderable key in a forward-streaming pager does
-     * nothing rather than accidentally advancing the screen. */
-    int out = -1;
+}
+
+static int
+bm_open_terminal (bm_session *s)
+{
+    if (!isatty (STDOUT_FILENO)) return 0;
+    s->tty = open ("/dev/tty", O_RDONLY | O_NOCTTY | O_CLOEXEC);
+    if (s->tty < 0) return 0;
+    if (tcgetattr (s->tty, &s->saved) < 0) return 0;
+    s->have_termios = 1;
+    bl_key_reset ();
+    bm_resize_seen = 0;
+    bm_install_sigwinch (&s->old_winch, &s->have_winch);
+    return 1;
+}
+
+static int
+bm_cbreak (bm_session *s)
+{
+    struct termios raw = s->saved;
+    raw.c_lflag &= ~(ICANON | ECHO);
+    raw.c_cc[VMIN] = 1;
+    raw.c_cc[VTIME] = 0;
+    return tcsetattr (s->tty, TCSANOW, &raw);
+}
+
+/* Let Bash handle interrupts at safe points inside the decoder's retry
+   loops; no SIGINT disposition or shell-global signal state is replaced. */
+static void
+bm_check_interrupt (void)
+{
+    int saved_errno = errno;
+    QUIT;
+    errno = saved_errno;
+}
+
+static int
+bm_wait (int fd, short events)
+{
     for (;;) {
-        int c = bl_read_key (tty);
+        struct pollfd p = { .fd = fd, .events = events };
+        QUIT;
+        int ready = poll (&p, 1, -1);
+        int poll_errno = errno;
+        QUIT;
+        errno = poll_errno;
+        if (ready > 0) return 0;
+        if (ready < 0 && poll_errno == EINTR) continue;
+        return -1;
+    }
+}
+
+static int
+bm_get_key (bm_session *s, int hint)
+{
+    if (bm_cbreak (s) < 0) return -1;
+    if (hint) fputs ("--More-- (space=page, enter=line, q=quit)", stderr);
+    else fputs ("--More--", stderr);
+    fflush (stderr);
+    for (;;) {
+        int c = bl_read_key_checked (s->tty, bm_check_interrupt);
         switch (c) {
-        case BL_KEY_NONE: out = -1; break;
-        case BL_KEY_DOWN: out = '\n'; break;
-        case BL_KEY_PGDN: out = ' ';  break;
-        case BL_KEY_END:  out = ' ';  break;
+        case BL_KEY_NONE: return -1;
+        case BL_KEY_RET:
+        case BL_KEY_DOWN: return '\n';
+        case BL_KEY_PGDN:
+        case BL_KEY_END: return ' ';
         case BL_KEY_UP:
         case BL_KEY_PGUP:
         case BL_KEY_HOME:
@@ -155,55 +209,36 @@ bm_get_key (int hint)
         case BL_KEY_INS:
         case BL_KEY_DEL:
         case BL_KEY_ESC:
-            continue;                  /* swallow + re-poll */
-        default: out = c; break;       /* plain ASCII */
+        case BL_KEY_PASTE_START:
+        case BL_KEY_PASTE_END:
+            continue;
+        default: return c;
         }
-        break;
     }
-    tcsetattr (tty, TCSANOW, &old);
-    close (tty);
-    /* Erase the prompt with CR + spaces + CR. Best effort. */
-    fputs ("\r                                                  \r", stderr);
-    fflush (stderr);
-    return out;
 }
 
 static int
-bm_prompt_search (char *buf, size_t bufsz)
+bm_prompt_search (bm_session *s, char *buf, size_t bufsz)
 {
-    if (!buf || bufsz == 0 || !isatty (STDOUT_FILENO))
-        return -1;
-
-    int tty = open ("/dev/tty", O_RDWR | O_NOCTTY | O_CLOEXEC);
-    if (tty < 0)
-        return -1;
-
-    struct termios old, raw;
-    int have_termios = 0;
-    if (tcgetattr (tty, &old) == 0) {
-        raw = old;
-        raw.c_lflag &= ~(ICANON | ECHO);
-        raw.c_cc[VMIN] = 1;
-        raw.c_cc[VTIME] = 0;
-        if (tcsetattr (tty, TCSANOW, &raw) == 0)
-            have_termios = 1;
-    }
-
+    if (bm_cbreak (s) < 0) return -1;
     fputs ("/", stderr);
     fflush (stderr);
-
     size_t n = 0;
-    int rc = -1;
     for (;;) {
         unsigned char c;
-        ssize_t r = read (tty, &c, 1);
-        if (r < 0) {
-            if (errno == EINTR)
-                continue;
-            goto cleanup;
+        if (bm_wait (s->tty, POLLIN) < 0) {
+            tcsetattr (s->tty, TCSANOW, &s->saved);
+            return -1;
         }
-        if (r == 0 || c == '\n' || c == '\r')
-            break;
+        ssize_t r = read (s->tty, &c, 1);
+        int read_errno = errno;
+        QUIT;
+        if (r < 0 && read_errno == EINTR) continue;
+        if (r <= 0) {
+            tcsetattr (s->tty, TCSANOW, &s->saved);
+            return -1;
+        }
+        if (c == '\n' || c == '\r') break;
         if (c == 0x7f || c == 0x08) {
             if (n) {
                 n--;
@@ -212,42 +247,32 @@ bm_prompt_search (char *buf, size_t bufsz)
             }
             continue;
         }
-        if (!isprint (c) || n + 1 >= bufsz)
-            continue;
+        if (!isprint (c) || n + 1 >= bufsz) continue;
         buf[n++] = (char) c;
         fputc (c, stderr);
         fflush (stderr);
     }
     buf[n] = '\0';
-    rc = n ? 0 : -1;
-
-cleanup:
-    if (have_termios)
-        tcsetattr (tty, TCSANOW, &old);
-    fputs ("\r                                                  \r", stderr);
-    fflush (stderr);
-    close (tty);
-    return rc;
+    tcsetattr (s->tty, TCSANOW, &s->saved);
+    bm_erase_prompt ();
+    return n ? 0 : -1;
 }
 
-static int
-bm_search_forward (FILE *f, char **linep, size_t *capp, const char *pat, int *shown)
+static ssize_t
+bm_read_line (bm_session *s, FILE *f)
 {
-    ssize_t n;
-
-    if (!pat || !*pat)
-        return 0;
-    while ((n = getline (linep, capp, f)) != -1) {
-        if (strstr (*linep, pat)) {
-            fwrite (*linep, 1, (size_t) n, stdout);
-            if (shown)
-                *shown = 1;
-            return 1;
+    for (;;) {
+        QUIT;
+        ssize_t n = getline (&s->line, &s->cap, f);
+        int read_errno = errno;
+        QUIT;
+        if (n < 0 && ferror (f) && read_errno == EINTR) {
+            clearerr (f);
+            continue;
         }
+        errno = read_errno;
+        return n;
     }
-    fputs ("Pattern not found\r\n", stderr);
-    fflush (stderr);
-    return 0;
 }
 
 static void
@@ -259,93 +284,158 @@ bm_show_key_help (void)
 }
 
 static int
+bm_copy_stream (FILE *f)
+{
+    unsigned char buf[65536];
+    /* These are private, newly opened streams: no stdio read-ahead exists.
+       read returns available pipe bytes instead of waiting to fill fread's
+       block. Flush each read so a held-open producer remains responsive. */
+    if (fflush (stdout) == EOF || ferror (stdout)) goto write_error;
+    for (;;) {
+        QUIT;
+        if (bm_wait (fileno (f), POLLIN) < 0) {
+            builtin_error ("read error: %s", strerror (errno));
+            return EXECUTION_FAILURE;
+        }
+        ssize_t n = read (fileno (f), buf, sizeof buf);
+        int read_errno = errno;
+        QUIT;
+        if (n < 0) {
+            if (read_errno == EINTR) continue;
+            builtin_error ("read error: %s", strerror (read_errno));
+            return EXECUTION_FAILURE;
+        }
+        if (n == 0) return EXECUTION_SUCCESS;
+        size_t offset = 0;
+        while (offset < (size_t) n) {
+            if (bm_wait (STDOUT_FILENO, POLLOUT) < 0) goto write_error;
+            ssize_t written = write (STDOUT_FILENO, buf + offset, (size_t) n - offset);
+            int write_errno = errno;
+            QUIT;
+            if (written < 0 && write_errno == EINTR) continue;
+            if (written <= 0) {
+                errno = written < 0 ? write_errno : EIO;
+                goto write_error;
+            }
+            offset += (size_t) written;
+        }
+    }
+write_error:
+    builtin_error ("write error: %s", strerror (errno));
+    return EXECUTION_FAILURE;
+}
+
+static int
 bm_pager (FILE *f, int rows, int hint)
 {
-    /* A builtin runs in the shell process, so the stdio stream outlives the
-       call. Without this, the EOF flag left by a previous invocation makes
-       every later `more < FILE' read nothing and still exit 0. */
-    clearerr (f);
-    char *line = NULL;
-    size_t cap = 0;
+    if (!isatty (STDOUT_FILENO)) return bm_copy_stream (f);
+
+    bm_session s = { .tty = -1 };
+    begin_unwind_frame ("more session");
+    add_unwind_protect (bm_cleanup, &s);
+    int interactive = bm_open_terminal (&s);
+    int shown = 0, single_line = 0;
+    int rc = EXECUTION_SUCCESS;
     ssize_t n;
-    int shown = 0;
-    int single_line_mode = 0;
-    struct sigaction old_winch;
-    int have_winch = 0;
-
-    bm_resize_seen = 0;
-    bm_install_sigwinch (&old_winch, &have_winch);
-
-    while ((n = getline (&line, &cap, f)) != -1) {
-        if (bm_resize_seen) {
+    while ((n = bm_read_line (&s, f)) != -1) {
+        if (bm_resize_seen && interactive) {
             rows = bm_screen_rows ();
             bm_resize_seen = 0;
-            if (shown > rows)
-                shown = rows;
         }
-        fwrite (line, 1, (size_t) n, stdout);
+        if (fwrite (s.line, 1, (size_t) n, stdout) != (size_t) n || ferror (stdout))
+            goto write_error;
+        if (!interactive) continue; /* Complete lines stay visible on pipes. */
         shown++;
-        if (single_line_mode) {
-            int k = bm_get_key (hint);
+        if (!single_line && shown < rows) continue;
+        for (;;) {
+            /* A non-newline final record must be visible before the prompt. */
+            if (fflush (stdout) == EOF) goto write_error;
+            int k = bm_get_key (&s, hint);
+            tcsetattr (s.tty, TCSANOW, &s.saved);
+            bm_erase_prompt ();
             if (bm_resize_seen) {
                 rows = bm_screen_rows ();
                 bm_resize_seen = 0;
             }
-            if (k < 0) { single_line_mode = 0; continue; }
-            if (k == 'q' || k == 'Q') {
-                bm_restore_sigwinch (&old_winch, have_winch);
-                free (line);
-                return EXECUTION_SUCCESS;
-            }
-            if (k == ' ' || k == 'f') { single_line_mode = 0; shown = 0; continue; }
+            if (k == 'q' || k == 'Q') { rc = BM_QUIT; goto done; }
+            if (k < 0) { interactive = 0; break; }
             if (k == 'h' || k == 'H' || k == '?') {
                 bm_show_key_help ();
-                continue;
+                continue; /* Help never consumes another input record. */
             }
             if (k == '/') {
                 char pat[128];
-                if (bm_prompt_search (pat, sizeof pat) == 0)
-                    bm_search_forward (f, &line, &cap, pat, &shown);
-                single_line_mode = 0;
-                continue;
+                if (bm_prompt_search (&s, pat, sizeof pat) < 0) continue;
+                int found = 0;
+                while ((n = bm_read_line (&s, f)) != -1) {
+                    /* Literal byte search includes text after embedded NULs. */
+                    if (memmem (s.line, (size_t) n, pat, strlen (pat))) {
+                        if (fwrite (s.line, 1, (size_t) n, stdout) != (size_t) n)
+                            goto write_error;
+                        found = 1;
+                        break;
+                    }
+                }
+                if (!found) {
+                    fputs ("Pattern not found\r\n", stderr);
+                    goto input_done;
+                }
+                single_line = 0;
+                shown = 1;
+                break;
             }
-            /* Stay in single-line mode for enter / j. */
-            continue;
-        }
-        if (shown < rows) continue;
-        int k = bm_get_key (hint);
-        if (bm_resize_seen) {
-            rows = bm_screen_rows ();
-            bm_resize_seen = 0;
-        }
-        if (k < 0) {
-            /* No tty — drain rest without pausing. */
-            while ((n = getline (&line, &cap, f)) != -1)
-                fwrite (line, 1, (size_t) n, stdout);
+            single_line = k == '\n' || k == '\r' || k == 'j';
+            shown = 0;
             break;
         }
-        if (k == 'q' || k == 'Q') {
-            bm_restore_sigwinch (&old_winch, have_winch);
-            free (line);
-            return EXECUTION_SUCCESS;
-        }
-        if (k == '\n' || k == '\r' || k == 'j') { single_line_mode = 1; shown = rows - 1; continue; }
-        if (k == 'h' || k == 'H' || k == '?') {
-            bm_show_key_help ();
-            continue;
-        }
-        if (k == '/') {
-            char pat[128];
-            if (bm_prompt_search (pat, sizeof pat) == 0)
-                bm_search_forward (f, &line, &cap, pat, &shown);
-            continue;
-        }
-        /* space, f, anything else → next page */
-        shown = 0;
     }
-    bm_restore_sigwinch (&old_winch, have_winch);
-    free (line);
-    return EXECUTION_SUCCESS;
+input_done:
+    if (ferror (f)) {
+        builtin_error ("read error: %s", strerror (errno));
+        rc = EXECUTION_FAILURE;
+    }
+done:
+    if (fflush (stdout) == EOF || ferror (stdout)) {
+write_error:
+        builtin_error ("write error: %s", strerror (errno));
+        rc = EXECUTION_FAILURE;
+    }
+    run_unwind_frame ("more session");
+    return rc;
+}
+
+static void
+bm_close_input (void *arg)
+{
+    fclose ((FILE *) arg);
+}
+
+/* The shell's persistent stdin FILE may retain read-ahead after q. Give
+   every invocation a private stream without changing stdin's buffering or
+   error state. Closing the duplicate never closes the shell's descriptor. */
+static FILE *
+bm_open_input (const char *path)
+{
+    if (strcmp (path, "-")) return fopen (path, "r");
+    int fd = fcntl (STDIN_FILENO, F_DUPFD_CLOEXEC, 3);
+    if (fd < 0) return NULL;
+    FILE *f = fdopen (fd, "r");
+    if (!f) {
+        int saved_errno = errno;
+        close (fd);
+        errno = saved_errno;
+    }
+    return f;
+}
+
+static int
+bm_page_input (FILE *f, int rows, int hint)
+{
+    begin_unwind_frame ("more input");
+    add_unwind_protect (bm_close_input, f);
+    int result = bm_pager (f, rows, hint);
+    run_unwind_frame ("more input");
+    return result;
 }
 
 int
@@ -368,55 +458,68 @@ more_builtin (WORD_LIST *list)
         }
         if (!strcmp (w, "-d")) { hint = 1; list = list->next; continue; }
         if (!strcmp (w, "-n")) {
-            if (!list->next) { builtin_error ("-n needs LINES"); return EX_USAGE; }
+            if (!list->next) { builtin_error ("-n needs LINES"); return EXECUTION_FAILURE; }
             list = list->next;
-            if (!bm_str_is_num (list->word->word)) {
+            if (!bm_parse_rows (list->word->word, &rows)) {
                 builtin_error ("-n: invalid number: %s", list->word->word);
-                return EX_USAGE;
+                return EXECUTION_FAILURE;
             }
-            rows = atoi (list->word->word);
-            if (rows < 2) rows = 23;
             list = list->next;
             continue;
         }
         if (!strncmp (w, "-n", 2) && w[2]) {
-            if (!bm_str_is_num (w + 2)) {
+            if (!bm_parse_rows (w + 2, &rows)) {
                 builtin_error ("-n: invalid number: %s", w + 2);
-                return EX_USAGE;
+                return EXECUTION_FAILURE;
             }
-            rows = atoi (w + 2);
-            if (rows < 2) rows = 23;
             list = list->next;
             continue;
         }
-        if (w[1] >= '1' && w[1] <= '9' && bm_str_is_num (w + 1)) {
-            rows = atoi (w + 1);
-            if (rows < 2) rows = 23;
+        if (w[1] >= '1' && w[1] <= '9' && bm_parse_rows (w + 1, &rows)) {
             list = list->next;
             continue;
         }
         builtin_error ("unknown flag: %s", w);
         builtin_usage ();
-        return EX_USAGE;
+        return EXECUTION_FAILURE;
     }
 
     if (!list) {
-        return bm_pager (stdin, rows, hint);
+        FILE *f = bm_open_input ("-");
+        if (!f) {
+            builtin_error ("stdin: %s", strerror (errno));
+            return EXECUTION_FAILURE;
+        }
+        int result = bm_page_input (f, rows, hint);
+        return result == BM_QUIT ? EXECUTION_SUCCESS : result;
     }
     int rc = EXECUTION_SUCCESS;
     int n_files = 0;
     for (WORD_LIST *p = list; p; p = p->next) n_files++;
-    int idx = 0;
-    for (WORD_LIST *p = list; p; p = p->next, idx++) {
-        if (n_files > 1) printf ("::::::::::::::\n%s\n::::::::::::::\n", p->word->word);
-        FILE *f = !strcmp (p->word->word, "-") ? stdin : fopen (p->word->word, "r");
+    for (WORD_LIST *p = list; p; p = p->next) {
+        FILE *f = bm_open_input (p->word->word);
         if (!f) {
             builtin_error ("%s: %s", p->word->word, strerror (errno));
-            rc = EXECUTION_FAILURE;
+            /* util-linux more reports unavailable named inputs but keeps
+               processing the operand list with success status. */
             continue;
         }
-        bm_pager (f, rows, hint);
-        if (f != stdin) fclose (f);
+        struct stat st;
+        if (fstat (fileno (f), &st) == 0 && S_ISDIR (st.st_mode)) {
+            printf ("\n*** %s: directory ***\n\n", p->word->word);
+            fclose (f);
+            continue;
+        }
+        /* Nonterminal output labels every named file, including a single
+           operand. The documented '-' extension continues to read stdin. */
+        if (n_files > 1 || (!isatty (STDOUT_FILENO) && strcmp (p->word->word, "-")))
+            printf ("::::::::::::::\n%s\n::::::::::::::\n", p->word->word);
+        int result = bm_page_input (f, rows, hint);
+        if (result != EXECUTION_SUCCESS && result != BM_QUIT)
+            rc = EXECUTION_FAILURE;
+        if (result == BM_QUIT) break;
+        /* Output already failed: later files could only repeat the error. */
+        if (ferror (stdout)) break;
     }
     return rc;
 }
@@ -432,9 +535,11 @@ char *more_doc[] = {
     "    -h/--help  show this help",
     "    -V/--version show version",
     "",
-    "Reads stdin when no FILE given (or `-` in the list). Multi-file",
-    "mode prints `::::::::::::::\\nFILE\\n::::::::::::::` headers per",
-    "file. Pause keys (read from /dev/tty):",
+    "Reads stdin when no FILE given (or `-` in the list). Named files",
+    "receive `::::::::::::::\\nFILE\\n::::::::::::::` headers on nonterminal",
+    "output; terminal mode shows headers for multiple operands.",
+    "Unavailable named inputs are diagnosed and skipped with success status.",
+    "Pause keys (read from /dev/tty):",
     "    space / f       next page",
     "    enter / j       next line",
     "    /PATTERN        search forward",

@@ -74,6 +74,8 @@ def main():
         command = [str(compiler), *flags, str(src), "-o", str(dest)]
         if src.name == "_libssh_misc.c":
             command += ["-include", str(ROOT / "include/guest/libssh_port.h")]
+        if src.name == "git.c" or src.name.startswith("_git_"):
+            command += ["-include", str(ROOT / "include/guest/git_time.h")]
         if src.name == "bashline.c":
             command += ["-include", "netdb.h"]
         if src.name == "netopen.c":

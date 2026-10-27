@@ -196,8 +196,8 @@ bblk_serial8 (char *out, const unsigned char *u)
 
 /* ext2/3/4 superblock starts at byte 1024. Distinguishing features:
    feature_compat (1024+0x5c), feature_incompat (1024+0x60),
-   feature_ro_compat (1024+0x64). HAS_JOURNAL = 0x4 in compat selects
-   ext3/4; EXTENTS = 0x40 in incompat selects ext4. */
+   feature_ro_compat (1024+0x64). Features unsupported by ext3 select
+   ext4 independently of HAS_JOURNAL: ext4 also supports no journal. */
 static int
 bblk_match_ext (const unsigned char *p, size_t n, bblk_info *out)
 {
@@ -208,14 +208,17 @@ bblk_match_ext (const unsigned char *p, size_t n, bblk_info *out)
 
     uint32_t compat   = bblk_le32 (sb + 0x5c);
     uint32_t incompat = bblk_le32 (sb + 0x60);
+    uint32_t ro_compat = bblk_le32 (sb + 0x64);
 
-    const char *t = "ext2";
-    if (compat & 0x4) {
-        t = (incompat & 0x40) ? "ext4" : "ext3";
-    }
+    /* ext3 accepts FILETYPE, RECOVER, META_BG and the three original
+       read-only-compatible flags; newer features require ext4. */
+    const char *t = (incompat & 0x8) ? "jbd" :
+        ((incompat & ~0x16u) || (ro_compat & ~0x7u)) ? "ext4" :
+        (compat & 0x4) ? "ext3" : "ext2";
     strncpy (out->type, t, BBLK_TYPE_MAX - 1);
     out->type[BBLK_TYPE_MAX - 1] = '\0';
-    if (strcmp (t, "ext3") == 0 || strcmp (t, "ext4") == 0) {
+    if ((strcmp (t, "ext3") == 0 || strcmp (t, "ext4") == 0) &&
+        !(incompat & ~0x12u)) {
         strncpy (out->sec_type, "ext2", BBLK_TYPE_MAX - 1);
         out->sec_type[BBLK_TYPE_MAX - 1] = '\0';
     }
@@ -600,7 +603,7 @@ bblk_emit (const char *dev, const bblk_info *info, const char *only_tag,
     bblk_emit_kv ("PTTYPE", info->pttype, only_tag, fmt, &count);
     bblk_emit_kv ("PARTLABEL", info->partlabel, only_tag, fmt, &count);
     bblk_emit_kv ("PARTUUID", info->partuuid, only_tag, fmt, &count);
-    if (count > 0) putchar ('\n');
+    if (count > 0 && strcmp (fmt, "value") == 0) putchar ('\n');
 }
 
 /* ---------------- /sys/class/block enumeration -------------------- */

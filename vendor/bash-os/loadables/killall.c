@@ -3,7 +3,7 @@
  * Shares the /proc walker, the flag parser, and the signal-name table
  * with bashpgrep + bashpkill. The differentiator is the match semantic:
  * killall uses exact /proc/PID/comm strcmp (psmisc semantics) rather
- * than substring, so `killall sleep` terminates every sleep but does
+ * than a regular expression, so `killall sleep` terminates every sleep but does
  * not accidentally signal `gpg-agent-sleeper` or `sleepd`. Counterpart
  * binaries: psmisc killall (canonical), busybox killall, toybox killall —
  * all three exact-match by default.
@@ -41,40 +41,10 @@
 
 extern int bp_dispatch (WORD_LIST *list, int mode);
 
-static WORD_LIST *
-bashkillall_strip_exact_long (WORD_LIST *list)
-{
-    WORD_LIST *head = list;
-    WORD_LIST *prev = NULL;
-
-    for (WORD_LIST *cur = list; cur && cur->word && cur->word->word; ) {
-        const char *w = cur->word->word;
-
-        if (strcmp (w, "--") == 0)
-            break;
-        if (w[0] != '-' || w[1] == '\0')
-            break;
-
-        if (strcmp (w, "--exact") == 0) {
-            if (prev)
-                prev->next = cur->next;
-            else
-                head = cur->next;
-            cur = cur->next;
-            continue;
-        }
-
-        prev = cur;
-        cur = cur->next;
-    }
-
-    return head;
-}
-
 int
 killall_builtin (WORD_LIST *list)
 {
-    return bp_dispatch (bashkillall_strip_exact_long (list), BP_MODE_KILLALL);
+    return sh_chkwrite (bp_dispatch (list, BP_MODE_KILLALL));
 }
 
 char *killall_doc[] = {
@@ -89,13 +59,14 @@ char *killall_doc[] = {
     "               accepted psmisc compatibility no-op; exact matching",
     "               is already the default",
     "    -f         match against /proc/PID/cmdline (full command line)",
-    "               instead of /proc/PID/comm",
+    "               instead of /proc/PID/comm; the joined line must match exactly",
     "    -u USER    only signal processes whose real uid is USER",
     "               (numeric or /etc/passwd name)",
     "",
     "Each NAME is matched exactly against /proc/PID/comm (kernel-truncated",
     "to 15 chars). Self is never signalled. Use bashpkill for substring.",
-    "Returns 0 if any process was signalled, 1 if none, 2 on usage error.",
+    "Returns 0 if any process was signalled, 1 if none or output failed,",
+    "2 on usage error, 3 on a fatal proc error. Fixture roots are read-only.",
     (char *)NULL
 };
 

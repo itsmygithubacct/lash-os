@@ -1,0 +1,4 @@
+# Explicitly selected integrations with their own runtime dependencies.
+bashperl|bashperl [PERL-OPTION ...] [-e PROGRAM | SCRIPT] [ARG ...]
+uv|uv [UV-ARGS ...]
+bashpython|bashpython [PYTHON-OPTION ...] [-c COMMAND | -m MODULE | SCRIPT | -] [ARG ...]

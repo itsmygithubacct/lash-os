@@ -552,6 +552,8 @@ bw_seen_add (char ***seen, size_t *n, size_t *cap, const char *line)
   return (*seen)[*n - 1] ? 0 : -1;
 }
 
+extern char *wall_doc[];
+
 int
 wall_builtin (WORD_LIST *list)
 {
@@ -565,11 +567,16 @@ wall_builtin (WORD_LIST *list)
     {
       const char *w = list->word->word;
 
+      if (!strcmp (w, "-h") || !strcmp (w, "--help"))
+        {
+          for (char **p = wall_doc; *p; p++) puts (*p);
+          return sh_chkwrite (EXECUTION_SUCCESS);
+        }
       if (!strcmp (w, "-g") || !strcmp (w, "--group"))
         {
           list = list->next;
           if (!list)
-            { builtin_error ("option requires an argument: %s", w); return EX_USAGE; }
+            { builtin_error ("option requires an argument: %s", w); return EXECUTION_FAILURE; }
           group = list->word->word;
           list = list->next;
           continue;
@@ -578,7 +585,7 @@ wall_builtin (WORD_LIST *list)
         {
           group = w + 8;
           if (!*group)
-            { builtin_error ("option requires an argument: --group"); return EX_USAGE; }
+            { builtin_error ("option requires an argument: --group"); return EXECUTION_FAILURE; }
           list = list->next;
           continue;
         }
@@ -597,16 +604,16 @@ wall_builtin (WORD_LIST *list)
         {
           list = list->next;
           if (!list)
-            { builtin_error ("option requires an argument: %s", w); return EX_USAGE; }
+            { builtin_error ("option requires an argument: %s", w); return EXECUTION_FAILURE; }
           if (!bw_parse_long_field (list->word->word, &timeout) || timeout < 1)
-            { builtin_error ("invalid timeout: %s", list->word->word); return EX_USAGE; }
+            { builtin_error ("invalid timeout: %s", list->word->word); return EXECUTION_FAILURE; }
           list = list->next;
           continue;
         }
       if (!strncmp (w, "--timeout=", 10))
         {
           if (!bw_parse_long_field (w + 10, &timeout) || timeout < 1)
-            { builtin_error ("invalid timeout: %s", w + 10); return EX_USAGE; }
+            { builtin_error ("invalid timeout: %s", w + 10); return EXECUTION_FAILURE; }
           list = list->next;
           continue;
         }
@@ -618,7 +625,7 @@ wall_builtin (WORD_LIST *list)
       if (w[0] == '-' && w[1] != '\0')
         {
           builtin_error ("unknown option: %s", w);
-          return EX_USAGE;
+          return EXECUTION_FAILURE;
         }
       break;
     }
@@ -742,7 +749,9 @@ char *wall_doc[] = {
   "    wall -g GROUP MSG     send only to users in GROUP",
   "    wall -n|--nobanner   suppress the banner (root only, like wall(1))",
   "    wall -t|--timeout N  per-tty write timeout in seconds (accepted)",
+  "    wall -h|--help      show this documentation without broadcasting",
   "    wall                 read message from stdin",
+  "Timeout values are checked, but synchronous writes have no deadline.",
   "",
   "Walks utmp ($BASHWALL_UTMP or /var/run/utmp), and writes a banner",
   "(\"Broadcast message from USER@HOST (TTY) (DATE):\") followed by the",
@@ -760,7 +769,7 @@ struct builtin wall_struct = {
   wall_builtin,
   BUILTIN_ENABLED,
   wall_doc,
-  "wall [-n|--nobanner] [-t|--timeout N] [-g GROUP|--group GROUP] [MSG ...]",
+  "wall [-n|--nobanner] [-t|--timeout N] [-g GROUP|--group GROUP] [-h|--help] [MSG ...]",
   0
 };
 

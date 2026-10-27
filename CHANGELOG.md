@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.1.2.1
+
+- Adopt bash-os v0.1.2 at `8381e8136626d18083d470ac26ba079ad0b2f602`,
+  including all 286 full-profile builtins. The previous release embedded bash-os 0.1.0.
+- Match the first three lash-os version components to bash-os; use a fourth
+  component for lash-os updates between upstream releases. Validate local version
+  metadata during builds and the latest published upstream pin during release packaging.
+- Port Git calendar formatting, descriptor-relative renames, file-range copying,
+  POSIX message queues and named semaphore lifetimes through the checked bridge.
+- Mount guest IPC filesystems, move oversized service-manager and Git tables
+  to unwind-managed heap memory, and ship the new sed regex license notice.
+- Cover version mismatches, Git timezone formatting, semaphore reference counts
+  and fork inheritance, and the updated archive, hash, Git, calculator and IPC builtins.
+
 ## 0.1.2
 
 - Interrupt blocking reads and writes for queued guest signals, including native

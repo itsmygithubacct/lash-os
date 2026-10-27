@@ -79,24 +79,12 @@
  * `length`/`paths`, arithmetic, and conditionals fail closed with
  * `path: unsupported path expression`.
  *
- * ──── Deliberate divergences from jq (DO NOT "fix" without operator
- *      sign-off — see HOST-SAFE-RESIDUALS.parts/03-...) ────
- *
- * (a) Postfix `?` on type errors: jq emits `null`; jq emits
- *     nothing (suppresses the value). This is a consequence of
- *     jq's broader "no errors, just null" philosophy — eval_node
- *     paths return null on type mismatch rather than raising an
- *     error that `?` could swallow. Aligning would require an
- *     error-tracking refactor of every node-eval path. Pending if
- *     operator demand surfaces.
- *
- * (b) `+` between mismatched scalars: jq's N_ADD coerces both
- *     sides via strtod and emits a numeric result (typically `0`).
- *     jq errors. The current behavior is silently wrong for
- *     unintentional type mismatches; fixing it changes every
- *     existing `+` invocation in operator scripts. PENDING DECISION —
- *     resolution requires explicit operator sign-off because the
- *     change has wider blast radius than (a) or above.
+ * Ordinary JSON text streams and filter files are supported within
+ * this subset. Postfix ? suppresses runtime type errors; + and add require
+ * compatible JSON types (null is the identity). --stream retains the
+ * documented leaf-tuple contract, without jq's container-end events. Input
+ * and result streams are buffered, not an incremental-memory implementation.
+ * JSON syntax is checked with a nesting limit of 256 containers.
  */
 
 #include <config.h>
@@ -108,6 +96,7 @@
 #include <errno.h>
 #include <math.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -342,34 +331,113 @@ jq_validate_primitives (const char *src, jsmntok_t *toks, int ntoks)
   return 0;
 }
 
+/* jsmn is a tokenizer, not a JSON grammar validator. Find one complete
+   text before tokenizing it, checking separators and quoted strings too. */
+static void
+json_space (const char **p)
+{
+  while (**p == ' ' || **p == '\t' || **p == '\r' || **p == '\n') (*p)++;
+}
+
+static int
+json_scan_string (const char **p)
+{
+  if (*(*p)++ != '"') return -1;
+  while (**p && **p != '"')
+    {
+      unsigned char c = (unsigned char) *(*p)++;
+      if (c < 0x20) return -1;
+      if (c == '\\')
+        {
+          c = (unsigned char) **p;
+          if (!c) return -1;
+          (*p)++;
+          if (c == 'u')
+            {
+              for (int i = 0; i < 4; i++)
+                { if (!isxdigit ((unsigned char) **p)) return -1; (*p)++; }
+            }
+          else if (!strchr ("\"\\/bfnrt", c)) return -1;
+        }
+    }
+  if (**p != '"') return -1;
+  (*p)++;
+  return 0;
+}
+
+static int
+json_scan_value (const char **p, int depth)
+{
+  json_space (p);
+  if (**p == '"') return json_scan_string (p);
+  if (**p == '[' || **p == '{')
+    {
+      if (depth >= 256) return -1;
+      int object = *(*p)++ == '{';
+      char close = object ? '}' : ']';
+      json_space (p);
+      if (**p == close) { (*p)++; return 0; }
+      for (;;)
+        {
+          if (object)
+            {
+              if (**p != '"' || json_scan_string (p) < 0) return -1;
+              json_space (p);
+              if (**p != ':') return -1;
+              (*p)++;
+            }
+          if (json_scan_value (p, depth + 1) < 0) return -1;
+          json_space (p);
+          if (**p == close) { (*p)++; return 0; }
+          if (**p != ',') return -1;
+          (*p)++;
+          json_space (p);
+        }
+    }
+  const char *start = *p;
+  while (**p && !strchr (" \t\r\n,]}[{\"", **p)) (*p)++;
+  size_t n = (size_t) (*p - start);
+  return ((n == 4 && !strncmp (start, "null", n))
+          || (n == 4 && !strncmp (start, "true", n))
+          || (n == 5 && !strncmp (start, "false", n))
+          || jq_valid_json_number (start, n)) ? 0 : -1;
+}
+
+/* 1 = value, 0 = end, -1 = invalid JSON or allocation failure. */
+static int
+json_next_text (const char **cursor, char **value)
+{
+  json_space (cursor);
+  if (!**cursor) return 0;
+  const char *start = *cursor;
+  if (json_scan_value (cursor, 0) < 0) return -1;
+  *value = xstrndup (start, (size_t) (*cursor - start));
+  return *value ? 1 : -1;
+}
+
 static int
 jq_validate_json_document (const char *doc)
 {
-  int nt = 0;
-  jsmntok_t *toks = jq_tokenize_json (doc, strlen (doc), &nt);
-  if (!toks || nt <= 0)
-    {
-      free (toks);
-      return -1;
-    }
+  const char *p = doc;
+  if (json_scan_value (&p, 0) < 0) return -1;
+  json_space (&p);
+  return *p ? -1 : 0;
+}
 
-  size_t end = (size_t) toks[0].end;
-  /* jsmn string tokens span the CONTENT only (between the quotes), so a
-     top-level JSON string like "x" leaves toks[0].end on the closing quote.
-     Advance past it; otherwise the closing quote reads as trailing garbage
-     and a valid bare-string document is wrongly rejected (jq accepts it). */
-  if (toks[0].type == JSMN_STRING)
-    end++;
-  while (doc[end] && isspace ((unsigned char) doc[end]))
-    end++;
-  if (doc[end])
-    {
-      free (toks);
-      return -1;
-    }
+/* Optional evaluation suppresses runtime diagnostics, not subset limits. */
+static int jq_optional_depth;
+static int jq_unsupported;
 
-  free (toks);
-  return 0;
+static void
+jq_eval_error (const char *fmt, ...)
+{
+  if (jq_optional_depth) return;
+  char msg[512];
+  va_list ap;
+  va_start (ap, fmt);
+  vsnprintf (msg, sizeof msg, fmt, ap);
+  va_end (ap);
+  builtin_error ("%s", msg);
 }
 
 static int
@@ -511,6 +579,7 @@ lex_filter (lexer_t *lx, const char *s)
     {
       unsigned char c = (unsigned char)s[i];
       if (isspace (c)) { i++; continue; }
+      if (c == '#') { while (s[i] && s[i] != '\n') i++; continue; }
       /* Wave 6 (2026-05-26): `..` recursive descent — was lex-rejected.
          Now emits FT_RECURSE, which parse_primary lifts into N_RECURSE.
          Must be checked BEFORE the single-dot case so `.` doesn't win. */
@@ -565,7 +634,10 @@ lex_filter (lexer_t *lx, const char *s)
                 if (s[i] == '"') { i++; break; }
                 i++;
               }
-            if (s[i-1] != '"') return lex_err (lx, "unterminated string");
+            char *literal = xstrndup (s + st, i - st);
+            int valid = literal && jq_validate_json_document (literal) == 0;
+            free (literal);
+            if (!valid) return lex_err (lx, "invalid or unsupported string literal; use system+ jq");
             if (lex_add (lx, FT_STRING, s + st, i - st) < 0) return -1;
             continue;
           }
@@ -577,6 +649,7 @@ lex_filter (lexer_t *lx, const char *s)
           while (isdigit ((unsigned char)s[i])) i++;
           if (s[i] == '.' && isdigit ((unsigned char)s[i+1])) { i++; while (isdigit ((unsigned char)s[i])) i++; }
           if (s[i] == 'e' || s[i] == 'E') { i++; if (s[i] == '+' || s[i] == '-') i++; while (isdigit ((unsigned char)s[i])) i++; }
+          if (!jq_valid_json_number (s + st, i - st)) return lex_err (lx, "invalid numeric literal");
           if (lex_add (lx, FT_NUMBER, s + st, i - st) < 0) return -1;
           continue;
         }
@@ -713,6 +786,7 @@ jq_strkey (const char *tokval)
 static node_t *
 parse_path_tail (parser_t *p, node_t *base)
 {
+  if (!base) return NULL;
   for (;;)
     {
       if (accept (p, FT_DOT))
@@ -735,6 +809,7 @@ parse_path_tail (parser_t *p, node_t *base)
           else if (peek (p)->t == FT_STRING) { char *f = jq_strkey (peek (p)->v); p->lx->pos++; if (!expect (p, FT_RB)) { free (f); goto bad; } base = node_new (N_FIELD, base, NULL, NULL, f); free (f); }
           else { if (peek (p)->t != FT_NUMBER) goto bad; char *idx = peek (p)->v; p->lx->pos++; if (!expect (p, FT_RB)) goto bad; base = node_new (N_INDEX, base, NULL, NULL, idx); }
         }
+      else if (accept (p, FT_Q)) base = node_new (N_TRY, base, NULL, NULL, NULL);
       else break;
       if (!base) return NULL;
     }
@@ -986,6 +1061,26 @@ json_array_each (const char *json, vals_t *out)
 }
 
 static int
+json_each (const char *json, vals_t *out)
+{
+  int nt = 0;
+  jsmntok_t *toks = jq_tokenize_json (json, strlen (json), &nt);
+  if (!toks || nt <= 0) { free (toks); return -1; }
+  int object = toks[0].type == JSMN_OBJECT;
+  if (!object && toks[0].type != JSMN_ARRAY)
+    { free (toks); jq_eval_error ("cannot iterate over %s", json_type (json)); return -1; }
+  int ci = 1, rc = 0;
+  for (int i = 0; i < toks[0].size && rc == 0; i++)
+    {
+      if (object) ci++;
+      rc = vals_add_take (out, tok_json (json, &toks[ci]));
+      ci = jq_skip (toks, ci);
+    }
+  free (toks);
+  return rc;
+}
+
+static int
 /* HOST-SAFE-RESIDUALS pass 4 fix (2026-05-26): jq parity for `length`.
  *   - numbers: return fabs(value) (jq: "5 | length" → 5; "-7 | length" → 7;
  *              "3.14 | length" → 3.14). Was: byte span of the literal.
@@ -1006,7 +1101,7 @@ json_length (const char *json, double *out)
       char first = json[toks[0].start];
       if (first == 'n') { *out = 0; }                  /* null → 0 */
       else if (first == 't' || first == 'f')           /* true/false → error */
-        { builtin_error ("length: boolean has no length"); free (toks); return -1; }
+        { jq_eval_error ("length: boolean has no length"); free (toks); return -1; }
       else                                             /* number → abs(value) */
         {
           char *end;
@@ -1137,49 +1232,22 @@ oom:
 static char *
 json_slurp_array (const char *src)
 {
-  size_t len = strlen (src), off = 0;
+  const char *cursor = src;
   sbuf_t b = {0};
-  int first = 1;
-
-  if (sb_puts (&b, "[") < 0)
-    goto oom;
-
-  while (off < len)
+  int first = 1, rc;
+  char *value = NULL;
+  if (sb_puts (&b, "[") < 0) goto fail;
+  while ((rc = json_next_text (&cursor, &value)) > 0)
     {
-      while (off < len && isspace ((unsigned char)src[off]))
-        off++;
-      if (off >= len)
-        break;
-
-      int nt = 0;
-      jsmntok_t *toks = jq_tokenize_json (src + off, len - off, &nt);
-      if (!toks || nt <= 0 || toks[0].end < 0)
-        {
-          free (toks);
-          free (b.p);
-          return NULL;
-        }
-
-      if (!first && sb_puts (&b, ",") < 0)
-        {
-          free (toks);
-          goto oom;
-        }
-      if (sb_putn (&b, src + off, (size_t)toks[0].end) < 0)
-        {
-          free (toks);
-          goto oom;
-        }
+      if ((!first && sb_puts (&b, ",") < 0) || sb_puts (&b, value) < 0)
+        { free (value); goto fail; }
+      free (value);
+      value = NULL;
       first = 0;
-      off += (size_t)toks[0].end;
-      free (toks);
     }
-
-  if (sb_puts (&b, "]") < 0)
-    goto oom;
+  if (rc < 0 || sb_puts (&b, "]") < 0) goto fail;
   return b.p;
-
-oom:
+fail:
   free (b.p);
   return NULL;
 }
@@ -1706,7 +1774,7 @@ static char *
 fmt_num (double d)
 {
   char buf[128];
-  if (isfinite (d) && fabs (d - (long long)d) < 1e-9) snprintf (buf, sizeof buf, "%lld", (long long)d);
+  if (isfinite (d) && d >= -0x1p63 && d < 0x1p63 && d == trunc (d)) snprintf (buf, sizeof buf, "%lld", (long long)d);
   else snprintf (buf, sizeof buf, "%.15g", d);
   return xstrdup (buf);
 }
@@ -2057,6 +2125,84 @@ json_paths_walk (const char *src, jsmntok_t *toks, int idx,
   return 0;
 }
 
+/* Shallow object addition: preserve first key order, replace its value from
+   the right operand, then append new right-hand keys. */
+static char *
+json_object_add (const char *a, const char *b)
+{
+  vals_t keys = {0}, names = {0}, values = {0};
+  sbuf_t result = {0};
+  const char *src[2] = { a, b };
+  for (int side = 0; side < 2; side++)
+    {
+      int nt = 0;
+      jsmntok_t *t = jq_tokenize_json (src[side], strlen (src[side]), &nt);
+      if (!t || nt <= 0) { free (t); goto fail; }
+      int ci = 1;
+      for (int i = 0; i < t[0].size; i++)
+        {
+          char *key = tok_json (src[side], &t[ci]);
+          char *name = key ? json_unstring (key) : NULL;
+          char *value = tok_json (src[side], &t[ci + 1]);
+          if (!key || !name || !value)
+            { free (key); free (name); free (value); free (t); goto fail; }
+          int j;
+          for (j = 0; j < names.n; j++) if (!strcmp (names.v[j], name)) break;
+          if (j < names.n)
+            { free (values.v[j]); values.v[j] = value; free (key); free (name); }
+          else
+            {
+              /* Duplicate before insertion so every temporary has one owner. */
+              int rc = vals_add (&keys, key);
+              if (rc == 0) rc = vals_add (&names, name);
+              if (rc == 0) rc = vals_add (&values, value);
+              free (key); free (name); free (value);
+              if (rc < 0) { free (t); goto fail; }
+            }
+          ci = jq_skip (t, ci + 1);
+        }
+      free (t);
+    }
+  if (sb_puts (&result, "{") < 0) goto fail;
+  for (int i = 0; i < keys.n; i++)
+    if ((i && sb_puts (&result, ",") < 0)
+        || sb_puts (&result, keys.v[i]) < 0
+        || sb_puts (&result, ":") < 0
+        || sb_puts (&result, values.v[i]) < 0) goto fail;
+  if (sb_puts (&result, "}") < 0) goto fail;
+  vals_free (&keys); vals_free (&names); vals_free (&values);
+  return result.p;
+fail:
+  vals_free (&keys); vals_free (&names); vals_free (&values);
+  free (result.p);
+  return NULL;
+}
+
+static char *
+json_add (const char *a, const char *b)
+{
+  const char *ta = json_type (a), *tb = json_type (b);
+  if (!strcmp (ta, "null")) return xstrdup (b);
+  if (!strcmp (tb, "null")) return xstrdup (a);
+  if (!strcmp (ta, tb))
+    {
+      if (!strcmp (ta, "number")) return fmt_num (strtod (a, NULL) + strtod (b, NULL));
+      if (!strcmp (ta, "array")) return json_array_concat (a, b);
+      if (!strcmp (ta, "object")) return json_object_add (a, b);
+      if (!strcmp (ta, "string"))
+        {
+          char *sa = json_unstring (a), *sb = json_unstring (b), *res = NULL;
+          sbuf_t tmp = {0};
+          if (sa && sb && sb_puts (&tmp, sa) == 0 && sb_puts (&tmp, sb) == 0)
+            res = json_string (tmp.p);
+          free (sa); free (sb); free (tmp.p);
+          return res;
+        }
+    }
+  jq_eval_error ("cannot add %s and %s", ta, tb);
+  return NULL;
+}
+
 static int
 eval_paths (node_t *n, const char *in, vals_t *paths)
 {
@@ -2120,6 +2266,7 @@ eval_paths (node_t *n, const char *in, vals_t *paths)
     case N_TRY:
       return eval_paths (n->a, in, paths);
     default:
+      jq_unsupported = 1;
       builtin_error ("path: unsupported path expression");
       return -1;
     }
@@ -2133,35 +2280,52 @@ eval_node (node_t *n, const char *in, vals_t *out)
     {
     case N_ROOT: return vals_add (out, in);
     case N_LITERAL: return vals_add (out, n->s);
-    case N_FIELD:
+    case N_FIELD: case N_INDEX:
       {
-        vals_t sub = {0}; if (eval_node (n->a, in, &sub) < 0) return -1;
-        for (int i = 0; i < sub.n; i++) { char *v = NULL; if (json_resolve_field (sub.v[i], n->s, &v) < 0) v = xstrdup ("null"); vals_add_take (out, v); }
-        vals_free (&sub); return 0;
-      }
-    case N_INDEX:
-      {
-        vals_t sub = {0}; int idx = atoi (n->s); if (eval_node (n->a, in, &sub) < 0) return -1;
-        for (int i = 0; i < sub.n; i++) { char *v = NULL; if (json_resolve_index (sub.v[i], idx, &v) < 0) v = xstrdup ("null"); vals_add_take (out, v); }
-        vals_free (&sub); return 0;
+        vals_t sub = {0};
+        int upstream = eval_node (n->a, in, &sub);
+        int rc = 0;
+        for (int i = 0; i < sub.n && rc == 0; i++)
+          {
+            const char *type = json_type (sub.v[i]);
+            const char *want = n->k == N_FIELD ? "object" : "array";
+            if (strcmp (type, want) && strcmp (type, "null"))
+              { jq_eval_error ("cannot index %s with %s", type,
+                               n->k == N_FIELD ? "string" : "number"); rc = -1; break; }
+            char *v = NULL;
+            int found = n->k == N_FIELD
+              ? json_resolve_field (sub.v[i], n->s, &v)
+              : json_resolve_index (sub.v[i], atoi (n->s), &v);
+            if (found < 0) v = xstrdup ("null");
+            rc = vals_add_take (out, v);
+          }
+        vals_free (&sub);
+        return rc < 0 ? rc : upstream;
       }
     case N_ITER:
       {
-        vals_t sub = {0}; if (eval_node (n->a, in, &sub) < 0) return -1;
-        for (int i = 0; i < sub.n; i++) if (json_array_each (sub.v[i], out) < 0) { vals_free (&sub); return -1; }
-        vals_free (&sub); return 0;
+        vals_t sub = {0};
+        int upstream = eval_node (n->a, in, &sub);
+        int rc = 0;
+        for (int i = 0; i < sub.n && rc == 0; i++) rc = json_each (sub.v[i], out);
+        vals_free (&sub);
+        return rc < 0 ? rc : upstream;
       }
     case N_PIPE:
       {
-        vals_t lhs = {0}; if (eval_node (n->a, in, &lhs) < 0) return -1;
+        vals_t lhs = {0};
+        int upstream = eval_node (n->a, in, &lhs);
         for (int i = 0; i < lhs.n; i++) if (eval_node (n->b, lhs.v[i], out) < 0) { vals_free (&lhs); return -1; }
-        vals_free (&lhs); return 0;
+        vals_free (&lhs); return upstream;
       }
     case N_DEFAULT:
       {
-        vals_t lhs = {0}; int saw = 0; eval_node (n->a, in, &lhs);
+        vals_t lhs = {0}; int saw = 0;
+        int upstream = eval_node (n->a, in, &lhs);
         for (int i = 0; i < lhs.n; i++) if (strcmp (lhs.v[i], "null") && strcmp (lhs.v[i], "false")) { vals_add (out, lhs.v[i]); saw = 1; }
-        vals_free (&lhs); if (!saw) return eval_node (n->b, in, out); return 0;
+        vals_free (&lhs);
+        if (upstream < 0) return upstream;
+        if (!saw) return eval_node (n->b, in, out); return 0;
       }
     case N_CALL_LENGTH: { double l = 0; if (json_length (in, &l) < 0) return -1; char buf[64];
       /* Match jq: integer-valued result prints with no decimal point;
@@ -2189,40 +2353,45 @@ eval_node (node_t *n, const char *in, vals_t *out)
       }
     case N_CALL_SELECT:
       {
-        char *cond = NULL; int ok = eval_one (n->a, in, &cond) == 0 && truthy (cond);
-        free (cond); return ok ? vals_add (out, in) : 0;
+        vals_t cond = {0};
+        int upstream = eval_node (n->a, in, &cond);
+        int rc = 0;
+        for (int i = 0; i < cond.n && rc == 0; i++)
+          if (truthy (cond.v[i])) rc = vals_add (out, in);
+        vals_free (&cond);
+        return rc < 0 ? rc : upstream;
       }
     case N_CALL_MAP:
       {
-        vals_t elems = {0}; if (json_array_each (in, &elems) < 0) return -1;
-        sbuf_t b = {0}; sb_puts (&b, "["); int first = 1;
-        for (int i = 0; i < elems.n; i++)
-          {
-            vals_t r = {0}; eval_node (n->a, elems.v[i], &r);
-            for (int j = 0; j < r.n; j++) { if (!first) sb_puts (&b, ","); sb_puts (&b, r.v[j]); first = 0; }
-            vals_free (&r);
-          }
-        vals_free (&elems); sb_puts (&b, "]"); return vals_add_take (out, b.p);
+        vals_t elems = {0}, results = {0};
+        if (json_each (in, &elems) < 0) { vals_free (&elems); return -1; }
+        int rc = 0;
+        for (int i = 0; i < elems.n && rc == 0; i++)
+          rc = eval_node (n->a, elems.v[i], &results);
+        vals_free (&elems);
+        char *res = rc < 0 ? NULL : vals_to_json_array (&results);
+        vals_free (&results);
+        return res ? vals_add_take (out, res) : -1;
       }
     /* ──── HOST-SAFE-RESIDUALS Wave 3 (2026-05-26) ──── */
     case N_CALL_FIRST:
       {
         /* jq: array → element 0 or null when empty; error on non-array. */
-        if (json_type (in)[0] != 'a') { builtin_error ("first: input is not an array"); return -1; }
+        if (json_type (in)[0] != 'a') { jq_eval_error ("first: input is not an array"); return -1; }
         vals_t elems = {0}; if (json_array_each (in, &elems) < 0) return -1;
         int rc = vals_add (out, elems.n > 0 ? elems.v[0] : "null");
         vals_free (&elems); return rc;
       }
     case N_CALL_LAST:
       {
-        if (json_type (in)[0] != 'a') { builtin_error ("last: input is not an array"); return -1; }
+        if (json_type (in)[0] != 'a') { jq_eval_error ("last: input is not an array"); return -1; }
         vals_t elems = {0}; if (json_array_each (in, &elems) < 0) return -1;
         int rc = vals_add (out, elems.n > 0 ? elems.v[elems.n - 1] : "null");
         vals_free (&elems); return rc;
       }
     case N_CALL_REVERSE:
       {
-        if (json_type (in)[0] != 'a') { builtin_error ("reverse: input is not an array"); return -1; }
+        if (json_type (in)[0] != 'a') { jq_eval_error ("reverse: input is not an array"); return -1; }
         vals_t elems = {0}; if (json_array_each (in, &elems) < 0) return -1;
         sbuf_t b = {0}; sb_puts (&b, "[");
         for (int i = elems.n - 1; i >= 0; i--)
@@ -2235,27 +2404,13 @@ eval_node (node_t *n, const char *in, vals_t *out)
       {
         /* jq: fold + over the array; empty/null-input → null. */
         if (!strcmp (in, "null")) return vals_add (out, "null");
-        if (json_type (in)[0] != 'a') { builtin_error ("add: input is not an array"); return -1; }
+        if (json_type (in)[0] != 'a') { jq_eval_error ("add: input is not an array"); return -1; }
         vals_t elems = {0}; if (json_array_each (in, &elems) < 0) return -1;
         if (elems.n == 0) { vals_free (&elems); return vals_add (out, "null"); }
         char *acc = xstrdup (elems.v[0]);
         for (int i = 1; i < elems.n && acc; i++)
           {
-            const char *cur = elems.v[i];
-            const char *ta = json_type (acc), *tb = json_type (cur);
-            char *next = NULL;
-            if (!strcmp (acc, "null")) next = xstrdup (cur);
-            else if (!strcmp (cur, "null")) next = xstrdup (acc);
-            else if (!strcmp (ta, "number") && !strcmp (tb, "number"))
-              next = fmt_num (strtod (acc, NULL) + strtod (cur, NULL));
-            else if (!strcmp (ta, "string") && !strcmp (tb, "string"))
-              { char *sa = json_unstring (acc), *sb = json_unstring (cur);
-                sbuf_t tmp = {0}; sb_puts (&tmp, sa ? sa : ""); sb_puts (&tmp, sb ? sb : "");
-                next = json_string (tmp.p ? tmp.p : ""); free (tmp.p); free (sa); free (sb); }
-            else if (!strcmp (ta, "array") && !strcmp (tb, "array"))
-              next = json_array_concat (acc, cur);
-            else
-              { builtin_error ("add: incompatible element types"); free (acc); vals_free (&elems); return -1; }
+            char *next = json_add (acc, elems.v[i]);
             free (acc); acc = next;
           }
         vals_free (&elems);
@@ -2264,7 +2419,7 @@ eval_node (node_t *n, const char *in, vals_t *out)
     case N_CALL_MIN: case N_CALL_MAX:
       {
         if (!strcmp (in, "null")) return vals_add (out, "null");
-        if (json_type (in)[0] != 'a') { builtin_error ("min/max: input is not an array"); return -1; }
+        if (json_type (in)[0] != 'a') { jq_eval_error ("min/max: input is not an array"); return -1; }
         vals_t elems = {0}; if (json_array_each (in, &elems) < 0) return -1;
         if (elems.n == 0) { vals_free (&elems); return vals_add (out, "null"); }
         int best = 0;
@@ -2279,7 +2434,7 @@ eval_node (node_t *n, const char *in, vals_t *out)
       }
     case N_CALL_SORT:
       {
-        if (json_type (in)[0] != 'a') { builtin_error ("sort: input is not an array"); return -1; }
+        if (json_type (in)[0] != 'a') { jq_eval_error ("sort: input is not an array"); return -1; }
         vals_t elems = {0}; if (json_array_each (in, &elems) < 0) return -1;
         if (elems.n > 1)
           qsort (elems.v, (size_t) elems.n, sizeof elems.v[0], json_value_cmp_qsort);
@@ -2289,7 +2444,7 @@ eval_node (node_t *n, const char *in, vals_t *out)
       }
     case N_CALL_UNIQUE:
       {
-        if (json_type (in)[0] != 'a') { builtin_error ("unique: input is not an array"); return -1; }
+        if (json_type (in)[0] != 'a') { jq_eval_error ("unique: input is not an array"); return -1; }
         vals_t elems = {0}; if (json_array_each (in, &elems) < 0) return -1;
         if (elems.n > 1)
           qsort (elems.v, (size_t) elems.n, sizeof elems.v[0], json_value_cmp_qsort);
@@ -2305,14 +2460,14 @@ eval_node (node_t *n, const char *in, vals_t *out)
       }
     case N_CALL_TO_ENTRIES:
       {
-        if (json_type (in)[0] != 'o') { builtin_error ("to_entries: input is not an object"); return -1; }
+        if (json_type (in)[0] != 'o') { jq_eval_error ("to_entries: input is not an object"); return -1; }
         char *res = json_to_entries (in);
         if (!res) return -1;
         return vals_add_take (out, res);
       }
     case N_CALL_FROM_ENTRIES:
       {
-        if (json_type (in)[0] != 'a') { builtin_error ("from_entries: input is not an array"); return -1; }
+        if (json_type (in)[0] != 'a') { jq_eval_error ("from_entries: input is not an array"); return -1; }
         char *res = json_from_entries (in);
         if (!res) return -1;
         return vals_add_take (out, res);
@@ -2334,11 +2489,11 @@ eval_node (node_t *n, const char *in, vals_t *out)
             char *end = NULL;
             double d = strtod (raw, &end);
             /* jq accepts leading whitespace; reject if no digits parsed. */
-            if (end == raw) { free (raw); builtin_error ("tonumber: not a number"); return -1; }
+            if (end == raw) { free (raw); jq_eval_error ("tonumber: not a number"); return -1; }
             free (raw);
             return vals_add_take (out, fmt_num (d));
           }
-        builtin_error ("tonumber: input is not a number or string");
+        jq_eval_error ("tonumber: input is not a number or string");
         return -1;
       }
     case N_CALL_TOJSON:
@@ -2350,14 +2505,14 @@ eval_node (node_t *n, const char *in, vals_t *out)
       }
     case N_CALL_FROMJSON:
       {
-        if (json_type (in)[0] != 's') { builtin_error ("fromjson: input is not a string"); return -1; }
+        if (json_type (in)[0] != 's') { jq_eval_error ("fromjson: input is not a string"); return -1; }
         char *res = json_fromjson_value (in);
-        if (!res) { builtin_error ("fromjson: invalid JSON in string"); return -1; }
+        if (!res) { jq_eval_error ("fromjson: invalid JSON in string"); return -1; }
         return vals_add_take (out, res);
       }
     case N_CALL_ASCII_DOWNCASE: case N_CALL_ASCII_UPCASE:
       {
-        if (json_type (in)[0] != 's') { builtin_error ("ascii_{down,up}case: input is not a string"); return -1; }
+        if (json_type (in)[0] != 's') { jq_eval_error ("ascii_{down,up}case: input is not a string"); return -1; }
         char *raw = json_unstring (in);
         if (!raw) return -1;
         for (char *p = raw; *p; p++)
@@ -2373,7 +2528,7 @@ eval_node (node_t *n, const char *in, vals_t *out)
     case N_CALL_FLOOR: case N_CALL_CEIL: case N_CALL_FABS: case N_CALL_SQRT:
       {
         if (json_type (in)[0] != 'n')
-          { builtin_error ("math: input is not a number"); return -1; }
+          { jq_eval_error ("math: input is not a number"); return -1; }
         double d = strtod (in, NULL), r = 0;
         if (n->k == N_CALL_FLOOR) r = floor (d);
         else if (n->k == N_CALL_CEIL) r = ceil (d);
@@ -2386,7 +2541,7 @@ eval_node (node_t *n, const char *in, vals_t *out)
     case N_CALL_EXP: case N_CALL_LOG:
       {
         if (json_type (in)[0] != 'n')
-          { builtin_error ("exp/log: input is not a number"); return -1; }
+          { jq_eval_error ("exp/log: input is not a number"); return -1; }
         double d = strtod (in, NULL), r = 0;
         if (n->k == N_CALL_EXP) r = exp (d);
         else /* LOG */
@@ -2445,11 +2600,11 @@ eval_node (node_t *n, const char *in, vals_t *out)
     case N_CALL_STARTSWITH: case N_CALL_ENDSWITH:
       {
         if (json_type (in)[0] != 's')
-          { builtin_error ("startswith/endswith: input is not a string"); return -1; }
+          { jq_eval_error ("startswith/endswith: input is not a string"); return -1; }
         char *arg = NULL;
         if (eval_one (n->a, in, &arg) < 0) return -1;
         if (json_type (arg)[0] != 's')
-          { free (arg); builtin_error ("startswith/endswith: argument is not a string"); return -1; }
+          { free (arg); jq_eval_error ("startswith/endswith: argument is not a string"); return -1; }
         char *raw = json_unstring (in), *sub = json_unstring (arg);
         free (arg);
         if (!raw || !sub) { free (raw); free (sub); return -1; }
@@ -2472,11 +2627,11 @@ eval_node (node_t *n, const char *in, vals_t *out)
     case N_CALL_SPLIT:
       {
         if (json_type (in)[0] != 's')
-          { builtin_error ("split: input is not a string"); return -1; }
+          { jq_eval_error ("split: input is not a string"); return -1; }
         char *arg = NULL;
         if (eval_one (n->a, in, &arg) < 0) return -1;
         if (json_type (arg)[0] != 's')
-          { free (arg); builtin_error ("split: separator is not a string"); return -1; }
+          { free (arg); jq_eval_error ("split: separator is not a string"); return -1; }
         char *raw = json_unstring (in), *sep = json_unstring (arg);
         free (arg);
         if (!raw || !sep) { free (raw); free (sep); return -1; }
@@ -2489,11 +2644,11 @@ eval_node (node_t *n, const char *in, vals_t *out)
       {
         /* splits emits one value per part (a stream, not an array). */
         if (json_type (in)[0] != 's')
-          { builtin_error ("splits: input is not a string"); return -1; }
+          { jq_eval_error ("splits: input is not a string"); return -1; }
         char *arg = NULL;
         if (eval_one (n->a, in, &arg) < 0) return -1;
         if (json_type (arg)[0] != 's')
-          { free (arg); builtin_error ("splits: separator is not a string"); return -1; }
+          { free (arg); jq_eval_error ("splits: separator is not a string"); return -1; }
         char *raw = json_unstring (in), *sep = json_unstring (arg);
         free (arg);
         if (!raw || !sep) { free (raw); free (sep); return -1; }
@@ -2512,11 +2667,11 @@ eval_node (node_t *n, const char *in, vals_t *out)
     case N_CALL_JOIN:
       {
         if (json_type (in)[0] != 'a')
-          { builtin_error ("join: input is not an array"); return -1; }
+          { jq_eval_error ("join: input is not an array"); return -1; }
         char *arg = NULL;
         if (eval_one (n->a, in, &arg) < 0) return -1;
         if (json_type (arg)[0] != 's')
-          { free (arg); builtin_error ("join: separator is not a string"); return -1; }
+          { free (arg); jq_eval_error ("join: separator is not a string"); return -1; }
         char *sep = json_unstring (arg);
         free (arg);
         if (!sep) return -1;
@@ -2550,32 +2705,93 @@ eval_node (node_t *n, const char *in, vals_t *out)
       }
     case N_AND: case N_OR:
       {
-        char *a = NULL, *b = NULL; eval_one (n->a, in, &a);
-        if (n->k == N_AND && !truthy (a)) { free (a); return vals_add (out, "false"); }
-        if (n->k == N_OR && truthy (a)) { free (a); return vals_add (out, "true"); }
-        free (a); eval_one (n->b, in, &b); int r = truthy (b); free (b); return vals_add (out, r ? "true" : "false");
+        vals_t a = {0};
+        int upstream = eval_node (n->a, in, &a), rc = 0;
+        for (int i = 0; i < a.n && rc == 0; i++)
+          {
+            int av = truthy (a.v[i]);
+            if ((n->k == N_AND && !av) || (n->k == N_OR && av))
+              rc = vals_add (out, av ? "true" : "false");
+            else
+              {
+                vals_t b = {0};
+                int right = eval_node (n->b, in, &b);
+                for (int j = 0; j < b.n && rc == 0; j++)
+                  rc = vals_add (out, truthy (b.v[j]) ? "true" : "false");
+                vals_free (&b);
+                if (rc == 0) rc = right;
+              }
+          }
+        vals_free (&a);
+        return rc < 0 ? rc : upstream;
       }
-    case N_ADD: case N_SUB: case N_MUL: case N_DIV: case N_MOD:
+    case N_ADD:
       {
-        char *a = NULL, *b = NULL; if (eval_one (n->a, in, &a) < 0 || eval_one (n->b, in, &b) < 0) { free (a); free (b); return -1; }
-        char *res = NULL;
-        if (n->k == N_ADD && !strcmp (a, "null"))
-          res = xstrdup (b);
-        else if (n->k == N_ADD && !strcmp (b, "null"))
-          res = xstrdup (a);
-        else if (n->k == N_ADD && !strcmp (json_type (a), "string") && !strcmp (json_type (b), "string"))
-          { char *sa = json_unstring (a), *sb = json_unstring (b); sbuf_t tmp = {0}; sb_puts (&tmp, sa ? sa : ""); sb_puts (&tmp, sb ? sb : ""); res = json_string (tmp.p ? tmp.p : ""); free (tmp.p); free (sa); free (sb); }
-        else if (n->k == N_ADD && !strcmp (json_type (a), "array") && !strcmp (json_type (b), "array"))
-          res = json_array_concat (a, b);
+        /* jq evaluates the right operand first and reruns the left stream
+           for each right value. Consume successful values before propagating
+           a later error from either buffered operand. */
+        vals_t b = {0};
+        int upstream = eval_node (n->b, in, &b), rc = 0;
+        for (int j = 0; j < b.n && rc == 0; j++)
+          {
+            vals_t a = {0};
+            int left = eval_node (n->a, in, &a);
+            for (int i = 0; i < a.n && rc == 0; i++)
+              rc = vals_add_take (out, json_add (a.v[i], b.v[j]));
+            vals_free (&a);
+            if (rc == 0) rc = left;
+          }
+        vals_free (&b);
+        return rc < 0 ? rc : upstream;
+      }
+    case N_SUB: case N_MUL: case N_DIV: case N_MOD:
+      {
+        char *a = NULL, *b = NULL;
+        if (eval_one (n->a, in, &a) < 0 || eval_one (n->b, in, &b) < 0)
+          { free (a); free (b); return -1; }
+        if (strcmp (json_type (a), "number") || strcmp (json_type (b), "number"))
+          { jq_eval_error ("arithmetic requires numbers in this subset"); free (a); free (b); return -1; }
+        double da = strtod (a, NULL), db = strtod (b, NULL), d = 0;
+        free (a); free (b);
+        if ((n->k == N_DIV || n->k == N_MOD) && db == 0)
+          { jq_eval_error ("division by zero"); return -1; }
+        if (n->k == N_SUB) d = da - db;
+        else if (n->k == N_MUL) d = da * db;
+        else if (n->k == N_DIV) d = da / db;
         else
-          { double da = strtod (a, NULL), db = strtod (b, NULL), d = 0; if (n->k == N_ADD) d = da + db; else if (n->k == N_SUB) d = da - db; else if (n->k == N_MUL) d = da * db; else if (n->k == N_DIV) d = da / db; else d = (double)((long long)da % (long long)db); res = fmt_num (d); }
-        free (a); free (b); return vals_add_take (out, res);
+          {
+            /* jq truncates operands for remainder; fmod avoids integer
+               conversion overflow and an integer zero-divisor trap. */
+            if (trunc (db) == 0) { jq_eval_error ("remainder divisor truncates to zero"); return -1; }
+            d = fmod (trunc (da), trunc (db));
+          }
+        return vals_add_take (out, fmt_num (d));
       }
     case N_NEG:
-      { char *a = NULL; if (eval_one (n->a, in, &a) < 0) return -1; char *r = fmt_num (-strtod (a, NULL)); free (a); return vals_add_take (out, r); }
+      {
+        char *a = NULL;
+        if (eval_one (n->a, in, &a) < 0) return -1;
+        if (strcmp (json_type (a), "number"))
+          { jq_eval_error ("negation requires a number"); free (a); return -1; }
+        char *r = fmt_num (-strtod (a, NULL)); free (a);
+        return vals_add_take (out, r);
+      }
     case N_IF:
-      { char *c = NULL; eval_one (n->a, in, &c); int tr = truthy (c); free (c); return eval_node (tr ? n->b : n->c, in, out); }
-    case N_TRY: return eval_node (n->a, in, out) < 0 ? 0 : 0;
+      {
+        vals_t cond = {0};
+        int upstream = eval_node (n->a, in, &cond), rc = 0;
+        for (int i = 0; i < cond.n && rc == 0; i++)
+          rc = eval_node (truthy (cond.v[i]) ? n->b : n->c, in, out);
+        vals_free (&cond);
+        return rc < 0 ? rc : upstream;
+      }
+    case N_TRY:
+      {
+        jq_optional_depth++;
+        int rc = eval_node (n->a, in, out);
+        jq_optional_depth--;
+        return rc < 0 && !jq_unsupported ? 0 : rc;
+      }
     /* ──── HOST-SAFE-RESIDUALS Wave 5 (2026-05-26) ──── */
     case N_COMMA:
       {
@@ -2624,7 +2840,7 @@ eval_node (node_t *n, const char *in, vals_t *out)
                     else
                       { from = 0; upto = strtod (va.v[i], NULL); }
                     step = n->c ? strtod (vc.v[k], NULL) : 1.0;
-                    if (step == 0) { builtin_error ("range: step cannot be 0"); rc = -1; break; }
+                    if (step == 0) { jq_eval_error ("range: step cannot be 0"); rc = -1; break; }
                     /* Safety cap to avoid runaway streams. jq itself has no
                        cap, but 1e7 elements is way past any reasonable
                        loadable invocation; surfaces faster than OOM. */
@@ -2670,7 +2886,7 @@ eval_node (node_t *n, const char *in, vals_t *out)
         char *parr = NULL;
         if (eval_one (n->a, in, &parr) < 0) return -1;
         if (json_type (parr)[0] != 'a')
-          { free (parr); builtin_error ("getpath: path must be an array"); return -1; }
+          { free (parr); jq_eval_error ("getpath: path must be an array"); return -1; }
         vals_t comps = {0};
         if (json_array_each (parr, &comps) < 0) { free (parr); return -1; }
         free (parr);
@@ -2708,7 +2924,7 @@ eval_node (node_t *n, const char *in, vals_t *out)
         char *parr = NULL;
         if (eval_one (n->a, in, &parr) < 0) return -1;
         if (json_type (parr)[0] != 'a')
-          { free (parr); builtin_error ("setpath: path must be an array"); return -1; }
+          { free (parr); jq_eval_error ("setpath: path must be an array"); return -1; }
         char *vstr = NULL;
         if (eval_one (n->b, in, &vstr) < 0) { free (parr); return -1; }
         vals_t comps = {0};
@@ -2728,7 +2944,7 @@ eval_node (node_t *n, const char *in, vals_t *out)
         char *parr = NULL;
         if (eval_one (n->a, in, &parr) < 0) return -1;
         if (json_type (parr)[0] != 'a')
-          { free (parr); builtin_error ("delpaths: paths must be an array"); return -1; }
+          { free (parr); jq_eval_error ("delpaths: paths must be an array"); return -1; }
         char *res = json_delpaths_helper (in, parr);
         free (parr);
         if (!res) return -1;
@@ -2809,108 +3025,78 @@ json_compact (char *text)
   *out = 0;
 }
 
+/* Compile once, evaluate every ordinary JSON text independently. The custom
+   --stream mode transforms each text to leaf tuples before applying the filter.
+   Evaluation remains buffered, including output-variable binding. */
 static int
-run_filter (const char *filter, char *doc, int raw, int exit_status, const char *out_var)
+run_filter (const char *filter, const char *doc, int raw, int exit_status,
+            const char *out_var, int stream)
 {
   lexer_t lx = {0};
-  if (jq_validate_json_document (doc) < 0)
-    {
-      builtin_error ("invalid JSON input");
-      return EXECUTION_FAILURE;
-    }
-  json_compact (doc);
-  if (lex_filter (&lx, filter) < 0) { builtin_error ("%s", lx.err[0] ? lx.err : "lex failed"); return EX_USAGE; }
-  parser_t p = { .lx = &lx };
-  node_t *root = parse_expr (&p);
-  if (!root || peek (&p)->t != FT_EOF) { builtin_error ("%s", p.err[0] ? p.err : "parse failed"); node_free (root); return EX_USAGE; }
+  node_t *root = NULL;
   vals_t out = {0};
-  int rc = eval_node (root, doc, &out) < 0 ? EXECUTION_FAILURE : EXECUTION_SUCCESS;
   sbuf_t bound = {0};
+  int rc = EXECUTION_SUCCESS;
+  jq_optional_depth = jq_unsupported = 0;
+  if (lex_filter (&lx, filter) < 0)
+    { builtin_error ("%s", lx.err[0] ? lx.err : "lex failed"); rc = EX_USAGE; goto done; }
+  parser_t p = { .lx = &lx };
+  root = parse_expr (&p);
+  if (!root || p.err[0] || peek (&p)->t != FT_EOF)
+    { builtin_error ("%s", p.err[0] ? p.err : "parse failed"); rc = EX_USAGE; goto done; }
+
+  const char *cursor = doc;
+  char *value = NULL;
+  int next;
+  while ((next = json_next_text (&cursor, &value)) > 0)
+    {
+      json_compact (value);
+      int er = 0;
+      if (stream)
+        {
+          vals_t leaves = {0};
+          er = json_stream_values (value, &leaves);
+          for (int i = 0; i < leaves.n && er == 0; i++)
+            er = eval_node (root, leaves.v[i], &out);
+          vals_free (&leaves);
+        }
+      else er = eval_node (root, value, &out);
+      free (value); value = NULL;
+      if (er < 0 || jq_unsupported) { rc = 5; break; }
+    }
+  if (next < 0)
+    { builtin_error ("invalid JSON input (nesting limit: 256)"); rc = 5; }
+
   for (int i = 0; i < out.n; i++)
     {
       json_compact (out.v[i]);
       char *raw_s = NULL;
       const char *emit = out.v[i];
-      if (raw && json_type (out.v[i]) && !strcmp (json_type (out.v[i]), "string"))
+      if (raw && !strcmp (json_type (out.v[i]), "string"))
         { raw_s = json_unstring (out.v[i]); emit = raw_s ? raw_s : ""; }
       if (out_var)
         {
-          if (i && sb_puts (&bound, "\n") < 0) rc = EXECUTION_FAILURE;
-          if (sb_puts (&bound, emit) < 0) rc = EXECUTION_FAILURE;
+          if ((i && sb_puts (&bound, "\n") < 0) || sb_puts (&bound, emit) < 0)
+            rc = EXECUTION_FAILURE;
         }
-      else
-        printf ("%s\n", emit);
+      else if (printf ("%s\n", emit) < 0) rc = 2;
       free (raw_s);
     }
+  /* stdio can defer a small write until flush. Use Bash's recovery helper
+     so a failed redirection cannot leave stdout poisoned for later builtins.
+     jq reports output failures as status 2. */
+  if (!out_var && sh_chkwrite (EXECUTION_SUCCESS) != EXECUTION_SUCCESS)
+    rc = 2;
   if (out_var && rc == EXECUTION_SUCCESS)
     builtin_bind_variable ((char *) out_var, bound.p ? bound.p : "", 0);
-  if (exit_status)
+  if (exit_status && rc == EXECUTION_SUCCESS)
     {
-      if (out.n == 0 || !strcmp (out.v[out.n-1], "null") || !strcmp (out.v[out.n-1], "false")) rc = EXECUTION_FAILURE;
+      if (out.n == 0) rc = 4;
+      else if (!strcmp (out.v[out.n-1], "null") || !strcmp (out.v[out.n-1], "false")) rc = 1;
     }
+done:
   free (bound.p);
   vals_free (&out); node_free (root);
-  for (int i = 0; i < lx.n; i++) free (lx.v[i].v);
-  free (lx.v);
-  return rc;
-}
-
-static int
-run_stream_filter (const char *filter, const char *doc, int raw,
-                   int exit_status, const char *out_var)
-{
-  vals_t stream = {0};
-  if (json_stream_values (doc, &stream) < 0)
-    { vals_free (&stream); builtin_error ("cannot stream JSON input"); return EXECUTION_FAILURE; }
-
-  lexer_t lx = {0};
-  if (lex_filter (&lx, filter) < 0)
-    { vals_free (&stream); builtin_error ("%s", lx.err[0] ? lx.err : "lex failed"); return EX_USAGE; }
-  parser_t p = { .lx = &lx };
-  node_t *root = parse_expr (&p);
-  if (!root || peek (&p)->t != FT_EOF)
-    {
-      builtin_error ("%s", p.err[0] ? p.err : "parse failed");
-      node_free (root); vals_free (&stream);
-      for (int i = 0; i < lx.n; i++) free (lx.v[i].v);
-      free (lx.v);
-      return EX_USAGE;
-    }
-
-  vals_t out = {0};
-  int rc = EXECUTION_SUCCESS;
-  for (int i = 0; i < stream.n; i++)
-    if (eval_node (root, stream.v[i], &out) < 0)
-      { rc = EXECUTION_FAILURE; break; }
-
-  sbuf_t bound = {0};
-  for (int i = 0; i < out.n; i++)
-    {
-      json_compact (out.v[i]);
-      char *raw_s = NULL;
-      const char *emit = out.v[i];
-      if (raw && json_type (out.v[i]) && !strcmp (json_type (out.v[i]), "string"))
-        { raw_s = json_unstring (out.v[i]); emit = raw_s ? raw_s : ""; }
-      if (out_var)
-        {
-          if (i && sb_puts (&bound, "\n") < 0) rc = EXECUTION_FAILURE;
-          if (sb_puts (&bound, emit) < 0) rc = EXECUTION_FAILURE;
-        }
-      else
-        printf ("%s\n", emit);
-      free (raw_s);
-    }
-  if (out_var && rc == EXECUTION_SUCCESS)
-    builtin_bind_variable ((char *) out_var, bound.p ? bound.p : "", 0);
-  if (exit_status)
-    {
-      if (out.n == 0 || !strcmp (out.v[out.n-1], "null") || !strcmp (out.v[out.n-1], "false")) rc = EXECUTION_FAILURE;
-    }
-
-  free (bound.p);
-  vals_free (&out);
-  vals_free (&stream);
-  node_free (root);
   for (int i = 0; i < lx.n; i++) free (lx.v[i].v);
   free (lx.v);
   return rc;
@@ -2929,7 +3115,7 @@ jq_builtin (WORD_LIST *list)
       else if (!strcmp (w, "-e") || !strcmp (w, "--exit-status")) exit_status = 1;
       else if (!strcmp (w, "-c") || !strcmp (w, "--compact-output")) ;
       else if (!strcmp (w, "-n") || !strcmp (w, "--null-input")) null_input = 1;
-      else if (!strcmp (w, "-f")) { if (!a->next) { builtin_error ("-f needs file"); return EX_USAGE; } a = a->next; filter_file = a->word->word; }
+      else if (!strcmp (w, "-f") || !strcmp (w, "--from-file")) { if (!a->next) { builtin_error ("-f needs file"); return EX_USAGE; } a = a->next; filter_file = a->word->word; }
       else if (!strcmp (w, "-i")) { if (!a->next) { builtin_error ("-i needs INPUT_VAR"); return EX_USAGE; } a = a->next; input_var = a->word->word; }
       else if (!strcmp (w, "-V")) { if (!a->next) { builtin_error ("-V needs OUT_VAR"); return EX_USAGE; } a = a->next; out_var = a->word->word; }
       else if (!strcmp (w, "-s") || !strcmp (w, "--slurp")) slurp = 1;
@@ -2940,14 +3126,14 @@ jq_builtin (WORD_LIST *list)
          error while a unary-minus filter is accepted (jq parity). */
       else if (w[0] == '-' && (isalpha ((unsigned char) w[1]) || w[1] == '-'))
         { builtin_error ("unknown flag: %s", w); builtin_usage (); return EX_USAGE; }
-      else if (!filter) filter = w;
+      else if (!filter && !filter_file) filter = w;
       else if (!file) file = w;
       else { builtin_error ("extra arg: %s", w); return EX_USAGE; }
     }
   char *filter_buf = NULL, *doc = NULL; size_t len = 0;
   if (filter_file)
     {
-      if (slurp_file (filter_file, &filter_buf, &len) < 0) { builtin_error ("cannot read %s", filter_file); return EXECUTION_FAILURE; }
+      if (slurp_file (filter_file, &filter_buf, &len) < 0) { builtin_error ("cannot read %s", filter_file); return 2; }
       filter = filter_buf;
     }
   if (!filter) { builtin_error ("usage: jq [-r] [-e] FILTER [FILE]"); free (filter_buf); return EX_USAGE; }
@@ -2965,18 +3151,17 @@ jq_builtin (WORD_LIST *list)
     }
   else
     {
-      int sr = file ? slurp_file (file, &doc, &len) : slurp_fd (STDIN_FILENO, &doc, &len);
-      if (sr < 0) { builtin_error ("cannot read input"); free (filter_buf); return EXECUTION_FAILURE; }
+      int sr = file && strcmp (file, "-") ? slurp_file (file, &doc, &len) : slurp_fd (STDIN_FILENO, &doc, &len);
+      if (sr < 0) { builtin_error ("cannot read input"); free (filter_buf); return 2; }
     }
-  if (slurp)
+  if (slurp && !(null_input && !input_var))
     {
       char *slurped = json_slurp_array (doc);
-      if (!slurped) { builtin_error ("cannot slurp JSON input"); free (filter_buf); free (doc); return EXECUTION_FAILURE; }
+      if (!slurped) { builtin_error ("cannot slurp JSON input"); free (filter_buf); free (doc); return 5; }
       free (doc);
       doc = slurped;
     }
-  int rc = stream ? run_stream_filter (filter, doc, raw, exit_status, out_var)
-                  : run_filter (filter, doc, raw, exit_status, out_var);
+  int rc = run_filter (filter, doc, raw, exit_status, out_var, stream);
   free (filter_buf); free (doc);
   return rc;
 }
@@ -2992,6 +3177,11 @@ char *jq_doc[] = {
   "Supports paths, pipes, [], length/keys/type/has, select/map, comparisons,",
   "boolean ops, arithmetic, //, if/elif/else, literals, postfix ?, and",
   "streaming leaf tuples.",
+  "Input and result streams are buffered; output is compact by default.",
+  "-f also accepts --from-file. At most one input FILE is supported.",
+  "--stream emits leaf tuples, not the full jq container-end events.",
+  "Unsupported syntax returns 2; runtime errors return 5. With -e,",
+  "no output returns 4 and a final false or null returns 1.",
   (char *)NULL
 };
 
@@ -3000,6 +3190,6 @@ struct builtin jq_struct = {
   jq_builtin,
   BUILTIN_ENABLED,
   jq_doc,
-  "jq [-r] [-e] [-n] FILTER [FILE]",
+  "jq [-r] [-e] [-c] [-n] [-s|--stream] [-i INPUT_VAR] [-V OUT_VAR] {FILTER|-f FILTER_FILE} [FILE]",
   0
 };

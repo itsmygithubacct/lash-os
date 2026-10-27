@@ -836,7 +836,18 @@ env_builtin (WORD_LIST *list)
     for (int j = 0; j < n_set; j++) {
         if (debug)
             fprintf (stderr, "setenv:   %s\n", setv[j]);
-        envp[en++] = (char *) setv[j];
+        /* Replace in place: GNU keeps the first assignment's position but
+           uses the last value, both when printing and in the child's envp. */
+        size_t nlen = (size_t) (strchr (setv[j], '=') - setv[j]);
+        int slot;
+        for (slot = 0; slot < en; slot++) {
+            const char *eq = strchr (envp[slot], '=');
+            if (eq && (size_t) (eq - envp[slot]) == nlen &&
+                !memcmp (envp[slot], setv[j], nlen))
+                break;
+        }
+        envp[slot] = (char *) setv[j];
+        if (slot == en) en++;
     }
     envp[en] = NULL;
 
@@ -960,6 +971,13 @@ env_builtin (WORD_LIST *list)
                          k, argv[k]);
         }
         bos_run_builtin (program, argv, envp);
+        /* execvpe gets its search PATH through getenv. Bash's getenv reads
+           its variable tables first, falling back to environ only without
+           shell_variables. Detach those tables only in this exec-only child
+           and keep the original envp strings alive for execvpe. */
+        temporary_env = NULL;
+        shell_variables = NULL;
+        environ = envp;
         execvpe (program, argv, envp);
         int err = errno;
         if (err == ENOEXEC) {

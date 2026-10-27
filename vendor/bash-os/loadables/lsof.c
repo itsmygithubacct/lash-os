@@ -169,13 +169,13 @@ lsof_builtin (WORD_LIST *list)
             if (!list->next) {
                 builtin_error ("-p needs PID");
                 builtin_usage ();
-                return EX_USAGE;
+                return EXECUTION_FAILURE;
             }
             list = list->next;
             if (n_pids >= (int) (sizeof explicit_pids / sizeof explicit_pids[0])) {
                 builtin_error ("too many -p PIDs");
                 builtin_usage ();
-                return EX_USAGE;
+                return EXECUTION_FAILURE;
             }
             explicit_pids[n_pids++] = atoi (list->word->word);
             list = list->next;
@@ -185,7 +185,7 @@ lsof_builtin (WORD_LIST *list)
             if (!list->next) {
                 builtin_error ("-u needs USER");
                 builtin_usage ();
-                return EX_USAGE;
+                return EXECUTION_FAILURE;
             }
             list = list->next;
             bl_resolve_user (list->word->word, want_user, sizeof want_user);
@@ -196,7 +196,7 @@ lsof_builtin (WORD_LIST *list)
             if (n_pids >= (int) (sizeof explicit_pids / sizeof explicit_pids[0])) {
                 builtin_error ("too many PIDs");
                 builtin_usage ();
-                return EX_USAGE;
+                return EXECUTION_FAILURE;
             }
             explicit_pids[n_pids++] = atoi (w);
             list = list->next;
@@ -204,7 +204,7 @@ lsof_builtin (WORD_LIST *list)
         }
         builtin_error ("unknown arg: %s", w);
         builtin_usage ();
-        return EX_USAGE;
+        return EXECUTION_FAILURE;
     }
 
     printf ("%-12s %5s %-8s %3s %-5s %s\n",

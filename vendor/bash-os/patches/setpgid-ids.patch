@@ -1,0 +1,57 @@
+--- a/setpgid.c
++++ b/setpgid.c
+@@ -54,7 +54,7 @@
+   wl = list;
+   pid = pgid = 0;
+ 
+-  if (wl == 0 || wl->next == 0)
++  if (wl == 0 || wl->next == 0 || wl->next->next)
+     {
+       builtin_usage ();
+       return (EX_USAGE);
+@@ -79,7 +79,12 @@
+       builtin_error("%s: negative pid  values not allowed", pidstr);
+       return (EXECUTION_FAILURE);
+     }
+-  pid = pid_arg;
++  if ((intmax_t)(pid_t)pid_arg != pid_arg)
++    {
++      builtin_error ("%s: pid value out of range", pidstr);
++      return (EXECUTION_FAILURE);
++    }
++  pid = (pid_t)pid_arg;
+ 
+   if (valid_number (pgidstr, &pgid_arg) == 0)
+     {
+@@ -91,7 +96,12 @@
+       builtin_error ("%s: negative pgrp values not allowed", pgidstr);
+       return (EXECUTION_FAILURE);
+     }
+-  pgid = pgid_arg;
++  if ((intmax_t)(pid_t)pgid_arg != pgid_arg)
++    {
++      builtin_error ("%s: pgrp value out of range", pgidstr);
++      return (EXECUTION_FAILURE);
++    }
++  pgid = (pid_t)pgid_arg;
+ 
+   errno = 0;
+   if (setpgid(pid, pgid) < 0)
+@@ -103,11 +113,16 @@
+ }
+ 
+ const char *setpgid_doc[] = {
+-	"invoke the setpgid(2) system call",
++	"Set the process group of the caller or an unexecuted child.",
+ 	"",
+ 	"Arguments:",
+ 	"   pid : numeric process identifier, >= 0",
+ 	"   pgrpid: numeric process group identifier, >=0",
++	"Zero pid selects the calling process.",
++	"For zero pgrpid, the new process group ID is the target process ID.",
++	"IDs must fit pid_t. Exactly two arguments are required.",
++	"The target must be in the caller's session and cannot be a session leader.",
++	"Return success on completion, failure on invalid IDs or system call errors.",
+ 	"See the setpgid(2) manual page.",
+ 	(const char *)NULL
+ };

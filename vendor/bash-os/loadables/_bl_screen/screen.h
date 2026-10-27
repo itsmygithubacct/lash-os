@@ -99,6 +99,7 @@ void  bls_setfg(bls_win *, int32_t color);
 void  bls_setbg(bls_win *, int32_t color);
 
 /* --- the point: diff newscr vs curscr, emit only changes --------------- */
+int   bls_refresh_checked(bls_win *); /* 0 success, -1 output/resize failure; retryable */
 void  bls_refresh(bls_win *);
 void  bls_touchwin(bls_win *);   /* force full redraw on next refresh */
 

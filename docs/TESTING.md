@@ -8,7 +8,7 @@ in that workspace, outside the release Git tree.
 | --- | --- |
 | `make test-workspace` | Local configuration precedence, external output paths, safe cleanup of recognizable build trees, dedicated harness work directories, relocated CMake metadata, source refresh, rejection of overlapping source trees and untrackable input names, Make dependencies including compiler changes, release provenance checks, and deterministic initramfs metadata |
 | `make test-host` | Signals, polling, inherited descriptors, guest ABI conversions (flag translation, wire records and bounds), launcher policies, sandbox argument, mount reachability, socket filter and log-tail logic, and workspace tests with the regular host libc |
-| `make test-vm` or `make verify` | Native/kernel shell parity, registration of 279 builtins, representative builtin behavior and terminal job control |
+| `make test-vm` or `make verify` | Native/kernel shell parity, registration of 286 builtins, representative builtin behavior and terminal job control |
 | `make test-processes` | Fork state, resolver allocations, descriptor cleanup and recovery after failed execution |
 | `make test-portable` | Static musl host tests and full direct-mode VM tests with `/nix` removed |
 | `make test-portable-processes` | Process regressions with the portable loader |
@@ -18,9 +18,15 @@ in that workspace, outside the release Git tree.
 | `make test-mlkem` | Deterministic ML-KEM key generation, encapsulation and decapsulation across native and kernel code |
 | `make test-sha1dc` | SHA-1 padding vectors and collision-check continuation behavior |
 | `python3 -B tests/reachability-equivalence.py` | Compiler reachability transformation equivalence |
-| `scripts/dev.py python3 -B scripts/test-architecture.py --arch ARCH` | Extract an actual portable artifact, boot its matching guest kernel and check raw syscall translation plus all 279 builtin registrations |
+| `scripts/dev.py python3 -B scripts/test-architecture.py --arch ARCH` | Extract an actual portable artifact, boot its matching guest kernel and check raw syscall translation plus all 286 builtin registrations |
 | `scripts/dev.py python3 -B scripts/test-architecture.py --arch ARCH --full` | Full shell/builtin cases and PTY job-control tests inside that artifact's guest kernel |
 | `scripts/dev.py python3 -B scripts/test-guest-runtime.py --arch ARCH` | Production guest init and console protocol, shared home, outbound networking and processes; `--smoke` omits the process cases |
+
+Host checks also cover the bash-os version policy, Git calendar conversion,
+and named semaphore handle bounds, shared identity, cleanup and fork inheritance.
+The full guest suite exercises the new archive and hash builtins, Git commits,
+dates and remotes, calculator exit, IPC creation and service workspace cleanup.
+The sandbox PTY suite enters and leaves a nested shell and exits `bc` with `quit`.
 
 The host C tests need no BPF privileges or VM; their Make targets build the
 image first. Existing builds can be tested directly with `scripts/dev.py ctest

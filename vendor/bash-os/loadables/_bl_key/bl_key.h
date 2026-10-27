@@ -74,11 +74,20 @@ enum {
 /* Read one key from `fd`. See contract in the file header. */
 int bl_read_key (int fd);
 
+/* Optional safe-point callback around blocking reads/polls, including EINTR
+ * retries and sequence assembly. May unwind (e.g. Bash QUIT). A returning
+ * callback must preserve errno. NULL is exactly bl_read_key's behavior. The
+ * decoder installs no signal handlers and retains its existing time budgets. */
+int bl_read_key_checked (int fd, void (*check) (void));
+
 /* Push back one byte so the next bl_read_key call returns it (post-
  * ESC peek/restore). Only one byte of state. */
 void bl_pushback (unsigned char b);
 
 /* Clear any pushback state. Call at session start. */
 void bl_key_reset (void);
+
+/* True when a decoded ESC left a byte queued; check before polling the fd. */
+int bl_key_pending (void);
 
 #endif /* _BL_KEY_BL_KEY_H */

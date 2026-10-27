@@ -73,6 +73,10 @@ def words(values):
 
 def selection(root, args):
     catalog = parse_list(root/'config/bash-loadables.list')
+    optional = parse_list(root/'config/bash-loadables-optional.list')
+    if catalog.keys() & optional.keys():
+        raise ValueError('optional and full catalogs contain duplicate names')
+    catalog.update(optional)
     profiles = json.loads((root/'config/profiles.json').read_text())
     for directory in os.environ.get('EXTRA_LOADABLES', '').split():
         directory = Path(directory)

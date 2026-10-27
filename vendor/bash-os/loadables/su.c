@@ -14,6 +14,7 @@
 #endif
 
 #include <errno.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <stdint.h>
@@ -25,6 +26,7 @@
 #include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <termios.h>
 #include <time.h>
 
@@ -34,6 +36,7 @@
 #include "_bashauth_passwd_lookup.h"
 #include "_bashauth_secure_read.h"
 #include "bashcred_privdrop.h"
+#include "child-wait.h"
 #include "loadables.h"
 
 #define BSU_MAX_PASSWORD 4096
@@ -409,12 +412,46 @@ bsu_verify_user_interactive (const char *user)
   unsigned char *pw = NULL;
   size_t pw_len = 0;
   if (bsu_secure_read_password ("Password: ", &pw, &pw_len) < 0)
-    { builtin_error ("password read: %s", strerror (errno)); return 2; }
+    {
+      bsu_wipe (phc, sizeof phc);
+      builtin_error ("password read: %s", strerror (errno));
+      return 2;
+    }
   int r = bsu_verify_secret (pw, pw_len, phc);
   bsu_free_password (pw);
+  bsu_wipe (phc, sizeof phc);
   if (r == 0) bsu_record_success (user);
   else if (r == 1) bsu_record_failure (user);
   return r == 0 ? 0 : (r == 1 ? 1 : 2);
+}
+
+static int
+bsu_close_fds (void)
+{
+#ifdef SYS_close_range
+  if (syscall (SYS_close_range, 3U, ~0U, 0U) == 0) return 0;
+#endif
+  /* Enumerate actual descriptors, including ones above a lowered rlimit. */
+  DIR *d = opendir ("/proc/self/fd");
+  if (!d) return -1;
+  for (;;)
+    {
+      /* A read error is not end-of-directory: executing now could leak any
+         descriptors not yet visited. Ignore errno left by an earlier close. */
+      errno = 0;
+      struct dirent *ent = readdir (d);
+      if (!ent)
+        {
+          int saved = errno;
+          closedir (d);
+          if (saved) { errno = saved; return -1; }
+          return 0;
+        }
+      char *end;
+      long fd = strtol (ent->d_name, &end, 10);
+      if (*ent->d_name && !*end && fd >= 3 && fd != dirfd (d))
+        close ((int) fd);
+    }
 }
 
 static int
@@ -428,9 +465,8 @@ bsu_exec_user (const bc_user_info *u, int keep_env, int login_shell, const char 
      su(1)/login(1) and doas already do) so the dropped process carries
      supplementary groups such as `wheel`. The kernel PRIVCMD %group matcher reads
      the LIVE process credential, NOT /etc/group — so without this a wheel member
-     silently fails a `%wheel NOPASSWD` sudo rule. Only this setgroups (run while
-     still root, inside bc_privdrop_to_user) sticks; the later cred_exec setgroups
-     runs post-drop as the target and is tolerated. n_groups<=0 would otherwise
+     silently fails a `%wheel NOPASSWD` sudo rule. This setgroups runs while
+     still root, inside bc_privdrop_to_user. n_groups<=0 would otherwise
      collapse the drop to {primary gid} only (the historical su behavior). */
   gid_t groups[BC_PD_GROUPS_MAX];
   int n_groups = 0;
@@ -449,12 +485,29 @@ bsu_exec_user (const bc_user_info *u, int keep_env, int login_shell, const char 
       return EXECUTION_FAILURE;
     }
 
-  bashos_cred_exec_user ceu = {
-    u->name, u->uid, u->gid, u->home, u->shell
-  };
-  if (bashos_cred_exec_user_shell (&ceu, "su", keep_env, login_shell,
-                                   cmd, 0, NULL) < 0)
-    fprintf (stderr, "su: exec setup: %s\n", strerror (errno));
+  bashos_cred_exec_user ceu = { u->name, u->uid, u->gid, u->home, u->shell };
+  char **env = bashos_cred_exec_build_env (&ceu, keep_env, NULL);
+  if (!env) return EXECUTION_FAILURE;
+  if (login_shell && chdir (u->home) < 0 && chdir ("/") < 0)
+    {
+      bashos_cred_exec_free_env (env);
+      return EXECUTION_FAILURE;
+    }
+  char login_name[BC_PD_PATH_MAX + 1];
+  const char *base = strrchr (u->shell, '/');
+  snprintf (login_name, sizeof login_name, "-%s", base ? base + 1 : u->shell);
+  char *argv[4] = { login_shell ? login_name : (char *) u->shell, NULL, NULL, NULL };
+  if (cmd) { argv[1] = "-c"; argv[2] = (char *) cmd; }
+  else if (login_shell) argv[1] = "-i";
+  if (bsu_close_fds () < 0)
+    {
+      builtin_error ("close descriptors: %s", strerror (errno));
+      bashos_cred_exec_free_env (env);
+      return EXECUTION_FAILURE;
+    }
+  execve (u->shell, argv, env);
+  builtin_error ("execve %s: %s", u->shell, strerror (errno));
+  bashos_cred_exec_free_env (env);
   _exit (126);
 }
 
@@ -463,6 +516,7 @@ extern char *su_doc[];
 int
 su_builtin (WORD_LIST *list)
 {
+  clearerr (stdout);
   const char *target = "root";
   const char *cmd = NULL;
   int login_shell = 1;
@@ -474,7 +528,8 @@ su_builtin (WORD_LIST *list)
       if (strcmp (w, "-h") == 0 || strcmp (w, "--help") == 0)
         {
           for (char **d = su_doc; *d; d++) puts (*d);
-          return EXECUTION_SUCCESS;
+          return fflush (stdout) == EOF || ferror (stdout)
+                   ? EXECUTION_FAILURE : EXECUTION_SUCCESS;
         }
       if (strcmp (w, "-") == 0 || strcmp (w, "-l") == 0 || strcmp (w, "--login") == 0)
         login_shell = 1;
@@ -519,6 +574,49 @@ su_builtin (WORD_LIST *list)
   strncpy (u.home, au.home, sizeof u.home - 1);
   strncpy (u.shell, au.shell, sizeof u.shell - 1);
 
+  /* Authentication, partial credential changes and exec belong to an owned
+     child. Never return into the shell with altered IDs or dumpability. */
+  bos_child_wait waiting;
+  if (bos_child_wait_begin (&waiting) < 0)
+    { builtin_error ("child wait: %s", strerror (errno)); return EXECUTION_FAILURE; }
+  /* The reader restores its tty on normal returns. Keep a parent-side snapshot
+     as well: SIGINT/SIGTERM can kill the child while echo is disabled. */
+  int tty = -1;
+  struct termios saved_tty;
+  if (getuid () != 0)
+    {
+      tty = open ("/dev/tty", O_RDWR | O_CLOEXEC);
+      if (tty < 0 && isatty (STDIN_FILENO))
+        tty = fcntl (STDIN_FILENO, F_DUPFD_CLOEXEC, 3);
+      if (tty >= 0 && tcgetattr (tty, &saved_tty) < 0)
+        { close (tty); tty = -1; }
+    }
+  pid_t pid = fork ();
+  if (pid != 0)
+    {
+      int status = 0, rc = EXECUTION_FAILURE;
+      if (pid < 0) builtin_error ("fork: %s", strerror (errno));
+      else
+        {
+          pid_t w;
+          do { w = waitpid (pid, &status, 0); } while (w < 0 && errno == EINTR);
+          if (w < 0) builtin_error ("waitpid: %s", strerror (errno));
+          else if (WIFEXITED (status)) rc = WEXITSTATUS (status);
+          else if (WIFSIGNALED (status)) rc = 128 + WTERMSIG (status);
+        }
+      if (tty >= 0)
+        { (void) tcsetattr (tty, TCSANOW, &saved_tty); close (tty); }
+      bos_child_wait_end (&waiting);
+      return rc;
+    }
+  if (tty >= 0) close (tty);
+  bos_child_wait_child (&waiting);
+  sigset_t empty;
+  sigemptyset (&empty);
+  sigprocmask (SIG_SETMASK, &empty, NULL);
+  for (int sig = 1; sig < NSIG; sig++)
+    if (sig != SIGKILL && sig != SIGSTOP) signal (sig, SIG_DFL);
+
   if (getuid () != 0)
     {
       /* Non-root su owns target-password bytes and PHC verification in this
@@ -526,10 +624,10 @@ su_builtin (WORD_LIST *list)
       if (prctl (PR_SET_DUMPABLE, 0, 0, 0, 0) < 0)
         builtin_warning ("prctl(PR_SET_DUMPABLE,0): %s", strerror (errno));
       int vr = bsu_verify_user_interactive (target);
-      if (vr != 0) return vr == 1 ? EXECUTION_FAILURE : EX_USAGE;
+      if (vr != 0) _exit (vr == 1 ? EXECUTION_FAILURE : EX_USAGE);
     }
 
-  return bsu_exec_user (&u, keep_env, login_shell, cmd);
+  _exit (bsu_exec_user (&u, keep_env, login_shell, cmd));
 }
 
 char *su_doc[] = {

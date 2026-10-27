@@ -5,8 +5,8 @@
  *
  *   cksum [FILE...]
  *       Print "<crc> <bytes> <name>" lines, one per FILE. With no
- *       FILE or "-", reads stdin (and prints "<crc> <bytes>" with no
- *       name).
+ *       FILE, reads stdin and prints "<crc> <bytes>" with no name.
+ *       An explicit "-" reads stdin and retains "-" as the name.
  *   cksum -a md5|sha1|sha224|sha256|sha384|sha512 [FILE...]
  *       Match GNU cksum digest modes for common algorithms, defaulting
  *       to tagged output: "SHA256 (FILE) = HEX". --untagged emits
@@ -76,7 +76,7 @@ bck_compute_fd (int fd, uint32_t *crc_out, uint64_t *bytes_out)
         bytes += (uint64_t) n;
     }
     if (n < 0) return -1;
-    /* POSIX: append length octets in MSB-first order, dropping leading
+    /* POSIX: append length octets least-significant first, omitting high
        zero bytes, then final XOR with 0xFFFFFFFF. */
     uint64_t len = bytes;
     while (len > 0) {
@@ -263,7 +263,7 @@ cksum_builtin (WORD_LIST *list)
             if (!list->next) {
                 builtin_error ("%s needs an algorithm", w);
                 builtin_usage ();
-                return EX_USAGE;
+                return EXECUTION_FAILURE;
             }
             list = list->next;
             alg_name = list->word->word;
@@ -278,7 +278,7 @@ cksum_builtin (WORD_LIST *list)
                 builtin_error ("unsupported algorithm: %s "
                                "(supported: crc, md5, sha1, sha224, sha256, sha384, sha512)", alg_name);
                 builtin_usage ();
-                return EX_USAGE;
+                return EXECUTION_FAILURE;
             }
             selected_alg = parsed;
             list = list->next;
@@ -286,7 +286,7 @@ cksum_builtin (WORD_LIST *list)
         }
         builtin_error ("unknown flag: %s", w);
         builtin_usage ();
-        return EX_USAGE;
+        return EXECUTION_FAILURE;
     }
     if (!list) {
         if (selected_alg != BCK_ALG_CRC) {
@@ -310,8 +310,8 @@ cksum_builtin (WORD_LIST *list)
     for (WORD_LIST *p = list; p; p = p->next) {
         const char *path = p->word->word;
         int fd;
-        /* Options were consumed above; a leading '-' here only reaches us
-           after '--', so treat it as a (dash-leading) filename. */
+        /* A literal '-' selects stdin. Other dash-leading names can be
+           supplied after the '--' option separator. */
         int from_stdin = (strcmp (path, "-") == 0);
         if (from_stdin) {
             fd = STDIN_FILENO;
@@ -343,10 +343,7 @@ cksum_builtin (WORD_LIST *list)
             rc = EXECUTION_FAILURE;
             continue;
         }
-        if (from_stdin)
-            printf ("%" PRIu32 " %" PRIu64 "%c", crc, bytes, delim);
-        else
-            printf ("%" PRIu32 " %" PRIu64 " %s%c", crc, bytes, path, delim);
+        printf ("%" PRIu32 " %" PRIu64 " %s%c", crc, bytes, path, delim);
         if (!from_stdin) close (fd);
     }
     return rc;
@@ -359,7 +356,8 @@ char *cksum_doc[] = {
     "    cksum --help | --version",
     "        CRC mode prints '<crc> <bytes> <FILE>'. Digest modes",
     "        default to tagged output, e.g. 'SHA256 (FILE) = HEX'.",
-    "        With no FILE or '-', read stdin. Digest stdin is named '-'.",
+    "        With no FILE or '-', read stdin. Explicit '-' operands keep their name.",
+    "        Without FILE, CRC stdin omits its name; digest stdin is named '-'.",
     "        Use -- before dash-leading filenames.",
     "",
     "    -a, --algorithm=ALG   crc, md5, sha1, sha224, sha256, sha384, or sha512",

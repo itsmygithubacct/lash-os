@@ -1348,7 +1348,14 @@ bvt_feed_byte (bvt_t *t, unsigned char b)
     case VT_CSI_ENTRY:
     case VT_CSI_PARAM:
         if (b >= '0' && b <= '9') {
-            t->params[t->n_params] = t->params[t->n_params] * 10 + (b - '0');
+            /* A long CSI parameter must saturate. Multiplying a value
+               near INT_MAX by ten is signed overflow, which is undefined. */
+            int cur = t->params[t->n_params];
+            int digit = b - '0';
+            if (cur > 99999999)
+                t->params[t->n_params] = 999999999;
+            else
+                t->params[t->n_params] = cur * 10 + digit;
             t->param_pending = 1;
             t->state = VT_CSI_PARAM;
         } else if (b == ';') {
@@ -1520,7 +1527,12 @@ bvt_clone_alloc (bvt_t *src)
     t->cluster_arena = NULL;
     t->scrollback_lines = NULL;
     t->tab_stops = NULL;
+    /* The struct copy kept the source capacity. A drained response has
+       length zero and, after this, a null buffer; leaving the old
+       capacity made the next append memcpy through that null pointer. */
     t->response_buf = NULL;
+    t->response_len = 0;
+    t->response_cap = 0;
     size_t cells = (size_t) (src->rows * src->cols);
     t->grid = malloc (cells * sizeof (bvt_cell));
     t->alt_grid = malloc (cells * sizeof (bvt_cell));
@@ -1540,7 +1552,8 @@ bvt_clone_alloc (bvt_t *src)
         if (!t->tab_stops) goto fail;
         memcpy (t->tab_stops, src->tab_stops, (size_t) src->cols);
     }
-    if (src->response_len > 0) {
+    if (src->response_len > 0 && src->response_buf) {
+        t->response_len = src->response_len;
         t->response_cap = src->response_len + 1;
         t->response_buf = malloc (t->response_cap);
         if (!t->response_buf) goto fail;
@@ -1967,16 +1980,32 @@ bvt_render_cmd (WORD_LIST *args)
     return EXECUTION_SUCCESS;
 }
 
+/* Bytes one cell can take: the base codepoint plus every combiner the
+   assembly buffer will keep. Callers size their output from this. */
 static size_t
-bvt_render_cell_to_buf (bvt_t *t, bvt_cell *cell, char *out, size_t off)
+bvt_cell_utf8_room (void)
+{
+    return (size_t) (1 + BVT_CLUSTER_MAX_COMBINERS) * 4;
+}
+
+static size_t
+bvt_render_cell_to_buf (bvt_t *t, bvt_cell *cell, char *out, size_t off,
+                        size_t cap)
 {
     if (cell->flags & BVT_CELL_FLAG_CONT) return off;
+    if (off >= cap) return off;
     uint32_t cp = cell->cp ? cell->cp : ' ';
     if (cp == 0xFFFFFFFFu) cp = ' ';
-    off += grapheme_encode_utf8 (cp, out + off, 16);
-    for (int k = 0; k < cell->combiner_count; k++) {
-        uint32_t comb = t->cluster_arena[cell->combiner_offset - 1 + k];
-        off += grapheme_encode_utf8 (comb, out + off, 16);
+    size_t room = cap - off;
+    size_t need = grapheme_encode_utf8 (cp, out + off, room);
+    if (need > room) return off;
+    off += need;
+    for (int k = 0; k < cell->combiner_count && off < cap; k++) {
+        room = cap - off;
+        uint32_t comb = t->cluster_arena[cell->combiner_offset - 1 + (size_t) k];
+        need = grapheme_encode_utf8 (comb, out + off, room);
+        if (need > room) return off;
+        off += need;
     }
     return off;
 }
@@ -2031,13 +2060,14 @@ bvt_scrollback_row_cmd (WORD_LIST *args)
     }
     bvt_scroll_line *line = bvt_scrollback_line_at (t, n);
     if (!line) { builtin_error ("scrollback-row: bad row"); return EX_USAGE; }
-    size_t cap = line->len * 64 + 64;
+    size_t cap = line->len * bvt_cell_utf8_room () + 64;
     char *out = malloc (cap);
     if (!out) return EXECUTION_FAILURE;
     size_t off = (size_t) snprintf (out, cap, "%d ", n);
+    if (off >= cap) off = cap ? cap - 1 : 0;
     for (size_t i = 0; i < line->len; i++)
-        off = bvt_render_cell_to_buf (t, &line->cells[i], out, off);
-    out[off++] = '\n';
+        off = bvt_render_cell_to_buf (t, &line->cells[i], out, off, cap);
+    if (off < cap) out[off++] = '\n';
     /* EINTR-tolerant + partial-write loop. */
     size_t wpos = 0;
     while (wpos < off) {
@@ -2107,7 +2137,7 @@ bvt_scrollback_render_cmd (WORD_LIST *args)
                 if (!nb) { free (row_starts); free (out); return EXECUTION_FAILURE; }
                 out = nb;
             }
-            off = bvt_render_cell_to_buf (t, cell, out, off);
+            off = bvt_render_cell_to_buf (t, cell, out, off, cap);
             col += w;
         }
         if (off + 2 >= cap) {
@@ -2228,8 +2258,12 @@ bvt_diff_cmd (WORD_LIST *args)
     }
     /* Build output buffer. For each row, find runs of changed cells;
        emit cursor-position + characters + reset. Skip whole-row no-change.
-       3h: skip CONT cells (wide-char continuation), encode UTF-8. */
-    char *out = malloc ((size_t) (t->rows * t->cols * 32 + 64));
+       3h: skip CONT cells (wide-char continuation), encode UTF-8.
+       A cell can hold a base plus BVT_CLUSTER_MAX_COMBINERS combiners, so
+       a flat 32 bytes per cell is not enough for that encoding. */
+    size_t cell_room = 48 + bvt_cell_utf8_room ();
+    size_t cap = (size_t) t->rows * (size_t) t->cols * cell_room + 64;
+    char *out = malloc (cap);
     if (!out) return EXECUTION_FAILURE;
     size_t off = 0;
     for (int r = 0; r < t->rows; r++) {
@@ -2253,17 +2287,17 @@ bvt_diff_cmd (WORD_LIST *args)
                 if (bvt_cell_visual_equal (cur2, prev2)) break;
                 c++;
             }
-            off += (size_t) snprintf (out + off, 32, "\033[%d;%dH", r + 1, run_start + 1);
+            if (off >= cap) break;
+            {
+                size_t room = cap - off;
+                int wrote = snprintf (out + off, room, "\033[%d;%dH", r + 1, run_start + 1);
+                if (wrote < 0 || (size_t) wrote >= room) break;
+                off += (size_t) wrote;
+            }
             for (int k = run_start; k < c; k++) {
                 bvt_cell *cell = &t->grid[r * t->cols + k];
                 if (cell->flags & BVT_CELL_FLAG_CONT) continue;     /* skip wide-char cont */
-                uint32_t cp = cell->cp;
-                if (cp == 0 || cp == 0xFFFFFFFF) cp = ' ';
-                off += grapheme_encode_utf8 (cp, out + off, 16);
-                for (int kk = 0; kk < cell->combiner_count; kk++) {
-                    uint32_t comb = t->cluster_arena[cell->combiner_offset - 1 + kk];
-                    off += grapheme_encode_utf8 (comb, out + off, 16);
-                }
+                off = bvt_render_cell_to_buf (t, cell, out, off, cap);
             }
         }
     }

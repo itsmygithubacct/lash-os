@@ -1,0 +1,95 @@
+--- a/logname.c
++++ b/logname.c
+@@ -25,6 +25,7 @@
+ #endif
+ 
+ #include <stdio.h>
++#include <string.h>
+ #include <errno.h>
+ 
+ #include "../builtins.h"
+@@ -35,13 +36,54 @@
+ extern int errno;
+ #endif
+ 
++/* Accept GNU's unique long-option prefixes, without borrowing its banners. */
+ int
+ logname_builtin (WORD_LIST *list)
+ {
++  char *arg, *operand;
++  size_t len;
++  int end_options, posix_options;
+   char *np;
+ 
+-  if (no_options (list))
+-    return (EX_USAGE);
++  operand = 0;
++  end_options = 0;
++  posix_options = getenv ("POSIXLY_CORRECT") != 0;
++  for (; list; list = list->next)
++    {
++      arg = list->word->word;
++      if (end_options == 0 && strcmp (arg, "--") == 0)
++        {
++          end_options = 1;
++          continue;
++        }
++      if (end_options == 0 && arg[0] == '-' && arg[1])
++        {
++          len = strlen (arg + 2);
++          if (arg[1] == '-' && len && len <= 4 &&
++              strncmp ("help", arg + 2, len) == 0)
++            {
++              builtin_help ();
++              return (sh_chkwrite (EXECUTION_SUCCESS));
++            }
++          if (arg[1] == '-' && len && len <= 7 &&
++              strncmp ("version", arg + 2, len) == 0)
++            {
++              printf ("logname (bash-os builtin, Bash %s)\n", dist_version);
++              return (sh_chkwrite (EXECUTION_SUCCESS));
++            }
++          builtin_error ("%s: invalid option", arg);
++          return (EXECUTION_FAILURE);
++        }
++      if (operand == 0)
++        operand = arg;
++      if (posix_options)
++        end_options = 1;
++    }
++  if (operand)
++    {
++      builtin_error ("extra operand: %s", operand);
++      return (EXECUTION_FAILURE);
++    }
+ 
+   np = getlogin ();
+   if (np == 0)
+@@ -50,7 +92,7 @@
+       return (EXECUTION_FAILURE);
+     }
+   printf ("%s\n", np);
+-  return (EXECUTION_SUCCESS);
++  return (sh_chkwrite (EXECUTION_SUCCESS));
+ }
+ 
+ char *logname_doc[] = {
+@@ -58,7 +100,8 @@
+ 	"",
+ 	"Write the current user's login name to the standard output",
+ 	"and exit.  logname ignores the LOGNAME and USER variables.",
+-	"logname ignores any non-option arguments.",
++	"logname rejects operands.",
++	"--help displays help; --version displays the Bash builtin version.",
+ 	(char *)NULL
+ };
+ 	
+@@ -67,7 +110,7 @@
+ 	logname_builtin,
+ 	BUILTIN_ENABLED,
+ 	logname_doc,
+-	"logname",
++	"logname [--help] [--version]",
+ 	0
+ };
+ 	

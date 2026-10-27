@@ -17,11 +17,13 @@
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <stdint.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/select.h>
+#include <poll.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/types.h>
@@ -45,6 +47,7 @@ typedef struct bud_provider {
 typedef struct {
   int rc;
   int timed_out;
+  int output_invalid;
   char out[BUD_MAX_LINE];
   char err[BUD_MAX_LINE];
 } bud_run;
@@ -104,6 +107,21 @@ bud_config_path (void)
 }
 
 static int
+bud_valid_id (const char *s, const char *end, uintmax_t limit)
+{
+  uintmax_t value = 0;
+  if (s == end) return 0;
+  for (; s < end; s++)
+    {
+      if (*s < '0' || *s > '9') return 0;
+      unsigned digit = (unsigned) (*s - '0');
+      if (value > (limit - digit) / 10) return 0;
+      value = value * 10 + digit;
+    }
+  return 1;
+}
+
+static int
 bud_valid_record (const char *s)
 {
   int colons = 0;
@@ -113,7 +131,10 @@ bud_valid_record (const char *s)
       if (*p == '\n' || *p == '\r') return 0;
       if (*p == ':') colons++;
     }
-  return colons == 4;
+  if (colons != 4) return 0;
+  const char *uid_end = strchr (s, ':'), *gid_end = strchr (uid_end + 1, ':');
+  return bud_valid_id (s, uid_end, (uintmax_t) (uid_t) -1 - 1) &&
+         bud_valid_id (uid_end + 1, gid_end, (uintmax_t) (gid_t) -1 - 1);
 }
 
 static int
@@ -128,25 +149,32 @@ bud_passwd_lookup (const char *user, char *out, size_t outsz)
   int rc = 1;
   while ((n = getline (&line, &cap, f)) > 0)
     {
-      if (n && line[n - 1] == '\n') line[n - 1] = '\0';
-      char *save = NULL;
-      char *name = strtok_r (line, ":", &save);
-      char *pw = strtok_r (NULL, ":", &save);
-      char *uid = strtok_r (NULL, ":", &save);
-      char *gid = strtok_r (NULL, ":", &save);
-      char *gecos = strtok_r (NULL, ":", &save);
-      char *home = strtok_r (NULL, ":", &save);
-      char *shell = strtok_r (NULL, ":", &save);
-      (void) pw;
-      if (!name || !uid || !gid || !gecos || !home || !shell) continue;
-      if (strcmp (name, user) != 0) continue;
-      snprintf (out, outsz, "%s:%s:%s:%s:%s", uid, gid, gecos, home, shell);
+      if (memchr (line, '\0', (size_t) n)) continue;
+      if (n && line[n - 1] == '\n') line[--n] = '\0';
+      /* Keep the five record fields intact: empty GECOS, home, shell and
+         password fields must not shift the later fields as strtok does. */
+      char *name_end = strchr (line, ':');
+      if (!name_end) continue;
+      *name_end = '\0';
+      if (strcmp (line, user) != 0) continue;
+      char *record = strchr (name_end + 1, ':');
+      if (!record || !bud_valid_record (++record)) continue;
+      size_t length = strlen (record);
+      if (length >= outsz) continue;
+      memcpy (out, record, length + 1);
       rc = 0;
       break;
     }
   free (line);
   fclose (f);
   return rc;
+}
+
+static int
+bud_bind_record (const char *name, const char *record)
+{
+  SHELL_VAR *v = builtin_bind_variable ((char *) name, (char *) record, 0);
+  return v && !readonly_p (v) && !noassign_p (v) ? EXECUTION_SUCCESS : EXECUTION_FAILURE;
 }
 
 static int
@@ -157,35 +185,46 @@ bud_set_nonblock (int fd)
 }
 
 static void
-bud_append_read (int fd, char *buf, size_t *len)
+bud_close (int *fd)
+{
+  if (*fd >= 0) close (*fd);
+  *fd = -1;
+}
+
+/* Retain only the first line, but drain both streams. Limit each pass so a
+   provider continuously writing output cannot starve its own deadline. */
+static void
+bud_append_read (int *fd, char *buf, size_t *len, int *line_done, int *invalid)
 {
   char tmp[512];
-  for (;;)
+  for (int chunk = 0; *fd >= 0 && chunk < 32; chunk++)
     {
-      ssize_t n = read (fd, tmp, sizeof tmp);
+      ssize_t n = read (*fd, tmp, sizeof tmp);
       if (n > 0)
         {
-          size_t room = BUD_MAX_LINE - 1 - *len;
-          size_t take = (size_t) n < room ? (size_t) n : room;
-          if (take)
+          for (ssize_t i = 0; i < n && !*line_done; i++)
             {
-              memcpy (buf + *len, tmp, take);
-              *len += take;
-              buf[*len] = '\0';
+              if (tmp[i] == '\r' || tmp[i] == '\n') *line_done = 1;
+              else if (tmp[i] == '\0' || *len == BUD_MAX_LINE - 1) *invalid = 1;
+              else buf[(*len)++] = tmp[i];
             }
+          buf[*len] = '\0';
           continue;
         }
       if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))
         return;
+      if (n < 0) *invalid = 1;
+      bud_close (fd);
       return;
     }
 }
 
-static void
-bud_first_line (char *s)
+static long long
+bud_mono_ms (void)
 {
-  char *p = strpbrk (s, "\r\n");
-  if (p) *p = '\0';
+  struct timespec now;
+  if (clock_gettime (CLOCK_MONOTONIC, &now) < 0) return -1;
+  return (long long) now.tv_sec * 1000 + now.tv_nsec / 1000000;
 }
 
 static int
@@ -193,55 +232,59 @@ bud_run_provider (bud_provider *p, const char *op, const char *user,
                   const char *password, bud_run *r)
 {
   int outp[2] = { -1, -1 }, errp[2] = { -1, -1 }, pwp[2] = { -1, -1 };
-  int fd_verify = password && strcmp (op, "verify") == 0 && strcmp (p->name, "ldap") == 0;
+  int builtin_passwd = strcmp (p->name, "passwd") == 0;
+  int fd_verify = password && strcmp (op, "verify") == 0 &&
+                  (builtin_passwd || strcmp (p->name, "ldap") == 0);
+  int password_fd = builtin_passwd ? STDIN_FILENO : 3;
+  int guarded = 0, failed = 0, reaped = 0, status = 0, channel_error = 0;
+  size_t olen = 0, elen = 0, sent = 0, password_len = password ? strlen (password) : 0;
+  size_t password_bytes = password_len + (fd_verify && !builtin_passwd ? 1 : 0);
+  int out_done = 0, err_done = 0, err_invalid = 0;
+  pid_t pid = -1;
+  sigset_t chld_set, prev_mask;
+  struct sigaction chld_dfl, chld_save;
   memset (r, 0, sizeof *r);
   r->rc = 127;
-  if (pipe (outp) < 0 || pipe (errp) < 0 || (fd_verify && pipe (pwp) < 0))
-    {
-      if (outp[0] >= 0) close (outp[0]);
-      if (outp[1] >= 0) close (outp[1]);
-      if (errp[0] >= 0) close (errp[0]);
-      if (errp[1] >= 0) close (errp[1]);
-      if (pwp[0] >= 0) close (pwp[0]);
-      if (pwp[1] >= 0) close (pwp[1]);
-      return -1;
-    }
+  if (pipe2 (outp, O_CLOEXEC) < 0 || pipe2 (errp, O_CLOEXEC) < 0 ||
+      (fd_verify && socketpair (AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pwp) < 0))
+    { failed = 1; goto cleanup; }
 
-  struct sigaction chld_dfl, chld_save;
   memset (&chld_dfl, 0, sizeof chld_dfl);
   chld_dfl.sa_handler = SIG_DFL;
   sigemptyset (&chld_dfl.sa_mask);
-  sigaction (SIGCHLD, &chld_dfl, &chld_save);
-
-  sigset_t chld_set, prev_mask;
   sigemptyset (&chld_set);
   sigaddset (&chld_set, SIGCHLD);
-  sigprocmask (SIG_BLOCK, &chld_set, &prev_mask);
+  if (sigprocmask (SIG_BLOCK, &chld_set, &prev_mask) < 0)
+    { failed = 1; goto cleanup; }
+  if (sigaction (SIGCHLD, &chld_dfl, &chld_save) < 0)
+    { sigprocmask (SIG_SETMASK, &prev_mask, NULL); failed = 1; goto cleanup; }
+  guarded = 1;
 
-  pid_t pid = fork ();
+  pid = fork ();
   if (pid < 0)
-    {
-      close (outp[0]); close (outp[1]); close (errp[0]); close (errp[1]);
-      if (pwp[0] >= 0) close (pwp[0]);
-      if (pwp[1] >= 0) close (pwp[1]);
-      sigprocmask (SIG_SETMASK, &prev_mask, NULL);
-      sigaction (SIGCHLD, &chld_save, NULL);
-      return -1;
-    }
+    { failed = 1; goto cleanup; }
   if (pid == 0)
     {
-      sigprocmask (SIG_SETMASK, &prev_mask, NULL);
-      dup2 (outp[1], STDOUT_FILENO);
-      dup2 (errp[1], STDERR_FILENO);
+      if (setpgid (0, 0) < 0) _exit (127);
+      /* Move sources above all destinations before closing any pipe ends.
+         This also works when the caller entered with fd 0, 1 or 2 closed. */
+      int output = fcntl (outp[1], F_DUPFD_CLOEXEC, 4);
+      int error = fcntl (errp[1], F_DUPFD_CLOEXEC, 4);
+      int input = fd_verify ? fcntl (pwp[0], F_DUPFD_CLOEXEC, 4) : -1;
+      if (output < 0 || error < 0 || (fd_verify && input < 0)) _exit (127);
+      bud_close (&outp[0]); bud_close (&outp[1]); bud_close (&errp[0]); bud_close (&errp[1]);
+      bud_close (&pwp[0]); bud_close (&pwp[1]);
+      if (dup2 (output, STDOUT_FILENO) < 0 || dup2 (error, STDERR_FILENO) < 0 ||
+          (fd_verify && dup2 (input, password_fd) < 0)) _exit (127);
+      close (output); close (error); if (input >= 0) close (input);
       if (fd_verify)
         {
-          if (pwp[0] != 3 && dup2 (pwp[0], 3) < 0)
-            _exit (127);
-          setenv ("BASHUSERDB_VERIFY_FD", "3", 1);
+          if (setenv ("BASHUSERDB_VERIFY_FD", builtin_passwd ? "0" : "3", 1) < 0) _exit (127);
+          /* Bash's setenv updates its variable table, not libc's environ. */
+          array_needs_making = 1;
         }
-      close (outp[0]); close (outp[1]); close (errp[0]); close (errp[1]);
-      if (pwp[0] >= 0 && pwp[0] != 3) close (pwp[0]);
-      if (pwp[1] >= 0 && pwp[1] != 3) close (pwp[1]);
+      maybe_make_export_env ();
+      sigprocmask (SIG_SETMASK, &prev_mask, NULL);
       int extra = password && !fd_verify ? 3 : 2;
       int ac = 1 + p->argc + extra;
       char **argv = calloc ((size_t) ac + 1, sizeof *argv);
@@ -254,70 +297,79 @@ bud_run_provider (bud_provider *p, const char *op, const char *user,
       if (password && !fd_verify) argv[i++] = (char *) password;
       argv[i] = NULL;
       execv (p->path, argv);
+      if (builtin_passwd) execv ("/bin/bash", argv);
       _exit (127);
     }
 
-  close (outp[1]);
-  close (errp[1]);
-  if (fd_verify)
-    {
-      const char *pcur = password;
-      size_t left = strlen (password);
-      close (pwp[0]);
-      while (left > 0)
-        {
-          ssize_t n = write (pwp[1], pcur, left);
-          if (n < 0 && errno == EINTR) continue;
-          if (n <= 0) break;
-          pcur += n;
-          left -= (size_t) n;
-        }
-      (void) write (pwp[1], "\n", 1);
-      close (pwp[1]);
-    }
-  bud_set_nonblock (outp[0]);
-  bud_set_nonblock (errp[0]);
+  (void) setpgid (pid, pid);
+  bud_close (&outp[1]); bud_close (&errp[1]); bud_close (&pwp[0]);
+  if (bud_set_nonblock (outp[0]) < 0 || bud_set_nonblock (errp[0]) < 0 ||
+      (fd_verify && bud_set_nonblock (pwp[1]) < 0))
+    { failed = 1; goto cleanup; }
 
-  size_t olen = 0, elen = 0;
-  time_t deadline = time (NULL) + BUD_TIMEOUT_SEC;
-  int status = 0, done = 0;
-  while (!done)
+  long long now = bud_mono_ms (), deadline = now + BUD_TIMEOUT_SEC * 1000;
+  if (now < 0) { failed = 1; goto cleanup; }
+  while (!reaped)
     {
-      bud_append_read (outp[0], r->out, &olen);
-      bud_append_read (errp[0], r->err, &elen);
-      pid_t w = waitpid (pid, &status, WNOHANG);
-      if (w == pid) { done = 1; break; }
-      if (w < 0 && errno != EINTR) { done = 1; break; }
-      if (time (NULL) >= deadline)
+      bud_append_read (&outp[0], r->out, &olen, &out_done, &r->output_invalid);
+      bud_append_read (&errp[0], r->err, &elen, &err_done, &err_invalid);
+      if (pwp[1] >= 0 && sent == password_bytes) bud_close (&pwp[1]);
+      if (pwp[1] >= 0)
         {
-          r->timed_out = 1;
-          kill (pid, SIGKILL);
-          while (waitpid (pid, &status, 0) < 0 && errno == EINTR) ;
-          done = 1;
-          break;
+          const char *bytes = sent < password_len ? password + sent : "\n";
+          size_t remaining = sent < password_len ? password_len - sent : 1;
+          ssize_t n = send (pwp[1], bytes, remaining, MSG_NOSIGNAL);
+          if (n > 0)
+            {
+              sent += (size_t) n;
+              if (sent == password_bytes) bud_close (&pwp[1]);
+            }
+          else if (n == 0 || (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR))
+            { channel_error = 1; bud_close (&pwp[1]); }
         }
-      fd_set rfds;
-      FD_ZERO (&rfds);
-      FD_SET (outp[0], &rfds);
-      FD_SET (errp[0], &rfds);
-      int maxfd = outp[0] > errp[0] ? outp[0] : errp[0];
-      struct timeval tv;
-      tv.tv_sec = 0;
-      tv.tv_usec = 100000;
-      select (maxfd + 1, &rfds, NULL, NULL, &tv);
+      pid_t w = waitpid (pid, &status, WNOHANG);
+      if (w == pid) { reaped = 1; break; }
+      if (w < 0 && errno != EINTR) { failed = 1; break; }
+      now = bud_mono_ms ();
+      if (now < 0) { failed = 1; break; }
+      if (now >= deadline) { r->timed_out = 1; break; }
+      struct pollfd fds[] = {
+        { .fd = outp[0], .events = POLLIN }, { .fd = errp[0], .events = POLLIN },
+        { .fd = pwp[1], .events = POLLOUT }
+      };
+      int delay = deadline - now > 100 ? 100 : (int) (deadline - now);
+      if (poll (fds, 3, delay) < 0 && errno != EINTR) { failed = 1; break; }
     }
-  bud_append_read (outp[0], r->out, &olen);
-  bud_append_read (errp[0], r->err, &elen);
-  sigprocmask (SIG_SETMASK, &prev_mask, NULL);
-  sigaction (SIGCHLD, &chld_save, NULL);
-  close (outp[0]);
-  close (errp[0]);
+
+cleanup:
+  if (pid > 0 && !reaped)
+    {
+      /* The provider owns this process group; a timeout also ends helpers
+         that could otherwise keep our pipes open after the provider dies. */
+      (void) kill (-pid, SIGKILL);
+      (void) kill (pid, SIGKILL);
+      pid_t w;
+      do w = waitpid (pid, &status, 0); while (w < 0 && errno == EINTR);
+      reaped = w == pid;
+    }
+  if (pid > 0 && !failed)
+    {
+      bud_append_read (&outp[0], r->out, &olen, &out_done, &r->output_invalid);
+      bud_append_read (&errp[0], r->err, &elen, &err_done, &err_invalid);
+    }
+  bud_close (&outp[0]); bud_close (&outp[1]); bud_close (&errp[0]); bud_close (&errp[1]);
+  bud_close (&pwp[0]); bud_close (&pwp[1]);
+  if (guarded)
+    {
+      sigaction (SIGCHLD, &chld_save, NULL);
+      sigprocmask (SIG_SETMASK, &prev_mask, NULL);
+    }
+  if (failed) return -1;
 
   if (r->timed_out) r->rc = 124;
+  else if (!reaped || channel_error || (fd_verify && sent != password_bytes)) r->rc = 1;
   else if (WIFEXITED (status)) r->rc = WEXITSTATUS (status);
   else r->rc = 128;
-  bud_first_line (r->out);
-  bud_first_line (r->err);
   return 0;
 }
 
@@ -396,85 +448,13 @@ bud_load_config (void)
 static int
 bud_passwd_verify (const char *user, const char *password)
 {
-  int p[2];
-  if (pipe (p) < 0) return EXECUTION_FAILURE;
-
-  struct sigaction chld_dfl, chld_save;
-  memset (&chld_dfl, 0, sizeof chld_dfl);
-  chld_dfl.sa_handler = SIG_DFL;
-  sigemptyset (&chld_dfl.sa_mask);
-  sigaction (SIGCHLD, &chld_dfl, &chld_save);
-
-  sigset_t chld_set, prev_mask;
-  sigemptyset (&chld_set);
-  sigaddset (&chld_set, SIGCHLD);
-  sigprocmask (SIG_BLOCK, &chld_set, &prev_mask);
-
-  pid_t pid = fork ();
-  if (pid < 0)
-    {
-      close (p[0]); close (p[1]);
-      sigprocmask (SIG_SETMASK, &prev_mask, NULL);
-      sigaction (SIGCHLD, &chld_save, NULL);
-      return EXECUTION_FAILURE;
-    }
-  if (pid == 0)
-    {
-      sigprocmask (SIG_SETMASK, &prev_mask, NULL);
-      dup2 (p[0], STDIN_FILENO);
-      close (p[0]);
-      close (p[1]);
-      execl ("/proc/self/exe", "bash", "-c",
-             "builtin passwd verify-fd \"$1\" 0",
-             "userdb-passwd", user, (char *) NULL);
-      execl ("/bin/bash", "bash", "-c",
-             "builtin passwd verify-fd \"$1\" 0",
-             "userdb-passwd", user, (char *) NULL);
-      _exit (127);
-    }
-  close (p[0]);
-  size_t len = strlen (password ? password : "");
-  const char *q = password ? password : "";
-  while (len)
-    {
-      ssize_t n = write (p[1], q, len);
-      if (n < 0)
-        {
-          if (errno == EINTR) continue;
-          break;
-        }
-      q += n;
-      len -= (size_t) n;
-    }
-  close (p[1]);
-
-  int status = 0;
-  time_t deadline = time (NULL) + BUD_TIMEOUT_SEC;
-  for (;;)
-    {
-      pid_t w = waitpid (pid, &status, WNOHANG);
-      if (w == pid) break;
-      if (w < 0 && errno != EINTR)
-        {
-          sigprocmask (SIG_SETMASK, &prev_mask, NULL);
-          sigaction (SIGCHLD, &chld_save, NULL);
-          return EXECUTION_FAILURE;
-        }
-      if (time (NULL) >= deadline)
-        {
-          kill (pid, SIGKILL);
-          while (waitpid (pid, &status, 0) < 0 && errno == EINTR) ;
-          sigprocmask (SIG_SETMASK, &prev_mask, NULL);
-          sigaction (SIGCHLD, &chld_save, NULL);
-          builtin_error ("passwd provider timed out");
-          return EXECUTION_FAILURE;
-        }
-      usleep (100000);
-    }
-  sigprocmask (SIG_SETMASK, &prev_mask, NULL);
-  sigaction (SIGCHLD, &chld_save, NULL);
-  return (WIFEXITED (status) && WEXITSTATUS (status) == 0)
-         ? EXECUTION_SUCCESS : EXECUTION_FAILURE;
+  char *args[] = { "-c", "builtin passwd verify-fd \"$2\" 0", "userdb-passwd" };
+  bud_provider provider = { .name = "passwd", .path = "/proc/self/exe", .args = args, .argc = 3 };
+  bud_run result;
+  if (bud_run_provider (&provider, "verify", user, password ? password : "", &result) < 0)
+    return EXECUTION_FAILURE;
+  if (result.timed_out) builtin_error ("passwd provider timed out");
+  return result.rc == 0 ? EXECUTION_SUCCESS : EXECUTION_FAILURE;
 }
 
 static int
@@ -500,8 +480,7 @@ bud_lookup_cmd (WORD_LIST *args)
   char rec[BUD_MAX_LINE];
   if (bud_passwd_lookup (user, rec, sizeof rec) == 0)
     {
-      builtin_bind_variable ((char *) var, rec, 0);
-      return EXECUTION_SUCCESS;
+      return bud_bind_record (var, rec);
     }
 
   int tried = 0;
@@ -512,10 +491,9 @@ bud_lookup_cmd (WORD_LIST *args)
       if (bud_run_provider (p, "lookup", user, NULL, &r) < 0) continue;
       if (r.timed_out)
         { builtin_error ("provider %s lookup timed out", p->name); continue; }
-      if (r.rc == 0 && bud_valid_record (r.out))
+      if (r.rc == 0 && !r.output_invalid && bud_valid_record (r.out))
         {
-          builtin_bind_variable ((char *) var, r.out, 0);
-          return EXECUTION_SUCCESS;
+          return bud_bind_record (var, r.out);
         }
       if (r.rc == 1)
         continue;             /* expected user-not-found, stay silent */
@@ -677,9 +655,13 @@ char *userdb_doc[] = {
   "    userdb add-provider NAME PATH [ARGS...]",
   "        Add an external provider. Providers are invoked as",
   "        PATH [ARGS...] lookup USER or PATH [ARGS...] verify USER PASSWORD.",
+  "        The ldap provider receives the password on fd 3 instead of argv;",
+  "        BASHUSERDB_VERIFY_FD identifies that descriptor.",
   "    userdb remove-provider NAME",
   "",
   "Config: /etc/userdb.conf lines of: provider NAME PATH [ARGS...]",
+  "Provider exchange (including password input) has a five-second deadline.",
+  "Lookup accepts one complete first-line record of at most 4095 bytes.",
   "",
   "Provider error diagnostics: rc=0 success, rc=1 silent (user not",
   "found / wrong password). rc=127 reports 'exec failed (rc=127)'",

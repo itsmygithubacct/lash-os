@@ -8,8 +8,8 @@ HEADER = ('#include "unwind_prot.h"\n'
           'static void linux_bash_workspace_free(void *pointer) { free(pointer); }\n\n')
 
 
-def adapt(path, workspaces):
-    source = path.read_text().replace(HEADER, '')
+def adapt(path, workspaces, types=''):
+    source = path.read_text().replace(HEADER + types, '')
     for function, declaration, pointer, allocation, failure, at_entry in workspaces:
         start = source.index('static int\n' + function + ' (')
         body = source.index('\n{', start)
@@ -19,15 +19,20 @@ def adapt(path, workspaces):
         tag = 'linux-bash-os:' + function
         if tag in contents:
             continue
-        assert declaration in contents, (path, function)
+        declarations = [declaration] if isinstance(declaration, str) else declaration
+        for declaration in declarations:
+            assert declaration in contents, (path, function, declaration)
         setup = ('\n  void *workspace = malloc (' + allocation + ');\n'
                  '  if (!workspace) { ' + failure + ' }\n'
                  f'  begin_unwind_frame ("{tag}");\n'
                  '  add_unwind_protect (linux_bash_workspace_free, workspace);\n')
         if at_entry:
             before = ''
-            after = contents.replace(declaration, '', 1)
+            after = contents
+            for declaration in declarations:
+                after = after.replace(declaration, '', 1)
         else:
+            assert len(declarations) == 1
             before, after = contents.split(declaration, 1)
         tail = pointer + after
         # Guard returns before allocation remain unchanged. Every subsequent
@@ -39,7 +44,7 @@ def adapt(path, workspaces):
             tail)
         source = source[:start] + prefix + before + setup + tail + '\n}' + source[end:]
     first = min(source.index('static int\n' + item[0] + ' (') for item in workspaces)
-    source = source[:first] + HEADER + source[first:]
+    source = source[:first] + HEADER + types + source[first:]
     path.write_text(source)
 
 
@@ -63,8 +68,27 @@ def main():
         for function in ['bsv_up_target', 'bsv_down_target', 'bsv_status_target',
                          'bsv_start_enabled_ordered', 'bsv_stop_enabled_ordered',
                          'bsv_each_service']
+    ] + [
+        ('bsv_restart_target', '      struct bsv_service_meta svcs[BSV_SERVICE_MAX];',
+         '  struct bsv_service_meta *svcs = workspace;',
+         'sizeof (struct bsv_service_meta) * BSV_SERVICE_MAX',
+         'return EXECUTION_FAILURE;', True)
     ])
-    print('Adapted oversized DNS and service-manager workspaces')
+    adapt(args.directory / 'git.c', [
+        ('git_cmd_remote', [
+            '        struct { char shown[4096]; const char *state; } listed[256];',
+            '        struct { char local[4096]; char remote[4096]; } pulls[256];',
+        ],
+         '  struct linux_bash_remote_workspace *arrays = workspace;\n'
+         '  __typeof__ (arrays->listed[0]) *listed = arrays->listed;\n'
+         '  __typeof__ (arrays->pulls[0]) *pulls = arrays->pulls;\n',
+         'sizeof (struct linux_bash_remote_workspace)',
+         'return GIT_EXIT_FATAL;', True)
+    ], types=('struct linux_bash_remote_workspace {\n'
+              '  struct { char shown[4096]; const char *state; } listed[256];\n'
+              '  struct { char local[4096]; char remote[4096]; } pulls[256];\n'
+              '};\n\n'))
+    print('Adapted oversized DNS, service-manager and Git workspaces')
 
 
 if __name__ == '__main__':

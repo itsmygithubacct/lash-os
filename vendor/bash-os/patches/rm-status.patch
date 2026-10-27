@@ -1,0 +1,136 @@
+--- builtins/rm.c
++++ builtins/rm.c
+@@ -24,0 +25,3 @@
++#include <sys/stat.h>
++#include <unistd.h>
++#include "unwind_prot.h"
+@@ -28,2 +31,2 @@
+-#include "../builtins.h"
+-#include "../shell.h"
++#include "builtins.h"
++#include "shell.h"
+@@ -39 +42 @@
+-static int force, recursive;
++static int force, recursive, rm_prompt_each;
+@@ -96,0 +100,103 @@
++/* Explicit -i reads only its own answers, without stdio read-ahead or
++   invoking an external rm. Memory use does not depend on answer length. */
++static int
++rm_confirm (const char *action, const char *name)
++{
++  unsigned char c = 0, first = 0;
++  int have_first = 0;
++  ssize_t n;
++
++  if (fprintf (stderr, "rm: %s '%s'? ", action, name) < 0
++      || fflush (stderr) == EOF)
++    return -1;
++  for (;;)
++    {
++      QUIT;
++      n = read (STDIN_FILENO, &c, 1);
++      if (n < 0)
++        {
++          if (errno == EINTR) continue;
++          builtin_error ("confirmation: %s", strerror (errno));
++          return -1;
++        }
++      if (n == 0 || c == '\n') break;
++      if (have_first == 0) { first = c; have_first = 1; }
++    }
++  return have_first && (first == 'y' || first == 'Y');
++}
++
++static void
++rm_close_directory (void *arg)
++{
++  closedir ((DIR *) arg);
++}
++
++static int
++rm_interactive_file (const char *fname)
++{
++  struct stat st;
++  int answer, err;
++  DIR *dir;
++  struct dirent *dp;
++
++  if (lstat (fname, &st) < 0)
++    {
++      builtin_error ("%s: %s", fname, strerror (errno));
++      return 1;
++    }
++  if (S_ISDIR (st.st_mode) == 0)
++    {
++      answer = rm_confirm ("remove", fname);
++      if (answer <= 0) return answer < 0;
++      if (unlink (fname) == 0) return 0;
++      builtin_error ("%s: %s", fname, strerror (errno));
++      return 1;
++    }
++  if (recursive == 0)
++    {
++      builtin_error ("%s: %s", fname, strerror (EISDIR));
++      return 1;
++    }
++  dir = opendir (fname);
++  if (dir == 0)
++    {
++      builtin_error ("%s: %s", fname, strerror (errno));
++      return 1;
++    }
++  begin_unwind_frame ("rm interactive directory");
++  add_unwind_protect (rm_close_directory, dir);
++  do
++    dp = readdir (dir);
++  while (dp && (strcmp (dp->d_name, ".") == 0 || strcmp (dp->d_name, "..") == 0));
++  if (dp)
++    {
++      answer = rm_confirm ("descend into directory", fname);
++      if (answer <= 0)
++        {
++          run_unwind_frame ("rm interactive directory");
++          return answer < 0;
++        }
++    }
++  err = 0;
++  while (dp)
++    {
++      if (strcmp (dp->d_name, ".") && strcmp (dp->d_name, ".."))
++        {
++          size_t len = strlen (fname) + strlen (dp->d_name) + 2;
++          char child[len];
++          snprintf (child, len, "%s/%s", fname, dp->d_name);
++          if (rm_interactive_file (child)) err = 1;
++        }
++      dp = readdir (dir);
++    }
++  run_unwind_frame ("rm interactive directory");
++  answer = rm_confirm ("remove directory", fname);
++  if (answer <= 0) return err || answer < 0;
++  if (rmdir (fname) < 0)
++    {
++      builtin_error ("%s: %s", fname, strerror (errno));
++      return 1;
++    }
++  return err;
++}
++
+@@ -99,0 +206 @@
++  if (rm_prompt_each) return rm_interactive_file (fname);
+@@ -123 +230 @@
+-  recursive = force = 0;
++  recursive = force = rm_prompt_each = 0;
+@@ -136,0 +244 @@
++	  rm_prompt_each = 0;
+@@ -139 +247,3 @@
+-	  return (EX_DISKFALLBACK);
++	  rm_prompt_each = 1;
++	  force = 0;
++	  break;
+@@ -143 +253 @@
+-	  return (EX_USAGE);
++	  return (EXECUTION_FAILURE);
+@@ -171,0 +282,2 @@
++	"-i asks on standard input before removal; -f disables confirmation.",
++	"The last -f or -i option takes precedence; -r descends into directories.",

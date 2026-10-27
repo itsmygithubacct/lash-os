@@ -845,6 +845,154 @@ static int run_local (const char *cmd, const char *infile,
   return 127;
 }
 
+/* The same command with the channel on its streams, rather than a file
+   going in and two blobs coming back. What the client sends reaches the
+   command as it is sent, and what the command writes goes back at once —
+   which is what a conversation needs. A protocol like git's answers what
+   it has been told so far and then waits, so a far end whose output is
+   only sent when the command exits can never take part in one: both sides
+   wait for each other. Returns the command's status. */
+static int run_local_stream (const char *cmd, const bsshd_target_user *target,
+                             ssh_channel ch)
+{
+  int ip[2], op[2], ep[2];
+  if (pipe (ip) < 0) return 127;
+  if (pipe (op) < 0) { close (ip[0]); close (ip[1]); return 127; }
+  if (pipe (ep) < 0)
+    { close (ip[0]); close (ip[1]); close (op[0]); close (op[1]); return 127; }
+  struct bsshd_child_guard guard;
+  bsshd_child_guard_begin (&guard);
+  pid_t pid = fork ();
+  if (pid < 0)
+    {
+      bsshd_child_guard_parent_end (&guard);
+      close (ip[0]); close (ip[1]); close (op[0]);
+      close (op[1]); close (ep[0]); close (ep[1]);
+      return 127;
+    }
+  if (pid == 0)
+    {
+      bsshd_child_guard_child_end (&guard);
+      close (ip[1]); close (op[0]); close (ep[0]);
+      if (dup2 (ip[0], STDIN_FILENO) < 0 || dup2 (op[1], STDOUT_FILENO) < 0
+          || dup2 (ep[1], STDERR_FILENO) < 0)
+        _exit (127);
+      close (ip[0]); close (op[1]); close (ep[1]);
+      const char *shell = "/bin/bash";
+      if (target && target->enabled)
+        {
+          char drop_err[BC_PD_ERR_MAX];
+          if (target->user.home[0] && chdir (target->user.home) < 0)
+            {
+              fprintf (stderr, "sshd: chdir %s: %s\n",
+                       target->user.home, strerror (errno));
+              _exit (127);
+            }
+          if (geteuid () == 0 &&
+              bc_privdrop_to_user (target->user.uid, target->user.gid,
+                                   target->groups, target->ngroups,
+                                   drop_err, sizeof drop_err) < 0)
+            {
+              fprintf (stderr, "sshd: privdrop %s: %s\n",
+                       target->user.name, drop_err);
+              _exit (127);
+            }
+          if (geteuid () != target->user.uid || getegid () != target->user.gid)
+            _exit (127);
+          shell = target->user.shell[0] ? target->user.shell : "/bin/bash";
+        }
+      bsshd_exec_child (shell, cmd, target, NULL, NULL);
+      _exit (127);
+    }
+  close (ip[0]); close (op[1]); close (ep[1]);
+  /* A command that is not reading must not stop the other direction, so
+     what has arrived for it waits here instead of in a blocking write. */
+  int flags = fcntl (ip[1], F_GETFL, 0);
+  if (flags >= 0) fcntl (ip[1], F_SETFL, flags | O_NONBLOCK);
+
+  char pending[16384];
+  size_t pending_len = 0, pending_at = 0;
+  int in_open = 1, client_done = 0;
+  int done[2] = { 0, 0 };                     /* stdout, then stderr */
+  while (!done[0] || !done[1])
+    {
+      int moved = 0;
+      /* What is already held for the command goes to it first. */
+      while (in_open && pending_at < pending_len)
+        {
+          ssize_t w = write (ip[1], pending + pending_at,
+                             pending_len - pending_at);
+          if (w > 0) { pending_at += (size_t) w; moved = 1; }
+          else if (w < 0 && errno == EINTR) continue;
+          else break;                         /* full for now, or gone */
+        }
+      if (pending_at == pending_len) pending_at = pending_len = 0;
+      if (in_open && !pending_len && client_done)
+        { close (ip[1]); in_open = 0; }       /* the command sees the end */
+
+      /* Then whatever the client has said since. */
+      if (in_open && !pending_len)
+        {
+          int avail = ssh_channel_poll_timeout (ch, moved ? 0 : 10, 0);
+          if (avail == SSH_EOF || avail == SSH_ERROR)
+            client_done = 1;
+          else if (avail > 0)
+            {
+              uint32_t chunk = (uint32_t) (avail < (int) sizeof pending
+                                           ? avail : (int) sizeof pending);
+              int r = ssh_channel_read (ch, pending, chunk, 0);
+              if (r > 0) { pending_len = (size_t) r; moved = 1; }
+              else client_done = 1;
+            }
+        }
+
+      /* And whatever the command has written goes back the same way. */
+      fd_set readers;
+      int top = -1;
+      FD_ZERO (&readers);
+      for (int is_err = 0; is_err < 2; is_err++)
+        {
+          int fd = is_err ? ep[0] : op[0];
+          if (done[is_err]) continue;
+          FD_SET (fd, &readers);
+          if (fd > top) top = fd;
+        }
+      struct timeval wait = { 0, moved ? 0 : 10000 };
+      int ready = top >= 0 ? select (top + 1, &readers, NULL, NULL, &wait) : 0;
+      if (ready < 0 && errno != EINTR) break;
+      if (ready > 0)
+        {
+          char buf[8192];
+          for (int is_err = 0; is_err < 2; is_err++)
+            {
+              int fd = is_err ? ep[0] : op[0];
+              if (done[is_err] || !FD_ISSET (fd, &readers)) continue;
+              ssize_t r = read (fd, buf, sizeof buf);
+              if (r > 0)
+                {
+                  if (bsshd_channel_write_all (ch, buf, (size_t) r,
+                                               is_err) < 0)
+                    { done[0] = done[1] = 1; break; }
+                  moved = 1;
+                }
+              else if (r == 0)
+                done[is_err] = 1;
+              else if (errno != EINTR && errno != EAGAIN)
+                done[is_err] = 1;
+            }
+        }
+    }
+  close (op[0]); close (ep[0]);
+  if (in_open) close (ip[1]);
+  int st = 0;
+  pid_t w;
+  while ((w = waitpid (pid, &st, 0)) < 0 && errno == EINTR) ;
+  bsshd_child_guard_parent_end (&guard);
+  if (w == pid && WIFEXITED (st)) return WEXITSTATUS (st);
+  if (w == pid && WIFSIGNALED (st)) return 128 + WTERMSIG (st);
+  return 127;
+}
+
 static int listen_tcp (const char *addr, const char *port)
 {
   struct addrinfo hints, *res = NULL, *rp;
@@ -2562,31 +2710,38 @@ bsshd_encrypted_handle_direct_tcpip (ssh_session session,
               ssh_message_reply_default (msg);
               ssh_message_free (msg);
             }
-          blob in = {0}, out = {0}, err = {0};
-          char sbuf[4096];
-          int idle = 0;
-          while (!ssh_channel_is_eof (sch) && idle < 20)
-            {
-              int n = ssh_channel_read_timeout (sch, sbuf, sizeof sbuf, 0, 100);
-              if (n == SSH_ERROR) break;
-              if (n > 0) { blob_append (&in, sbuf, (size_t) n); idle = 0; }
-              else idle++;
-            }
+          int rc;
           char inpath[64] = "";
-          if (in.n) write_blob_temp (&in, inpath, sizeof inpath);
-          int rc = (allow_agent_forwarding && agent_req.requested)
-                   ? run_local_agent_proxy (session, cmd_copy ? cmd_copy : "",
-                                            in.n ? inpath : NULL, target, 1, &out, &err)
-                   : run_local (cmd_copy ? cmd_copy : "", in.n ? inpath : NULL,
-                                target, &out, &err);
-          bsshd_channel_write_all (sch, out.p ? out.p : "", out.n, 0);
-          bsshd_channel_write_all (sch, err.p ? err.p : "", err.n, 1);
+          if (allow_agent_forwarding && agent_req.requested)
+            {
+              /* With an agent to proxy, the pumping is the proxy's own and
+                 the command's input is collected before it starts. */
+              blob in = {0}, out = {0}, err = {0};
+              char sbuf[4096];
+              int idle = 0;
+              while (!ssh_channel_is_eof (sch) && idle < 20)
+                {
+                  int n = ssh_channel_read_timeout (sch, sbuf, sizeof sbuf, 0, 100);
+                  if (n == SSH_ERROR) break;
+                  if (n > 0) { blob_append (&in, sbuf, (size_t) n); idle = 0; }
+                  else idle++;
+                }
+              if (in.n) write_blob_temp (&in, inpath, sizeof inpath);
+              rc = run_local_agent_proxy (session, cmd_copy ? cmd_copy : "",
+                                          in.n ? inpath : NULL, target, 1,
+                                          &out, &err);
+              bsshd_channel_write_all (sch, out.p ? out.p : "", out.n, 0);
+              bsshd_channel_write_all (sch, err.p ? err.p : "", err.n, 1);
+              free (in.p); free (out.p); free (err.p);
+            }
+          else
+            rc = run_local_stream (cmd_copy ? cmd_copy : "", target, sch);
           ssh_channel_request_send_exit_status (sch, rc);
           ssh_channel_send_eof (sch);
           ssh_channel_close (sch);
           ssh_channel_free (sch);
           if (inpath[0]) unlink (inpath);
-          free (cmd_copy); free (in.p); free (out.p); free (err.p);
+          free (cmd_copy);
           goto bsshd_next_request;
         }
       ssh_message_reply_default (msg);

@@ -1,0 +1,57 @@
+--- jobs.c
++++ jobs.c
+@@ -3148,6 +3148,11 @@
+ itrace("wait_for: blocking wait for %d returns %d child = %p", (int)pid, r, child);
+ #endif
+ 	  queue_sigchld = 0;
++	  /* Non-POSIX wait does not return on SIGCHLD. Run the queued trap
++	     now that waitchld has finished the job list, before blocking
++	     for a child that the trap may release. */
++	  if (this_shell_builtin == wait_builtin && posixly_correct == 0)
++	    run_pending_traps ();
+ 	  if (r == -1 && errno == ECHILD && this_shell_builtin == wait_builtin)
+ 	    {
+ 	      termination_state = -1;
+@@ -4248,9 +4253,11 @@
+ 	  if (sigchld == 0 && wait_intr_flag)
+ 	    sh_longjmp (wait_intr_buf, 1);
+ 	}
+-      /* If not in posix mode and not executing the wait builtin, queue the
+-	 signal for later handling.  Run the trap immediately if we are
+-	 executing the wait builtin, but don't break out of `wait'. */
++      /* Queue the trap and keep waiting. Running it inside waitchld calls
++	 parse_and_execute() while this function still owns the job list, and
++	 the system malloc then corrupts its freelist. Non-POSIX wait_for runs
++	 the queued trap once this function returns, before waiting again.
++	 See builtins/wait.def. */
+       else if (sigchld)	/* called from signal handler */
+ 	queue_sigchld_trap (children_exited);
+       else if (signal_in_progress (SIGCHLD))
+@@ -4260,13 +4267,7 @@
+       else if (running_trap)
+ 	queue_sigchld_trap (children_exited);
+       else if (this_shell_builtin == wait_builtin)
+-	{
+-	  int o;
+-	  o = jobs_list_frozen;
+-	  jobs_list_frozen = 1;
+-	  run_sigchld_trap (children_exited);	/* XXX */
+-	  jobs_list_frozen = o;
+-	}
++	queue_sigchld_trap (children_exited);	/* wait_for runs it next */
+       else
+ 	queue_sigchld_trap (children_exited);
+     }
+--- builtins/wait.def
++++ builtins/wait.def
+@@ -193,8 +193,8 @@
+   opt = first_pending_trap ();
+ #if defined (SIGCHLD)
+   /* We special case SIGCHLD when not in posix mode because we don't break
+-     out of the wait even when the signal is trapped; we run the trap after
+-     the wait completes. See how it's handled in jobs.c:waitchld(). */
++     out of the wait even when the signal is trapped. jobs.c:wait_for runs
++     the queued trap after waitchld returns and before it waits again. */
+   if (opt == SIGCHLD && posixly_correct == 0)
+     opt = next_pending_trap (opt+1);
+ #endif

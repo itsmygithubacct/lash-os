@@ -852,7 +852,7 @@ sftp_builtin (WORD_LIST *list)
       else if (!strcmp (w, "--help") || !strcmp (w, "-h"))
         { sftp_print_help (); return EXECUTION_SUCCESS; }
       else if (w[0] == '-')
-        { builtin_error ("unknown option: %s", w); return EX_USAGE; }
+        { builtin_error ("unknown option: %s", w); return EXECUTION_FAILURE; }
       else if (!host_arg) host_arg = w;
       else { builtin_error ("extra argument: %s", w); return EX_USAGE; }
     }

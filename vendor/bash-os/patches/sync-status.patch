@@ -1,0 +1,5 @@
+--- builtins/sync.c
++++ builtins/sync.c
+@@ -46 +46 @@
+-    return (EX_USAGE);
++    return (EXECUTION_FAILURE);

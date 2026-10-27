@@ -25,11 +25,16 @@
 #include <time.h>
 #include <sys/socket.h>
 #include <sys/statvfs.h>
+#include <sys/statfs.h>
 #include <sys/epoll.h>
 #include <sys/timex.h>
 #include <sys/msg.h>
 #include <sys/shm.h>
 #include <sys/sem.h>
+#include <mqueue.h>
+#include <semaphore.h>
+#define LASHOS_TIME_IMPLEMENTATION
+#include "guest/git_time.h"
 #include <netdb.h>
 #include <ifaddrs.h>
 #include <sys/signalfd.h>

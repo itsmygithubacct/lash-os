@@ -1682,5 +1682,214 @@
         "string"
       ]
     ]
+  ],
+  [
+    "renameat",
+    "int",
+    [
+      [
+        "int",
+        "old_directory",
+        "dirfd"
+      ],
+      [
+        "const char *",
+        "old_path",
+        "path"
+      ],
+      [
+        "int",
+        "new_directory",
+        "dirfd"
+      ],
+      [
+        "const char *",
+        "new_path",
+        "path"
+      ]
+    ]
+  ],
+  [
+    "copy_file_range",
+    "ssize_t",
+    [
+      [
+        "int",
+        "input",
+        "fd"
+      ],
+      [
+        "off_t *",
+        "input_offset",
+        "optional:sizeof(off_t)"
+      ],
+      [
+        "int",
+        "output",
+        "fd"
+      ],
+      [
+        "off_t *",
+        "output_offset",
+        "optional:sizeof(off_t)"
+      ],
+      [
+        "size_t",
+        "length",
+        "value"
+      ],
+      [
+        "unsigned",
+        "flags",
+        "value"
+      ]
+    ]
+  ],
+  [
+    "mq_unlink",
+    "int",
+    [
+      [
+        "const char *",
+        "name",
+        "string"
+      ]
+    ]
+  ],
+  [
+    "mq_open",
+    "mqd_t",
+    [
+      [
+        "const char *",
+        "name",
+        "string"
+      ],
+      [
+        "int",
+        "flags",
+        "openflags"
+      ],
+      [
+        "mode_t",
+        "mode",
+        "value"
+      ],
+      [
+        "const struct mq_attr *",
+        "attributes",
+        "optional:sizeof(struct mq_attr)"
+      ]
+    ]
+  ],
+  [
+    "linkat",
+    "int",
+    [
+      [
+        "int",
+        "old_directory",
+        "dirfd"
+      ],
+      [
+        "const char *",
+        "old_path",
+        "path"
+      ],
+      [
+        "int",
+        "new_directory",
+        "dirfd"
+      ],
+      [
+        "const char *",
+        "new_path",
+        "path"
+      ],
+      [
+        "int",
+        "flags",
+        "atflags"
+      ]
+    ]
+  ],
+  [
+    "statfs",
+    "int",
+    [
+      [
+        "const char *",
+        "path",
+        "path"
+      ],
+      [
+        "struct statfs *",
+        "out",
+        "bytes:sizeof(struct statfs)"
+      ]
+    ]
+  ],
+  [
+    "mkfifoat",
+    "int",
+    [
+      [
+        "int",
+        "directory",
+        "dirfd"
+      ],
+      [
+        "const char *",
+        "path",
+        "path"
+      ],
+      [
+        "mode_t",
+        "mode",
+        "value"
+      ]
+    ]
+  ],
+  [
+    "mkdirat",
+    "int",
+    [
+      [
+        "int",
+        "directory",
+        "dirfd"
+      ],
+      [
+        "const char *",
+        "path",
+        "path"
+      ],
+      [
+        "mode_t",
+        "mode",
+        "value"
+      ]
+    ]
+  ],
+  [
+    "symlinkat",
+    "int",
+    [
+      [
+        "const char *",
+        "target",
+        "string"
+      ],
+      [
+        "int",
+        "directory",
+        "dirfd"
+      ],
+      [
+        "const char *",
+        "path",
+        "path"
+      ]
+    ]
   ]
 ]

@@ -3515,52 +3515,14 @@ ba_policy_open_fd_or_file (const char *target, const char *verb)
 	return fp;
 }
 
-static int
-ba_policy_list_cmd (WORD_LIST *args)
+/* Shared read-only renderer. Owns and closes fp; never opens policy or
+ * authority files, changes credentials, or authorizes execution. */
+int
+bashos_auth_policy_list (FILE *fp, const char *subject, int long_mode,
+                        FILE *output, unsigned int *entriesp)
 {
-	const char *path = NULL, *want_user = NULL;
-	int long_mode = 0;
-	for (WORD_LIST *a = args; a; a = a->next) {
-		const char *w = a->word->word;
-		if (strcmp (w, "--long") == 0) {
-			long_mode = 1;
-		} else if (strcmp (w, "--user") == 0) {
-			if (!a->next) {
-				builtin_error ("policy-list: --user needs USER");
-				return EX_USAGE;
-			}
-			a = a->next;
-			want_user = a->word->word;
-		} else if (strncmp (w, "--user=", 7) == 0) {
-			want_user = w + 7;
-		} else if (!path) {
-			path = w;
-		} else {
-			builtin_error ("policy-list: usage: policy-list FD-or-FILE [--user U] [--long]");
-			return EX_USAGE;
-		}
-	}
-	if (!path) {
-		builtin_error ("policy-list: usage: policy-list FD-or-FILE [--user U] [--long]");
-		return EX_USAGE;
-	}
-
-	struct passwd *self = getpwuid (getuid ());
-	const char *self_name = self ? self->pw_name : NULL;
-	if (!self_name || !*self_name) {
-		builtin_error ("policy-list: cannot resolve caller user");
-		return EXECUTION_FAILURE;
-	}
-	const char *subject = want_user && *want_user ? want_user : self_name;
-	if (strcmp (subject, self_name) != 0 && geteuid () != 0) {
-		builtin_error ("policy-list: --user other-than-self requires root");
-		return EXECUTION_FAILURE;
-	}
-
-	FILE *fp = ba_policy_open_fd_or_file (path, "policy-list");
-	if (!fp)
-		return EXECUTION_FAILURE;
-
+	const char *path = "policy snapshot";
+	*entriesp = 0;
 	char *line = NULL;
 	size_t cap = 0;
 	ssize_t n;
@@ -3647,14 +3609,14 @@ ba_policy_list_cmd (WORD_LIST *args)
 			for (char *cmd = strtok_r (copy, ",", &save); cmd;
 			     cmd = strtok_r (NULL, ",", &save)) {
 				cmd = ba_policy_trim (cmd);
-				printf ("entry user=%s host=%s runas=%s runas_group=%s nopasswd=%d setenv=%d cmd=%s\n",
+				fprintf (output, "entry user=%s host=%s runas=%s runas_group=%s nopasswd=%d setenv=%d cmd=%s\n",
 				        subject, r->host, runas, runas_group,
 				        r->nopasswd, r->setenv, cmd);
 				entries++;
 			}
 			free (copy);
 		} else {
-			printf ("list user=%s host=%s runas=%s runas_group=%s nopasswd=%d setenv=%d commands=%s\n",
+			fprintf (output, "list user=%s host=%s runas=%s runas_group=%s nopasswd=%d setenv=%d commands=%s\n",
 			        subject, r->host, runas, runas_group,
 			        r->nopasswd, r->setenv, commands);
 			entries++;
@@ -3664,10 +3626,63 @@ ba_policy_list_cmd (WORD_LIST *args)
 		free (commands);
 	}
 	if (rc == EXECUTION_SUCCESS)
-		printf ("summary entries=%u digest_sha256=%s\n", entries, hex);
+		fprintf (output, "summary entries=%u digest_sha256=%s\n", entries, hex);
 	ba_wipe (digest, sizeof digest);
 	ba_policy_list_free (&st);
+	*entriesp = entries;
+	if (fflush (output) != 0 || ferror (output))
+		rc = EXECUTION_FAILURE;
 	return rc;
+}
+
+static int
+ba_policy_list_cmd (WORD_LIST *args)
+{
+	const char *path = NULL, *want_user = NULL;
+	int long_mode = 0;
+	for (WORD_LIST *a = args; a; a = a->next) {
+		const char *w = a->word->word;
+		if (strcmp (w, "--long") == 0) {
+			long_mode = 1;
+		} else if (strcmp (w, "--user") == 0) {
+			if (!a->next) {
+				builtin_error ("policy-list: --user needs USER");
+				return EX_USAGE;
+			}
+			a = a->next;
+			want_user = a->word->word;
+		} else if (strncmp (w, "--user=", 7) == 0) {
+			want_user = w + 7;
+		} else if (!path) {
+			path = w;
+		} else {
+			builtin_error ("policy-list: usage: policy-list FD-or-FILE [--user U] [--long]");
+			return EX_USAGE;
+		}
+	}
+	if (!path) {
+		builtin_error ("policy-list: usage: policy-list FD-or-FILE [--user U] [--long]");
+		return EX_USAGE;
+	}
+
+	struct passwd *self = getpwuid (getuid ());
+	const char *self_name = self ? self->pw_name : NULL;
+	if (!self_name || !*self_name) {
+		builtin_error ("policy-list: cannot resolve caller user");
+		return EXECUTION_FAILURE;
+	}
+	const char *subject = want_user && *want_user ? want_user : self_name;
+	if (strcmp (subject, self_name) != 0 && geteuid () != 0) {
+		builtin_error ("policy-list: --user other-than-self requires root");
+		return EXECUTION_FAILURE;
+	}
+
+	FILE *fp = ba_policy_open_fd_or_file (path, "policy-list");
+	if (!fp)
+		return EXECUTION_FAILURE;
+
+	unsigned int entries;
+	return bashos_auth_policy_list (fp, subject, long_mode, stdout, &entries);
 }
 
 static int

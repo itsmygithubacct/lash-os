@@ -2,6 +2,9 @@
 /bin/busybox mount -t proc proc /proc
 /bin/busybox mount -t sysfs sysfs /sys
 /bin/busybox mount -t devtmpfs devtmpfs /dev
+/bin/busybox mkdir -p /dev/shm /dev/mqueue
+/bin/busybox mount -t tmpfs -o mode=1777 tmpfs /dev/shm
+/bin/busybox mount -t mqueue mqueue /dev/mqueue
 /bin/busybox mkdir -p /dev/pts
 /bin/busybox mount -t devpts devpts /dev/pts
 /bin/busybox ln -s /proc/self/fd /dev/fd

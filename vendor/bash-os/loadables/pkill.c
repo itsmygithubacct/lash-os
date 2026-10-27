@@ -32,7 +32,7 @@ pkill_builtin (WORD_LIST *list)
 char *pkill_doc[] = {
     "Signal running processes by name or cmdline.",
     "",
-    "    bashpkill [-SIGNAL] [-cfx] [-u USER] PATTERN",
+    "    bashpkill [-SIGNAL] [-cfx] [-n|-o] [SELECTORS] [PATTERN]",
     "    bashpkill [-SIGNAL] [-cf] -u USER",
     "    bashpkill -h | --help | -V | --version",
     "",
@@ -40,11 +40,17 @@ char *pkill_doc[] = {
     "               with or without leading SIG. Default: TERM",
     "    -f         match against /proc/PID/cmdline (full command line)",
     "    -c, --count  print only the count of processes signalled",
-    "    -x, --exact  match the whole comm/cmdline, not a substring",
-    "    -u USER    only signal processes whose real uid is USER",
+    "    -x, --exact  require the regex to match the whole comm/cmdline",
+    "    -u USER    only signal processes whose effective uid is USER",
+    "    -U USER    filter real uid; -G GROUP filter real gid",
+    "    -P PID     filter parent; -g PGRP process group; -s SID session",
+    "               selectors accept comma-separated alternatives",
+    "    -n, --newest / -o, --oldest select one by start time (ties by PID)",
     "",
-    "PATTERN is a substring (not a regex) unless -x is given. Self is never signalled.",
-    "Returns 0 if any process was signalled, 1 if none matched.",
+    "PATTERN is a POSIX extended regular expression. Self is never signalled.",
+    "A pattern or identity/parent/group/session selector is required.",
+    "Count includes successful signal requests; vanished processes are skipped.",
+    "Returns 0 if any request succeeded, 1 if none, 2 on usage error, 3 on fatal.",
     (char *)NULL
 };
 
@@ -53,6 +59,6 @@ struct builtin bashpkill_struct = {
     pkill_builtin,
     BUILTIN_ENABLED,
     pkill_doc,
-    "bashpkill [-SIGNAL] [-cfx] [-u USER] PATTERN [-h|--help|-V|--version]",
+    "bashpkill [-SIGNAL] [-cfx] [-n|-o] [SELECTORS] [PATTERN] [-h|--help|-V|--version]",
     0
 };

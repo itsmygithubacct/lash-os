@@ -15,15 +15,27 @@
  *
  * Commands shipped at v1:
  *   Motions:        h j k l, w, b, 0, $, G, [N]G
- *   Edits:          i, a, o, O, x, dd, yy, p, P, .  (repeat last edit)
+ *   Edits:          i, a, A, o, O, x, dd, yy, p, P, .  (repeat last edit)
+ *   Counts:         [N]h/j/k/l, [N]x, [N]dd, d[N]d, [N]yy, [N]p/P,
+ *                   [N]u, [N]Ctrl-R, [N].
  *   Search:         /pattern (forward), n, N
  *   Undo/redo:      u (undo), Ctrl-R (redo)
  *   Visual:         v (toggle), y (yank), d (delete), x (delete-as-x)
- *   Ex:             :w, :q, :wq, :q!, :w PATH, :set nu, :set nonu, :N
+ *   Ex:             :w, :q, :wq, :q!, :w PATH, :set nu, :set nonu, :N,
+ *                   :[range]d[elete] [N], :u[ndo], :red[o]; ranges are
+ *                   N . $ % with +N/-N offsets
+ *
+ * Cursor rule: the cursor always sits on a real line. The offset past
+ * a final newline is not a line, so deleting the last line moves the
+ * cursor to the new last line and further dd keep deleting until the
+ * buffer is empty; dd on the empty buffer is a no-op without an undo
+ * step. Linewise deletes and puts keep the buffer's final-newline
+ * state (a file without one stays without one). An empty unterminated
+ * last line exposed by deletion is tracked separately from the bytes.
  *
  * Deferred (out of scope at v1):
- *   - Macros (q/@), marks (m), named registers ("a..z), counts beyond
- *     :N and [N]G, complex motions (f/t/i/a-objects), syntax
+ *   - Macros (q/@), marks (m), named registers ("a..z), counts on
+ *     w/b/o/i/a, complex motions (f/t/i/a-objects), syntax
  *     highlighting, :substitute regex, plugins, recovery files, ex
  *     mode beyond the shipped verb list.
  *
@@ -107,7 +119,9 @@ typedef struct {
     size_t n_pieces;
     size_t total_len;
     size_t total_lines;
+    int empty_last_line; /* unterminated empty line after the stored bytes */
     int dirty;
+    size_t cur;          /* cursor at the time the snapshot was taken */
 } bv_pt_snapshot;
 
 typedef struct {
@@ -129,6 +143,7 @@ typedef struct {
     size_t pieces_cap;
     size_t total_len;
     size_t total_lines;
+    int empty_last_line;
     int dirty;
 } bv_pt_buffer;
 
@@ -160,6 +175,7 @@ typedef struct {
     char last_insert_text[4096];
     size_t last_insert_len;
     char last_op_cmd;    /* 'x','d','y','p','P','o','O','i','a',0 */
+    size_t last_count;   /* count of last_op_cmd, reused by '.' */
     /* status line for next render */
     char status[256];
     int quit;
@@ -171,6 +187,9 @@ typedef struct {
 } bv_state;
 
 static bv_state bv_st;
+
+/* Upper bound for typed counts and ex line numbers. */
+#define BV_COUNT_MAX 100000000u
 
 /* ---- piece-table primitives --------------------------------------- */
 
@@ -428,6 +447,20 @@ bv_find_piece (const bv_pt_buffer *b, size_t pos, size_t *idx, size_t *inner)
     return pos == b->total_len ? 0 : -1;
 }
 
+/* Newlines in bytes [lo, hi) of piece `p`. Counts whichever is
+ * shorter, the span or its complement (subtracted from the cached
+ * piece total), so trimming a few bytes off a large mapped piece does
+ * not rescan the whole file. */
+static size_t
+bv_piece_nl (const bv_pt_buffer *b, const bv_pt_piece *p, size_t lo, size_t hi)
+{
+    const char *d = bv_piece_data (b, p);
+    if (hi - lo <= p->length / 2)
+        return bv_count_nl (d + lo, hi - lo);
+    return p->line_count - bv_count_nl (d, lo)
+                         - bv_count_nl (d + hi, p->length - hi);
+}
+
 static int
 bv_replace_span (bv_pt_buffer *b, size_t start, size_t end,
                  const char *ins, size_t ins_len)
@@ -442,8 +475,7 @@ bv_replace_span (bv_pt_buffer *b, size_t start, size_t end,
     if (si < b->n_pieces && so > 0) {
         newp[nn] = b->pieces[si];
         newp[nn].length = so;
-        newp[nn].line_count = bv_count_nl (bv_piece_data (b, &newp[nn]),
-                                           newp[nn].length);
+        newp[nn].line_count = bv_piece_nl (b, &b->pieces[si], 0, so);
         nn++;
     }
     if (ins_len) {
@@ -461,8 +493,8 @@ bv_replace_span (bv_pt_buffer *b, size_t start, size_t end,
         newp[nn] = b->pieces[ei];
         newp[nn].offset += eo;
         newp[nn].length -= eo;
-        newp[nn].line_count = bv_count_nl (bv_piece_data (b, &newp[nn]),
-                                           newp[nn].length);
+        newp[nn].line_count = bv_piece_nl (b, &b->pieces[ei], eo,
+                                           b->pieces[ei].length);
         nn++;
     }
 
@@ -479,6 +511,13 @@ bv_replace_span (bv_pt_buffer *b, size_t start, size_t end,
         memcpy (b->pieces + remove_start, newp, nn * sizeof *newp);
     b->n_pieces = new_count;
     bv_recount (b);
+    /* Inserting text into the empty unterminated last line consumes it.
+     * Edits before it, and an inserted newline, leave it present. */
+    if (b->empty_last_line && b->total_len) {
+        const bv_pt_piece *last = &b->pieces[b->n_pieces - 1];
+        if (bv_piece_data (b, last)[last->length - 1] != '\n')
+            b->empty_last_line = 0;
+    }
     b->dirty = 1;
     return 0;
 }
@@ -588,7 +627,7 @@ bv_pt_save (const bv_pt_buffer *b, const char *path)
 /* ---- snapshot / undo ---------------------------------------------- */
 
 static int
-bv_snapshot_push (bv_pt_stack *u, const bv_pt_buffer *b)
+bv_snapshot_push (bv_pt_stack *u, const bv_pt_buffer *b, size_t cur)
 {
     if (u->n == u->cap) {
         size_t nc = u->cap ? u->cap * 2 : 16;
@@ -607,7 +646,9 @@ bv_snapshot_push (bv_pt_stack *u, const bv_pt_buffer *b)
     s->n_pieces = b->n_pieces;
     s->total_len = b->total_len;
     s->total_lines = b->total_lines;
+    s->empty_last_line = b->empty_last_line;
     s->dirty = b->dirty;
+    s->cur = cur;
     return 0;
 }
 
@@ -620,16 +661,18 @@ bv_snapshot_restore (bv_pt_buffer *b, bv_pt_snapshot *s)
     b->n_pieces  = s->n_pieces;
     b->total_len = s->total_len;
     b->total_lines = s->total_lines;
+    b->empty_last_line = s->empty_last_line;
     b->dirty = s->dirty;
     return 0;
 }
 
 static int
-bv_snapshot_pop_restore (bv_pt_stack *u, bv_pt_buffer *b)
+bv_snapshot_pop_restore (bv_pt_stack *u, bv_pt_buffer *b, size_t *cur)
 {
     if (u->n == 0) return -1;
     bv_pt_snapshot s = u->v[--u->n];
     int rc = bv_snapshot_restore (b, &s);
+    if (rc == 0 && cur) *cur = s.cur;
     free (s.pieces);
     return rc;
 }
@@ -649,23 +692,32 @@ static int
 bv_history_mark (bv_state *st)
 {
     bv_stack_free (&st->redo);
-    return bv_snapshot_push (&st->undo, &st->pt);
+    return bv_snapshot_push (&st->undo, &st->pt, st->cur);
 }
 
+static void bv_cursor_normalize (void);
+
+/* Undo and redo restore the cursor saved with the snapshot (the
+ * position before the edit for undo, after it for redo), then clamp
+ * it: the restored text may be shorter than when it was recorded. */
 static int
 bv_history_undo (bv_state *st)
 {
     if (st->undo.n == 0) return -1;
-    if (bv_snapshot_push (&st->redo, &st->pt) < 0) return -1;
-    return bv_snapshot_pop_restore (&st->undo, &st->pt);
+    if (bv_snapshot_push (&st->redo, &st->pt, st->cur) < 0) return -1;
+    if (bv_snapshot_pop_restore (&st->undo, &st->pt, &st->cur) < 0) return -1;
+    bv_cursor_normalize ();
+    return 0;
 }
 
 static int
 bv_history_redo (bv_state *st)
 {
     if (st->redo.n == 0) return -1;
-    if (bv_snapshot_push (&st->undo, &st->pt) < 0) return -1;
-    return bv_snapshot_pop_restore (&st->redo, &st->pt);
+    if (bv_snapshot_push (&st->undo, &st->pt, st->cur) < 0) return -1;
+    if (bv_snapshot_pop_restore (&st->redo, &st->pt, &st->cur) < 0) return -1;
+    bv_cursor_normalize ();
+    return 0;
 }
 
 /* ---- text geometry ------------------------------------------------ */
@@ -703,28 +755,97 @@ bv_prev_line_start (const bv_pt_buffer *b, size_t pos)
     return bv_line_start (b, ls - 1);
 }
 
+/* 0-based line containing `pos`. Whole pieces are skipped through
+ * their cached newline counts; only the piece holding `pos` is
+ * scanned. */
 static size_t
 bv_line_number (const bv_pt_buffer *b, size_t pos)
 {
     if (pos > b->total_len) pos = b->total_len;
-    size_t n = 0;
-    for (size_t i = 0; i < pos; i++)
-        if (bv_byte_at (b, i) == '\n') n++;
+    size_t n = 0, cur = 0;
+    for (size_t i = 0; i < b->n_pieces && cur < pos; i++) {
+        size_t len = b->pieces[i].length;
+        if (cur + len <= pos) {
+            n += b->pieces[i].line_count;
+        } else {
+            n += bv_piece_nl (b, &b->pieces[i], 0, pos - cur);
+        }
+        cur += len;
+    }
     return n;
 }
 
+/* Byte offset of the start of 0-based `line`, or total_len when the
+ * buffer has fewer lines. */
 static size_t
 bv_line_to_pos (const bv_pt_buffer *b, size_t line)
 {
-    size_t cur = 0, count = 0;
-    while (cur < b->total_len && count < line) {
-        if (bv_byte_at (b, cur) == '\n') count++;
-        cur++;
+    if (line == 0) return 0;
+    size_t count = 0, cur = 0;
+    for (size_t i = 0; i < b->n_pieces; i++) {
+        const bv_pt_piece *pc = &b->pieces[i];
+        if (count + pc->line_count < line) {
+            count += pc->line_count;
+            cur += pc->length;
+            continue;
+        }
+        const char *d = bv_piece_data (b, pc);
+        for (size_t j = 0; j < pc->length; j++) {
+            if (d[j] == '\n' && ++count == line) return cur + j + 1;
+        }
+        cur += pc->length;
     }
-    return cur;
+    return b->total_len;
 }
 
-/* Move cursor on the same line by `delta` bytes, clamped to the line. */
+/* Number of real lines. A final newline terminates the last line
+ * rather than starting another one, so "a\n" has one line and the
+ * empty buffer has none. Deletion can expose an empty unterminated
+ * last line: its presence is state, not an extra stored newline. */
+static size_t
+bv_nlines (const bv_pt_buffer *b)
+{
+    if (b->total_len == 0) return b->empty_last_line ? 1 : 0;
+    return b->total_lines
+         + (b->empty_last_line || bv_byte_at (b, b->total_len - 1) != '\n' ? 1 : 0);
+}
+
+/* Start of the last real line (0 for the empty buffer). */
+static size_t
+bv_last_line_start (const bv_pt_buffer *b)
+{
+    if (b->empty_last_line) return b->total_len;
+    if (b->total_len == 0) return 0;
+    size_t end = b->total_len;
+    if (bv_byte_at (b, end - 1) == '\n') end--;
+    return bv_line_start (b, end);
+}
+
+/* UTF-8 continuation bytes never start a character; cursor motion and
+ * x step over them so a multibyte character moves and deletes whole. */
+static int
+bv_is_cont (char c)
+{
+    return ((unsigned char) c & 0xC0) == 0x80;
+}
+
+static size_t
+bv_char_start (const bv_pt_buffer *b, size_t pos, size_t ls)
+{
+    while (pos > ls && bv_is_cont (bv_byte_at (b, pos))) pos--;
+    return pos;
+}
+
+static size_t
+bv_char_next (const bv_pt_buffer *b, size_t pos, size_t le)
+{
+    if (pos >= le) return le;
+    pos++;
+    while (pos < le && bv_is_cont (bv_byte_at (b, pos))) pos++;
+    return pos;
+}
+
+/* Clamp a position onto its line, on a character boundary. */
 static size_t
 bv_clamp_to_line (const bv_pt_buffer *b, size_t pos)
 {
@@ -733,9 +854,43 @@ bv_clamp_to_line (const bv_pt_buffer *b, size_t pos)
     if (pos > le) pos = le;
     if (pos < ls) pos = ls;
     /* On non-empty lines, normal-mode cursor cannot sit on the
-     * newline char itself — clamp one byte left. */
+     * newline char itself — clamp one character left. */
     if (pos == le && le > ls) pos = le - 1;
-    return pos;
+    return bv_char_start (b, pos, ls);
+}
+
+/* First non-blank character of the line containing `pos`. */
+static size_t
+bv_first_nonblank (const bv_pt_buffer *b, size_t pos)
+{
+    size_t p = bv_line_start (b, pos);
+    size_t le = bv_line_end (b, p);
+    while (p < le && (bv_byte_at (b, p) == ' ' || bv_byte_at (b, p) == '\t'))
+        p++;
+    return bv_clamp_to_line (b, p);
+}
+
+/* Keep the cursor on a real line after any edit or restore. The offset
+ * just past a final newline is not a line (unless deletion exposed an
+ * empty unterminated last line): an edit that leaves the
+ * cursor there (dd of the last line, undo to shorter text, :N past the
+ * end) moves it to the new last line, as vi does. */
+static void
+bv_cursor_normalize (void)
+{
+    const bv_pt_buffer *b = &bv_st.pt;
+    if (b->total_len == 0) { bv_st.cur = 0; return; }
+    if (b->empty_last_line && bv_st.cur >= b->total_len) {
+        bv_st.cur = b->total_len;
+        return;
+    }
+    if (bv_st.cur >= b->total_len) {
+        if (bv_byte_at (b, b->total_len - 1) == '\n')
+            bv_st.cur = bv_line_start (b, b->total_len - 1);
+        else
+            bv_st.cur = bv_line_start (b, b->total_len);
+    }
+    bv_st.cur = bv_clamp_to_line (b, bv_st.cur);
 }
 
 /* ---- motions ------------------------------------------------------ */
@@ -747,7 +902,7 @@ bv_motion_left (size_t pos)
 {
     if (pos == 0) return 0;
     size_t ls = bv_line_start (&bv_st.pt, pos);
-    if (pos > ls) return pos - 1;
+    if (pos > ls) return bv_char_start (&bv_st.pt, pos - 1, ls);
     return pos;
 }
 
@@ -755,11 +910,10 @@ static size_t
 bv_motion_right (size_t pos)
 {
     size_t le = bv_line_end (&bv_st.pt, pos);
-    if (pos + 1 < le) return pos + 1;
-    /* On non-empty line, cap one before newline. */
-    if (le > bv_line_start (&bv_st.pt, pos))
-        return le - 1;
-    return pos;
+    size_t next = bv_char_next (&bv_st.pt, pos, le);
+    if (next < le) return next;
+    /* On non-empty line, cap on the last character. */
+    return bv_clamp_to_line (&bv_st.pt, pos);
 }
 
 static size_t
@@ -768,14 +922,9 @@ bv_motion_down (size_t pos)
     size_t ls = bv_line_start (&bv_st.pt, pos);
     size_t col = pos - ls;
     size_t nl  = bv_next_line (&bv_st.pt, pos);
-    if (nl == bv_st.pt.total_len &&
-        bv_byte_at (&bv_st.pt, bv_st.pt.total_len - 1) != '\n')
-    {
-        /* file ends without trailing newline; staying-put is fine if
-         * there's no next line at all */
-        if (nl == ls) return pos;
-    }
-    if (nl >= bv_st.pt.total_len && bv_line_start (&bv_st.pt, nl) == ls)
+    /* No next line: either end of a file without a final newline or
+     * the offset past the final newline, which is not a line. */
+    if (nl >= bv_st.pt.total_len && !bv_st.pt.empty_last_line)
         return pos;
     size_t nle = bv_line_end (&bv_st.pt, nl);
     size_t target = nl + col;
@@ -819,6 +968,12 @@ bv_motion_w (size_t pos)
     /* Skip whitespace (incl. newlines). */
     while (pos < tot && isspace ((unsigned char) bv_byte_at (&bv_st.pt, pos)))
         pos++;
+    /* At EOF, stay on the last character (or real empty last line).
+     * Otherwise w after a tail delete reintroduces the phantom cursor
+     * and a following x silently does nothing. */
+    if (pos == tot && !bv_st.pt.empty_last_line)
+        return bv_clamp_to_line (&bv_st.pt,
+                                tot - (bv_byte_at (&bv_st.pt, tot - 1) == '\n'));
     return pos;
 }
 
@@ -849,21 +1004,21 @@ bv_motion_dollar (size_t pos)
 {
     size_t ls = bv_line_start (&bv_st.pt, pos);
     size_t le = bv_line_end   (&bv_st.pt, pos);
-    if (le > ls) return le - 1;
+    if (le > ls) return bv_char_start (&bv_st.pt, le - 1, ls);
     return ls;
 }
 
+/* G goes to the last line, [N]G to line N (1-based, clamped), both on
+ * the first non-blank. Trailing empty lines are real lines. */
 static size_t
-bv_motion_G (size_t pos)
+bv_motion_G (size_t line)
 {
-    /* Last non-empty line, col 0. */
-    (void) pos;
-    if (bv_st.pt.total_len == 0) return 0;
-    size_t last_ls = bv_st.pt.total_len;
-    /* Walk back over trailing newlines to find the last meaningful line. */
-    while (last_ls > 0 && bv_byte_at (&bv_st.pt, last_ls - 1) == '\n')
-        last_ls--;
-    return bv_line_start (&bv_st.pt, last_ls > 0 ? last_ls - 1 : 0);
+    size_t n = bv_nlines (&bv_st.pt);
+    if (n == 0) return 0;
+    if (line == 0 || line >= n)
+        return bv_first_nonblank (&bv_st.pt, bv_last_line_start (&bv_st.pt));
+    return bv_first_nonblank (&bv_st.pt,
+                              bv_line_to_pos (&bv_st.pt, line - 1));
 }
 
 /* ---- edits -------------------------------------------------------- */
@@ -909,65 +1064,176 @@ bv_yank_range (size_t start, size_t end, int is_line)
     return bv_st.yank ? 0 : -1;
 }
 
+/* [count]x: delete up to `count` characters from the cursor, never
+ * the line's newline. */
 static int
-bv_cmd_x (void)
+bv_cmd_x (size_t count)
 {
     if (bv_st.cur >= bv_st.pt.total_len) return 0;
     if (bv_byte_at (&bv_st.pt, bv_st.cur) == '\n') return 0;
+    size_t le = bv_line_end (&bv_st.pt, bv_st.cur);
+    size_t end = bv_st.cur;
+    for (size_t i = 0; i < count && end < le; i++)
+        end = bv_char_next (&bv_st.pt, end, le);
     bv_history_mark (&bv_st);
-    if (bv_delete_range (bv_st.cur, bv_st.cur + 1) < 0) return -1;
+    if (bv_delete_range (bv_st.cur, end) < 0) return -1;
     bv_st.cur = bv_clamp_to_line (&bv_st.pt, bv_st.cur);
     return 0;
 }
 
-static int
-bv_cmd_dd (void)
+/* End offset of `count` whole lines starting at line start `ls`. */
+static size_t
+bv_lines_end (size_t ls, size_t count)
 {
-    size_t ls = bv_line_start (&bv_st.pt, bv_st.cur);
-    size_t nl = bv_next_line  (&bv_st.pt, bv_st.cur);
-    bv_history_mark (&bv_st);
-    if (bv_yank_range (ls, nl, 1) < 0) return -1;
-    if (bv_replace_span (&bv_st.pt, ls, nl, NULL, 0) < 0) return -1;
-    if (bv_st.cur > bv_st.pt.total_len) bv_st.cur = bv_st.pt.total_len;
-    bv_st.cur = bv_line_start (&bv_st.pt, bv_st.cur);
-    bv_st.cur = bv_clamp_to_line (&bv_st.pt, bv_st.cur);
+    size_t end = ls;
+    for (size_t i = 0; i < count && end < bv_st.pt.total_len; i++)
+        end = bv_next_line (&bv_st.pt, end);
+    return end;
+}
+
+/* Yank lines [ls, end) linewise. The register always ends in a newline
+ * so a put recreates whole lines even when the last line had none. */
+static int
+bv_yank_lines (size_t ls, size_t end, int empty_tail)
+{
+    if (bv_yank_range (ls, end, 1) < 0) return -1;
+    if (empty_tail || bv_st.yank_len == 0 || bv_st.yank[bv_st.yank_len - 1] != '\n') {
+        char *ny = realloc (bv_st.yank, bv_st.yank_len + 2);
+        if (!ny) return -1;
+        ny[bv_st.yank_len++] = '\n';
+        ny[bv_st.yank_len] = '\0';
+        bv_st.yank = ny;
+    }
     return 0;
 }
 
+/* Delete `count` lines starting with the line containing `pos`; fewer
+ * when the buffer ends first. Returns the number of lines deleted, 0
+ * on the empty buffer (nothing to delete, no undo step), -1 on error.
+ * The cursor lands on the first non-blank of the line that followed,
+ * or of the new last line when the deletion reached the end. */
 static int
-bv_cmd_yy (void)
+bv_delete_lines (size_t pos, size_t count)
 {
-    size_t ls = bv_line_start (&bv_st.pt, bv_st.cur);
-    size_t nl = bv_next_line  (&bv_st.pt, bv_st.cur);
-    return bv_yank_range (ls, nl, 1);
+    bv_pt_buffer *b = &bv_st.pt;
+    if (bv_nlines (b) == 0 || count == 0) return 0;
+    size_t ls = bv_line_start (b, pos);
+    if (ls >= b->total_len && !b->empty_last_line) ls = bv_last_line_start (b);
+    size_t end = bv_lines_end (ls, count);
+    size_t start = ls;
+    /* Byte endpoints alone cannot tell whether a range includes an
+     * empty unterminated tail. Its predecessor ends at the same offset.
+     * Only consult line counts in that exceptional state; ordinary dd
+     * keeps the short scan used for large mapped files. */
+    int through_tail = end == b->total_len
+        && (!b->empty_last_line
+            || count > b->total_lines - bv_line_number (b, ls));
+    int no_eol = b->empty_last_line
+        || (b->total_len && bv_byte_at (b, b->total_len - 1) != '\n');
+    int empty_tail = b->empty_last_line && through_tail;
+    /* The final line has no newline: take the previous line's newline
+     * with it so the remaining last line keeps the missing-EOL state. */
+    if (through_tail && no_eol && ls > 0)
+        start = ls - 1;
+    int keep_empty = through_tail
+        ? (no_eol && ls > 0 && (start == 0 || bv_byte_at (b, start - 1) == '\n'))
+        : b->empty_last_line;
+    if (bv_history_mark (&bv_st) < 0) return -1;
+    if (bv_yank_lines (ls, end, empty_tail) < 0) return -1;
+    /* The register holds whole newline-terminated lines. */
+    size_t deleted = bv_count_nl (bv_st.yank, bv_st.yank_len);
+    if (bv_replace_span (b, start, end, NULL, 0) < 0) return -1;
+    b->empty_last_line = keep_empty;
+    bv_st.cur = start;
+    bv_cursor_normalize ();
+    bv_st.cur = bv_first_nonblank (b, bv_st.cur);
+    return (int) (deleted > 0x7fffffff ? 0x7fffffff : deleted);
+}
+
+/* A count beyond the last line is clamped, except that a count above
+ * one on the last line itself fails without changing anything (vi
+ * cannot move the cursor down to extend the range). */
+static int
+bv_count_fits (size_t count)
+{
+    return count <= 1
+        || bv_next_line (&bv_st.pt, bv_st.cur) < bv_st.pt.total_len
+        || (bv_st.pt.empty_last_line && bv_st.cur < bv_st.pt.total_len);
 }
 
 static int
-bv_cmd_p (int before)
+bv_cmd_dd (size_t count)
+{
+    if (!bv_count_fits (count)) return -1;
+    return bv_delete_lines (bv_st.cur, count) < 0 ? -1 : 0;
+}
+
+static int
+bv_cmd_yy (size_t count)
+{
+    if (bv_nlines (&bv_st.pt) == 0) return 0;
+    if (!bv_count_fits (count)) return -1;
+    size_t ls = bv_line_start (&bv_st.pt, bv_st.cur);
+    int empty_tail = bv_st.pt.empty_last_line
+        && count > bv_st.pt.total_lines - bv_line_number (&bv_st.pt, ls);
+    return bv_yank_lines (ls, bv_lines_end (ls, count), empty_tail);
+}
+
+/* [count]p / [count]P. A linewise put after a last line that lacks a
+ * newline supplies the separator itself and leaves the new last line
+ * without one, so the buffer's EOL state is unchanged. */
+static int
+bv_cmd_p (int before, size_t count)
 {
     if (!bv_st.yank || bv_st.yank_len == 0) return 0;
-    bv_history_mark (&bv_st);
+    if (count == 0) count = 1;
+    if (bv_st.yank_len > ((size_t) -1 - 2) / count) return -1;
+    size_t n = bv_st.yank_len * count;
+    char *text = malloc (n + 1);
+    if (!text) return -1;
+    for (size_t i = 0; i < count; i++)
+        memcpy (text + i * bv_st.yank_len, bv_st.yank, bv_st.yank_len);
+    bv_pt_buffer *b = &bv_st.pt;
+    if (bv_history_mark (&bv_st) < 0) { free (text); return -1; }
     size_t insert_at;
+    int rc = 0;
     if (bv_st.yank_is_line) {
         if (before)
-            insert_at = bv_line_start (&bv_st.pt, bv_st.cur);
+            insert_at = bv_line_start (b, bv_st.cur);
         else
-            insert_at = bv_next_line  (&bv_st.pt, bv_st.cur);
-        if (bv_insert_at (insert_at, bv_st.yank, bv_st.yank_len) < 0) return -1;
+            insert_at = bv_next_line  (b, bv_st.cur);
+        if (!before && insert_at == b->total_len &&
+            ((b->empty_last_line && bv_st.cur == b->total_len) ||
+             (!b->empty_last_line && b->total_len > 0 &&
+             bv_byte_at (b, b->total_len - 1) != '\n')))
+        {
+            memmove (text + 1, text, n - 1);
+            text[0] = '\n';
+            rc = bv_insert_at (insert_at, text, n);
+            if (rc == 0)
+                b->empty_last_line = text[n - 1] == '\n';
+            insert_at++;
+        } else {
+            rc = bv_insert_at (insert_at, text, n);
+        }
         bv_st.cur = insert_at;
-        bv_st.cur = bv_clamp_to_line (&bv_st.pt, bv_st.cur);
+        bv_cursor_normalize ();
+        bv_st.cur = bv_first_nonblank (b, bv_st.cur);
     } else {
         if (before)
             insert_at = bv_st.cur;
         else
-            insert_at = (bv_st.cur < bv_st.pt.total_len &&
-                         bv_byte_at (&bv_st.pt, bv_st.cur) != '\n')
-                       ? bv_st.cur + 1 : bv_st.cur;
-        if (bv_insert_at (insert_at, bv_st.yank, bv_st.yank_len) < 0) return -1;
-        bv_st.cur = insert_at + bv_st.yank_len - 1;
-        bv_st.cur = bv_clamp_to_line (&bv_st.pt, bv_st.cur);
+            insert_at = (bv_st.cur < b->total_len &&
+                         bv_byte_at (b, bv_st.cur) != '\n')
+                       ? bv_char_next (b, bv_st.cur,
+                                       bv_line_end (b, bv_st.cur))
+                       : bv_st.cur;
+        rc = bv_insert_at (insert_at, text, n);
+        bv_st.cur = insert_at + n - 1;
+        bv_cursor_normalize ();
     }
-    return 0;
+    free (text);
+    return rc;
 }
 
 static int
@@ -996,7 +1262,8 @@ bv_enter_insert (int after_cursor)
     bv_history_mark (&bv_st);
     if (after_cursor && bv_st.cur < bv_st.pt.total_len &&
         bv_byte_at (&bv_st.pt, bv_st.cur) != '\n')
-        bv_st.cur++;
+        bv_st.cur = bv_char_next (&bv_st.pt, bv_st.cur,
+                                  bv_line_end (&bv_st.pt, bv_st.cur));
     bv_st.mode = BV_MODE_INSERT;
     bv_st.last_insert_len = 0;
     return 0;
@@ -1192,22 +1459,170 @@ bv_ex_edit (const char *path, int bang)
     return 0;
 }
 
+/* Parse a decimal number of at most BV_COUNT_MAX. */
+static size_t
+bv_ex_number (const char **pp)
+{
+    size_t n = 0;
+    while (**pp >= '0' && **pp <= '9') {
+        n = n * 10 + (size_t) (**pp - '0');
+        if (n > BV_COUNT_MAX) n = BV_COUNT_MAX;
+        (*pp)++;
+    }
+    return n;
+}
+
+/* One ex address: N, '.', '$' or nothing, then any +N / -N offsets.
+ * Lines are 1-based; the empty buffer counts as one empty line, as in
+ * vi. Returns 1 when an address was present, 0 when not, -1 when it
+ * resolves before line 0. */
+static int
+bv_ex_address (const char **pp, size_t *out)
+{
+    const char *p = *pp;
+    size_t last = bv_nlines (&bv_st.pt);
+    long long line;
+    int seen = 1;
+    if (last == 0) last = 1;
+    if (*p >= '0' && *p <= '9') {
+        line = (long long) bv_ex_number (&p);
+    } else if (*p == '.') {
+        line = (long long) bv_line_number (&bv_st.pt, bv_st.cur) + 1; p++;
+    } else if (*p == '$') {
+        line = (long long) last; p++;
+    } else if (*p == '+' || *p == '-') {
+        line = (long long) bv_line_number (&bv_st.pt, bv_st.cur) + 1;
+    } else {
+        seen = 0;
+        line = 0;
+    }
+    while (seen && (*p == '+' || *p == '-')) {
+        int sign = *p++ == '+' ? 1 : -1;
+        long long off = (*p >= '0' && *p <= '9')
+                      ? (long long) bv_ex_number (&p) : 1;
+        line += sign * off;
+    }
+    *pp = p;
+    if (!seen) return 0;
+    if (line < 0) return -1;
+    *out = (size_t) line;
+    return 1;
+}
+
+/* [range]d[elete] [x] [count]. Ranges must lie inside the buffer.
+ * There is one register: a register name is accepted and the text goes
+ * to the unnamed register, except that "_" (black hole) keeps it. */
+static int
+bv_ex_delete (int naddr, size_t a1, size_t a2, const char *rest)
+{
+    size_t last = bv_nlines (&bv_st.pt);
+    size_t cur_line = bv_line_number (&bv_st.pt, bv_st.cur) + 1;
+    if (naddr == 0) a1 = a2 = cur_line;
+    if (naddr == 1) a1 = a2;
+    while (*rest == ' ') rest++;
+    int blackhole = 0;
+    if (isalpha ((unsigned char) *rest) || *rest == '"' || *rest == '_') {
+        blackhole = *rest == '_';
+        rest++;
+        while (*rest == ' ') rest++;
+    }
+    if (*rest >= '0' && *rest <= '9') {
+        size_t count = bv_ex_number (&rest);
+        if (count == 0) {
+            bv_set_status ("E939: Positive count required");
+            return -1;
+        }
+        a1 = a2;
+        a2 = a1 + count - 1;
+        if (a2 > last) a2 = last ? last : 1;
+    }
+    while (*rest == ' ') rest++;
+    if (*rest) {
+        bv_set_status ("E488: Trailing characters: %s", rest);
+        return -1;
+    }
+    if (a1 > a2) {
+        bv_set_status ("E493: Backwards range given");
+        return -1;
+    }
+    if (a1 == 0) a1 = 1;
+    if (a2 > (last ? last : 1)) {
+        bv_set_status ("E16: Invalid range");
+        return -1;
+    }
+    if (last == 0) return 0;
+    size_t start = bv_line_to_pos (&bv_st.pt, a1 - 1);
+    char *keep = blackhole ? bv_st.yank : NULL;
+    size_t keep_len = bv_st.yank_len;
+    int keep_line = bv_st.yank_is_line;
+    if (blackhole) bv_st.yank = NULL;
+    int rc = bv_delete_lines (start, a2 - a1 + 1) < 0 ? -1 : 0;
+    if (blackhole) {
+        free (bv_st.yank);
+        bv_st.yank = keep;
+        bv_st.yank_len = keep_len;
+        bv_st.yank_is_line = keep_line;
+    }
+    return rc;
+}
+
 static int
 bv_ex_command (const char *line)
 {
     /* Skip leading colon already consumed by caller. */
     while (*line == ' ') line++;
 
-    /* Numeric jump: :N */
-    if (*line >= '0' && *line <= '9') {
-        char *end = NULL;
-        long n = strtol (line, &end, 10);
-        if (n < 1) n = 1;
-        size_t ln = (size_t) (n - 1);
-        if (ln > bv_st.pt.total_lines) ln = bv_st.pt.total_lines;
-        bv_st.cur = bv_line_to_pos (&bv_st.pt, ln);
-        bv_st.cur = bv_clamp_to_line (&bv_st.pt, bv_st.cur);
-        (void) end;
+    /* Optional range: %, ADDR or ADDR,ADDR. */
+    size_t a1 = 0, a2 = 0;
+    int naddr = 0;
+    if (*line == '%') {
+        line++;
+        a1 = 1;
+        a2 = bv_nlines (&bv_st.pt);
+        if (a2 == 0) a2 = 1;
+        naddr = 2;
+    } else {
+        int r = bv_ex_address (&line, &a2);
+        if (r < 0) { bv_set_status ("E16: Invalid range"); return -1; }
+        if (r > 0) naddr = 1;
+        if (r > 0 && *line == ',') {
+            line++;
+            a1 = a2;
+            r = bv_ex_address (&line, &a2);
+            if (r < 0) { bv_set_status ("E16: Invalid range"); return -1; }
+            if (r == 0) { bv_set_status ("E14: Invalid address"); return -1; }
+            naddr = 2;
+        }
+    }
+    while (*line == ' ') line++;
+
+    /* A bare address moves to that line, clamped to the buffer. */
+    if (naddr && *line == '\0') {
+        bv_st.cur = bv_motion_G (a2 ? a2 : 1);
+        return 0;
+    }
+
+    if (*line == 'd') {
+        const char *w = line;
+        size_t wn = 0;
+        while (w[wn] >= 'a' && w[wn] <= 'z') wn++;
+        if (wn <= 6 && strncmp (w, "delete", wn) == 0)
+            return bv_ex_delete (naddr, a1, a2, w + wn);
+    }
+    if (naddr) {
+        bv_set_status ("E481: No range allowed");
+        return -1;
+    }
+    if (strcmp (line, "u") == 0 || strcmp (line, "un") == 0
+        || strcmp (line, "und") == 0 || strcmp (line, "undo") == 0)
+    {
+        if (bv_history_undo (&bv_st) < 0)
+            bv_set_status ("Already at oldest change");
+        return 0;
+    }
+    if (strcmp (line, "red") == 0 || strcmp (line, "redo") == 0) {
+        if (bv_history_redo (&bv_st) < 0)
+            bv_set_status ("Already at newest change");
         return 0;
     }
 
@@ -1255,11 +1670,11 @@ bv_ex_command (const char *line)
             bv_set_status ("E37: No write since last change (add ! to override)");
             return -1;
         }
-        bv_st.quit = 1; bv_st.rc = 0; return 0;
+        bv_st.quit = 1; return 0;
     }
     if (strcmp (verb, "wq") == 0 || strcmp (verb, "x") == 0) {
         if (bv_ex_write (p) < 0) return -1;
-        bv_st.quit = 1; bv_st.rc = 0; return 0;
+        bv_st.quit = 1; return 0;
     }
     bv_set_status ("E492: Not an editor command: %s", verb);
     return -1;
@@ -1267,23 +1682,38 @@ bv_ex_command (const char *line)
 
 /* ---- repeat (.) --------------------------------------------------- */
 
+/* `count` is the count typed before '.', or 0 to reuse the count of
+ * the repeated command. */
 static int
-bv_repeat (void)
+bv_repeat (size_t count)
 {
     if (bv_st.last_op_cmd == 0) return 0;
+    if (count == 0) count = bv_st.last_count ? bv_st.last_count : 1;
+    bv_st.last_count = count;
     switch (bv_st.last_op_cmd) {
     case 'x':
-        return bv_cmd_x ();
+        return bv_cmd_x (count);
     case 'd':
-        return bv_cmd_dd ();
+        return bv_cmd_dd (count);
     case 'p':
-        return bv_cmd_p (0);
+        return bv_cmd_p (0, count);
     case 'P':
-        return bv_cmd_p (1);
+        return bv_cmd_p (1, count);
     case 'o':
         return bv_open_line (1);
     case 'O':
         return bv_open_line (0);
+    case 'A':
+        if (bv_st.last_insert_len > 0) {
+            bv_history_mark (&bv_st);
+            bv_st.cur = bv_line_end (&bv_st.pt, bv_st.cur);
+            if (bv_insert_at (bv_st.cur, bv_st.last_insert_text,
+                              bv_st.last_insert_len) < 0) return -1;
+            bv_st.cur += bv_st.last_insert_len;
+            bv_st.cur = bv_motion_left (bv_st.cur);
+            bv_cursor_normalize ();
+        }
+        return 0;
     case 'i':
     case 'a':
         if (bv_st.last_insert_len > 0) {
@@ -1409,12 +1839,10 @@ bv_render (int fd)
     int num_w = bv_st.show_line_numbers ? 5 : 0;
 
     size_t pos = bv_line_to_pos (&bv_st.pt, bv_st.top_line);
+    size_t nlines = bv_nlines (&bv_st.pt);
     for (int r = 0; r < text_rows; r++) {
         size_t line_no = bv_st.top_line + (size_t) r;
-        if (line_no >= bv_st.pt.total_lines &&
-            (bv_st.pt.total_len == 0 ||
-             bv_byte_at (&bv_st.pt, bv_st.pt.total_len - 1) == '\n'))
-        {
+        if (line_no >= nlines) {
             bv_writef (fd, "~");
         } else {
             if (bv_st.show_line_numbers)
@@ -1458,57 +1886,91 @@ bv_render (int fd)
 
 /* ---- dispatch ---------------------------------------------------- */
 
-/* Pending operator state for two-char commands (dd, yy). */
+/* Pending operator state for two-char commands (dd, yy) and the
+ * count typed before a command ([N]dd) or inside it (d[N]d). */
 typedef struct {
     char pending;        /* 0, 'd', 'y' */
+    size_t count;        /* digits typed so far, 0 = none */
+    size_t op_count;     /* count typed before the pending operator */
     char insert_buf[4096];
     size_t insert_len;
 } bv_pending;
 
 static bv_pending bv_pend;
 
+
 /* Apply a single decoded key in NORMAL mode. */
 static void
 bv_normal_key (int fd, int key)
 {
+    (void) fd;
+    if ((key >= '1' && key <= '9') || (key == '0' && bv_pend.count)) {
+        size_t c = bv_pend.count * 10 + (size_t) (key - '0');
+        bv_pend.count = c > BV_COUNT_MAX ? BV_COUNT_MAX : c;
+        return;
+    }
+    size_t typed = bv_pend.count;
+    size_t count = typed ? typed : 1;
+    bv_pend.count = 0;
     if (bv_pend.pending) {
+        size_t total = (bv_pend.op_count ? bv_pend.op_count : 1) * count;
+        if (total > BV_COUNT_MAX) total = BV_COUNT_MAX;
         if (bv_pend.pending == 'd' && key == 'd') {
-            bv_cmd_dd ();
+            bv_cmd_dd (total);
             bv_st.last_op_cmd = 'd';
+            bv_st.last_count = total;
         } else if (bv_pend.pending == 'y' && key == 'y') {
-            bv_cmd_yy ();
-            bv_st.last_op_cmd = 'y';
+            bv_cmd_yy (total);
         }
         bv_pend.pending = 0;
+        bv_pend.op_count = 0;
         return;
     }
     switch (key) {
-    case 'h': case BV_KEY_LEFT:  bv_st.cur = bv_motion_left  (bv_st.cur); break;
-    case 'l': case BV_KEY_RIGHT: bv_st.cur = bv_motion_right (bv_st.cur); break;
-    case 'j': case BV_KEY_DOWN:  bv_st.cur = bv_motion_down  (bv_st.cur); break;
-    case 'k': case BV_KEY_UP:    bv_st.cur = bv_motion_up    (bv_st.cur); break;
+    case 'h': case BV_KEY_LEFT:
+        for (size_t i = 0; i < count; i++) bv_st.cur = bv_motion_left (bv_st.cur);
+        break;
+    case 'l': case BV_KEY_RIGHT:
+        for (size_t i = 0; i < count; i++) bv_st.cur = bv_motion_right (bv_st.cur);
+        break;
+    case 'j': case BV_KEY_DOWN:
+        for (size_t i = 0; i < count; i++) bv_st.cur = bv_motion_down (bv_st.cur);
+        break;
+    case 'k': case BV_KEY_UP:
+        for (size_t i = 0; i < count; i++) bv_st.cur = bv_motion_up (bv_st.cur);
+        break;
     case 'w': bv_st.cur = bv_motion_w (bv_st.cur); break;
     case 'b': bv_st.cur = bv_motion_b (bv_st.cur); break;
     case '0': case BV_KEY_HOME: bv_st.cur = bv_motion_0 (bv_st.cur); break;
     case '$': case BV_KEY_END:  bv_st.cur = bv_motion_dollar (bv_st.cur); break;
-    case 'G': bv_st.cur = bv_motion_G (bv_st.cur); break;
+    case 'G': bv_st.cur = bv_motion_G (typed); break;
     case 'x':
-        bv_cmd_x (); bv_st.last_op_cmd = 'x'; break;
+        bv_cmd_x (count); bv_st.last_op_cmd = 'x'; bv_st.last_count = count; break;
     case 'd':
-        bv_pend.pending = 'd'; break;
+        bv_pend.pending = 'd'; bv_pend.op_count = typed; break;
     case 'y':
-        bv_pend.pending = 'y'; break;
-    case 'p': bv_cmd_p (0); bv_st.last_op_cmd = 'p'; break;
-    case 'P': bv_cmd_p (1); bv_st.last_op_cmd = 'P'; break;
+        bv_pend.pending = 'y'; bv_pend.op_count = typed; break;
+    case 'p':
+        bv_cmd_p (0, count); bv_st.last_op_cmd = 'p'; bv_st.last_count = count; break;
+    case 'P':
+        bv_cmd_p (1, count); bv_st.last_op_cmd = 'P'; bv_st.last_count = count; break;
     case 'o': bv_open_line (1); bv_st.last_op_cmd = 'o'; bv_pend.insert_len = 0; break;
     case 'O': bv_open_line (0); bv_st.last_op_cmd = 'O'; bv_pend.insert_len = 0; break;
     case 'i': bv_enter_insert (0); bv_st.last_op_cmd = 'i'; bv_pend.insert_len = 0; break;
     case 'a': bv_enter_insert (1); bv_st.last_op_cmd = 'a'; bv_pend.insert_len = 0; break;
+    case 'A':
+        bv_st.cur = bv_line_end (&bv_st.pt, bv_st.cur);
+        bv_enter_insert (0); bv_st.last_op_cmd = 'A'; bv_pend.insert_len = 0; break;
     case 'v': bv_st.mode = BV_MODE_VISUAL; bv_st.visual_anchor = bv_st.cur; break;
-    case 'u': bv_history_undo (&bv_st); break;
+    case 'u':
+        for (size_t i = 0; i < count; i++)
+            if (bv_history_undo (&bv_st) < 0) break;
+        break;
     case 0x12: /* Ctrl-R */
-        bv_history_redo (&bv_st); break;
-    case '.': bv_repeat (); break;
+        for (size_t i = 0; i < count; i++)
+            if (bv_history_redo (&bv_st) < 0) break;
+        break;
+    case '.': bv_repeat (typed); break;
     case '/':
         bv_st.mode = BV_MODE_COMMAND;
         bv_pend.insert_buf[0] = '/';
@@ -1525,7 +1987,6 @@ bv_normal_key (int fd, int key)
     case 'N': bv_cmd_N (); break;
     case 'Z': /* "ZZ" — accept Z Z as :wq, but simplest: leave as no-op */ break;
     default:
-        (void) fd;
         break;
     }
 }
@@ -1543,8 +2004,11 @@ bv_insert_key (int fd, int key)
             bv_st.last_insert_len = bv_pend.insert_len;
         }
         bv_st.mode = BV_MODE_NORMAL;
-        if (bv_st.cur > 0)
-            bv_st.cur = bv_clamp_to_line (&bv_st.pt, bv_st.cur - 1);
+        /* Step back one character, but never off the start of the
+         * line: ESC on an empty line stays on that line. */
+        if (bv_st.cur > bv_line_start (&bv_st.pt, bv_st.cur))
+            bv_st.cur = bv_motion_left (bv_st.cur);
+        bv_cursor_normalize ();
         return;
     }
     if (key == BV_KEY_BS) {
@@ -1628,7 +2092,12 @@ bv_visual_key (int fd, int key)
     case 'x': {
         size_t a = bv_st.visual_anchor, c = bv_st.cur;
         if (a > c) { size_t t = a; a = c; c = t; }
-        if (c < bv_st.pt.total_len) c++;
+        /* Visual selection is inclusive of the character at either end.
+         * Include a newline on an empty line, but never split UTF-8. */
+        if (c < bv_st.pt.total_len) {
+            size_t le = bv_line_end (&bv_st.pt, c);
+            c = c < le ? bv_char_next (&bv_st.pt, c, le) : c + 1;
+        }
         bv_history_mark (&bv_st);
         if (key == 'y') {
             bv_yank_range (a, c, 0);
@@ -1636,7 +2105,7 @@ bv_visual_key (int fd, int key)
             bv_yank_range (a, c, 0);
             bv_replace_span (&bv_st.pt, a, c, NULL, 0);
             bv_st.cur = a;
-            bv_st.cur = bv_clamp_to_line (&bv_st.pt, bv_st.cur);
+            bv_cursor_normalize ();
         }
         bv_st.mode = BV_MODE_NORMAL;
         return;
@@ -1846,6 +2315,9 @@ bv_reset_state (void)
     free (bv_st.path);
     free (bv_st.yank);
     memset (&bv_st, 0, sizeof bv_st);
+    /* A key file may end mid-command ("3d"); never let that pending
+     * operator or count leak into the next invocation in this shell. */
+    memset (&bv_pend, 0, sizeof bv_pend);
 }
 
 static int
@@ -1905,9 +2377,9 @@ bv_selftest (void)
 
     /* 5. yank + put */
     bv_st.cur = bv_line_start (&bv_st.pt, 6);  /* start of 'world' line */
-    bv_cmd_yy ();
+    bv_cmd_yy (1);
     bv_st.cur = bv_line_start (&bv_st.pt, 0);
-    bv_cmd_p (0); /* p (after, so after line 1) */
+    bv_cmd_p (0, 1); /* p (after, so after line 1) */
     flat = bv_flatten (&bv_st.pt, &flat_len);
     /* "hello\n" + "world\n"? no — line "world" has no trailing newline so
      * yy yanked "world" (no \n). p (after) inserts on next line. Detail
@@ -1946,18 +2418,77 @@ bv_selftest (void)
     bv_reset_state ();
     bv_pt_init_text (&bv_st.pt, "one\ntwo\nthree\n", 14);
     bv_st.cur = 4;  /* "two" */
-    bv_cmd_dd ();
+    bv_cmd_dd (1);
     flat = bv_flatten (&bv_st.pt, &flat_len);
     fails += bv_tap (&n,
                      flat && flat_len == 10 && memcmp (flat, "one\nthree\n", 10) == 0,
                      "dd removes current line");
     free (flat);
 
+    /* 8b. G then repeated dd keeps deleting down to the empty buffer. */
+    bv_reset_state ();
+    bv_pt_init_text (&bv_st.pt, "one\ntwo\nthree\n", 14);
+    bv_st.cur = bv_motion_G (0);
+    int dd_ok = bv_st.cur == 8;
+    size_t lens[3] = { 8, 4, 0 };
+    for (int i = 0; i < 3; i++) {
+        dd_ok &= bv_cmd_dd (1) == 0 && bv_st.pt.total_len == lens[i]
+                 && bv_st.cur < (bv_st.pt.total_len ? bv_st.pt.total_len : 1)
+                 && bv_st.cur == bv_last_line_start (&bv_st.pt);
+    }
+    size_t undo_depth = bv_st.undo.n;
+    dd_ok &= bv_cmd_dd (1) == 0 && bv_st.undo.n == undo_depth && bv_st.cur == 0;
+    fails += bv_tap (&n, dd_ok,
+                     "G + dd clamps to the new last line until the buffer is empty");
+    bv_history_undo (&bv_st);
+    bv_history_undo (&bv_st);
+    flat = bv_flatten (&bv_st.pt, &flat_len);
+    fails += bv_tap (&n,
+                     flat && flat_len == 8 && memcmp (flat, "one\ntwo\n", 8) == 0
+                     && bv_st.cur == 4,
+                     "undo after dd at the end restores lines and cursor");
+    free (flat);
+
+    /* 8b'. Split counts taken from the shorter side stay exact. */
+    {
+        char big[400];
+        for (int i = 0; i < 100; i++) memcpy (big + i * 4, "ab\nc", 4);
+        bv_reset_state ();
+        bv_pt_init_text (&bv_st.pt, big, sizeof big);
+        int nl_ok = 1;
+        size_t cuts[][2] = { { 390, 395 }, { 3, 9 }, { 200, 203 }, { 0, 1 },
+                             { 100, 300 } };
+        for (size_t i = 0; i < sizeof cuts / sizeof cuts[0]; i++) {
+            bv_replace_span (&bv_st.pt, cuts[i][0], cuts[i][1], NULL, 0);
+            flat = bv_flatten (&bv_st.pt, &flat_len);
+            nl_ok &= flat && bv_count_nl (flat, flat_len) == bv_st.pt.total_lines
+                     && bv_line_number (&bv_st.pt, flat_len)
+                        == bv_count_nl (flat, flat_len)
+                     && bv_line_number (&bv_st.pt, flat_len / 3)
+                        == bv_count_nl (flat, flat_len / 3);
+            free (flat);
+        }
+        fails += bv_tap (&n, nl_ok, "piece newline counts stay exact across splits");
+    }
+
+    /* 8c. dd of a last line without a newline keeps the missing EOL. */
+    bv_reset_state ();
+    bv_pt_init_text (&bv_st.pt, "a\nb\nc", 5);
+    bv_st.cur = bv_motion_G (0);
+    bv_cmd_dd (1);
+    flat = bv_flatten (&bv_st.pt, &flat_len);
+    fails += bv_tap (&n,
+                     flat && flat_len == 3 && memcmp (flat, "a\nb", 3) == 0
+                     && bv_st.cur == 2 && bv_st.yank_len == 2
+                     && memcmp (bv_st.yank, "c\n", 2) == 0,
+                     "dd of a no-EOL last line keeps no-EOL and yanks a whole line");
+    free (flat);
+
     /* 9. x */
     bv_reset_state ();
     bv_pt_init_text (&bv_st.pt, "abcd\n", 5);
     bv_st.cur = 1;
-    bv_cmd_x ();
+    bv_cmd_x (1);
     flat = bv_flatten (&bv_st.pt, &flat_len);
     fails += bv_tap (&n,
                      flat && flat_len == 4 && memcmp (flat, "acd\n", 4) == 0,
@@ -2121,8 +2652,12 @@ vi_builtin (WORD_LIST *list)
                 builtin_error ("vi -c: COMMAND required");
                 return EX_USAGE;
             }
-            if (ncmds < (int) (sizeof cmds / sizeof cmds[0]))
-                cmds[ncmds++] = list->next->word->word;
+            if (ncmds == (int) (sizeof cmds / sizeof cmds[0])) {
+                builtin_error ("vi -c: too many commands (at most %d)",
+                               (int) (sizeof cmds / sizeof cmds[0]));
+                return EX_USAGE;
+            }
+            cmds[ncmds++] = list->next->word->word;
             list = list->next->next;
             continue;
         }
@@ -2234,12 +2769,15 @@ char *vi_doc[] = {
     "    -b, --binary  Bypass the binary-content tripwire and open files",
     "                  that contain NUL bytes (refused by default).",
     "",
-    "Modes: NORMAL (default), INSERT (i/a/o/O), COMMAND (:), VISUAL (v).",
+    "Modes: NORMAL (default), INSERT (i/a/A/o/O), COMMAND (:), VISUAL (v).",
     "Commands: h j k l, w, b, 0, $, G, [N]G,",
-    "          i a o O x dd yy p P, /pattern, n N,",
+    "          i a A o O x dd yy p P, /pattern, n N,",
     "          u (undo), Ctrl-R (redo), . (repeat),",
+    "          counts on h j k l x dd yy p P u Ctrl-R . (3dd, d3d),",
     "          :w :q :wq :q! :w PATH, :e :r :file,",
-    "          :set nu, :set nonu, :N.",
+    "          :set nu, :set nonu, :N, :$,",
+    "          :[range]d[elete] [N] (ranges N . $ % +N -N),",
+    "          :u[ndo], :red[o].",
     "",
     "Deferred: macros, marks, named registers, :substitute regex, syntax",
     "highlighting, plugins, complex motions (f/t/i-obj/a-obj).",

@@ -40,6 +40,7 @@
 #include <poll.h>
 #include <time.h>
 #include <fcntl.h>
+#include <math.h>
 
 #include "loadables.h"
 #include "command-run.h"
@@ -50,7 +51,7 @@ bto_parse_duration (const char *s, double *out)
 {
     char *end;
     double v = strtod (s, &end);
-    if (end == s || v < 0) return -1;
+    if (end == s || v < 0 || isnan (v)) return -1;
     if (*end == '\0') { *out = v; return 0; }
     if (end[1] != '\0') return -1;
     switch (*end) {
@@ -72,8 +73,9 @@ bto_parse_signal (const char *s)
     if (strncasecmp (p, "SIG", 3) == 0) p += 3;
     if (*p >= '0' && *p <= '9') {
         char *end;
+        errno = 0;
         long n = strtol (p, &end, 10);
-        if (*end != '\0') return -1;
+        if (errno || *end != '\0' || n < 0 || n >= NSIG) return -1;
         return (int) n;
     }
     if (strncasecmp (p, "RTMIN", 5) == 0) {
@@ -88,6 +90,7 @@ bto_parse_signal (const char *s)
         } else if (*tail != '\0') {
             return -1;
         }
+        if (off > SIGRTMAX - SIGRTMIN) return -1;
         long v = (long) SIGRTMIN + off;
         return (v >= SIGRTMIN && v <= SIGRTMAX) ? (int) v : -1;
     }
@@ -103,6 +106,7 @@ bto_parse_signal (const char *s)
         } else if (*tail != '\0') {
             return -1;
         }
+        if (off > SIGRTMAX - SIGRTMIN) return -1;
         long v = (long) SIGRTMAX - off;
         return (v >= SIGRTMIN && v <= SIGRTMAX) ? (int) v : -1;
     }
@@ -205,8 +209,8 @@ bto_restore (const sigset_t *prev, int pidfd)
 }
 
 /* Sleep until the child exits or remain elapses. pidfd+ppoll wakes
-   on our child without consuming SIGCHLD. Without a pidfd, sleep the
-   remaining time; waitpid (WNOHANG) at the top of the loop reaps. */
+   on our child without consuming SIGCHLD. Without a pidfd, cap each sleep
+   so waitpid can notice an early exit while SIGCHLD remains blocked. */
 static void
 bto_wait_remain (int pidfd, const struct timespec *remain)
 {
@@ -220,7 +224,12 @@ bto_wait_remain (int pidfd, const struct timespec *remain)
         return;
     }
     {
-        int rc = clock_nanosleep (CLOCK_MONOTONIC, 0, remain, NULL);
+        struct timespec interval = *remain;
+        if (interval.tv_sec > 0 || interval.tv_nsec > 50000000L) {
+            interval.tv_sec = 0;
+            interval.tv_nsec = 50000000L;
+        }
+        int rc = clock_nanosleep (CLOCK_MONOTONIC, 0, &interval, NULL);
         (void) rc;
     }
 }
@@ -372,6 +381,9 @@ timeout_builtin (WORD_LIST *list)
     sigaddset (&chld_set, SIGCHLD);
     sigprocmask (SIG_BLOCK, &chld_set, &prev_set);
 
+    maybe_make_export_env ();
+    fflush (stdout);
+    fflush (stderr);
     pid_t child = fork ();
     if (child < 0) {
         free (argv);
@@ -415,7 +427,7 @@ timeout_builtin (WORD_LIST *list)
     /* Parent: SIGCHLD stays blocked so Bash cannot steal this child, but
        we must not dequeue it (sigtimedwait would). pidfd+ppoll wakes when
        this child exits; leftover SIGCHLD still reaches Bash after restore.
-       SIGALRM is Bash's (TMOUT / read -t). No 50ms poll. */
+       SIGALRM is Bash's (TMOUT / read -t). */
     int pidfd = -1;
 #ifdef SYS_pidfd_open
     pidfd = (int) syscall (SYS_pidfd_open, child, 0);
@@ -471,6 +483,10 @@ timeout_builtin (WORD_LIST *list)
             continue;
         }
         double remain = deadline - elapsed;
+        /* GNU accepts infinite and very large durations. Wait in bounded
+           chunks rather than converting an unrepresentable double to time_t.
+           pidfd still wakes immediately when the command exits. */
+        if (remain > 86400.0) remain = 86400.0;
         struct timespec wait_ts;
         wait_ts.tv_sec = (time_t) remain;
         wait_ts.tv_nsec = (long) ((remain - (double) wait_ts.tv_sec) * 1e9);

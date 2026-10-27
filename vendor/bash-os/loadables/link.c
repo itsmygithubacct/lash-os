@@ -43,7 +43,7 @@ link_builtin (WORD_LIST *list)
         list = list->next;
     if (!list || !list->next || list->next->next) {
         builtin_error ("usage: bashlink TARGET LINK_NAME");
-        return EX_USAGE;
+        return EXECUTION_FAILURE;
     }
     const char *target = list->word->word;
     const char *linkname = list->next->word->word;

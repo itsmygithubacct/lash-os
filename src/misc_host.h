@@ -41,6 +41,26 @@ static int64_t service_misc(struct bridge_host *h, struct posix_request *request
     uint64_t *a = request->args;
     int actual, rc;
     switch (request->operation) {
+    case PX_SEM_OPEN: {
+        char *name = string(h, a[0]);
+        if (!name) return -1;
+        return open_named_semaphore(&h->semaphores, name, open_flags(a[1]), a[2], a[3]);
+    }
+    case PX_SEM_CLOSE:
+        return close_named_semaphore(&h->semaphores, a[0]);
+    case PX_SEM_UNLINK: {
+        char *name = string(h, a[0]);
+        return name ? sem_unlink(name) : -1;
+    }
+    case PX_GIT_STRFTIME: {
+        struct bridge_calendar *value = memory(h, a[3], sizeof(*value));
+        char *format = string(h, a[2]);
+        char *out = memory(h, a[0], a[1]);
+        if (!value || !format || !out) return -1;
+        char *zone = value->zone ? string(h, value->zone) : NULL;
+        if (value->zone && !zone) return -1;
+        return format_calendar(out, a[1], format, value, zone);
+    }
     case PX_OPENAT:
     case PX_FSTATAT: {
         int flags = request->operation == PX_OPENAT ? 0 : at_flags(a[3]);

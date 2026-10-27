@@ -7,29 +7,29 @@
 
 basename|basename
 cat|cat
-chmod|chmod
+chmod|chmod [-Rfv] MODE FILE...
 cut|cut -b LIST | -c LIST | -f LIST [-d DELIM] [-s] [-z] [--complement] [--output-delimiter=STRING] [-a ARRAY] [FILE...]
-dirname|dirname
+dirname|dirname [-z|--zero] [--] NAME...
 head|head
-id|id
+id|id [-aGgnruz] [USER ...]
 ln|ln
-logname|logname
-mkdir|mkdir
-mkfifo|mkfifo
-mktemp|mktemp
-pathchk|pathchk
-printenv|printenv
-realpath|realpath
+logname|logname [--help] [--version]
+mkdir|mkdir [-p] [-m MODE] DIRECTORY...
+mkfifo|mkfifo [-m mode] fifo_name [fifo_name ...]
+mktemp|mktemp [-dqu] [-t PREFIX] [-v VAR] [TEMPLATE...]
+pathchk|pathchk [-p] pathname ...
+printenv|printenv [-0|--null] [--] [VARIABLE...]
+realpath|realpath [-a varname] [-ceqsv] pathname [pathname...]
 rm|rm
-rmdir|rmdir
+rmdir|rmdir [-p] DIRECTORY...
 seq|seq [-w] [-s STRING] [-f FORMAT] [FIRST [INCREMENT]] LAST
-sleep|sleep
+sleep|sleep NUMBER[SUFFIX]...
 stat|stat
-strftime|strftime
-strptime|strptime
+strftime|strftime format [seconds]
+strptime|strptime [-f format] date-time
 sync|sync
-tee|tee
-tty|tty
-uname|uname
-unlink|unlink
-whoami|whoami
+tee|tee [-ai] [file ...]
+tty|tty [-s]
+uname|uname [-amnrsvpio]
+unlink|unlink name
+whoami|whoami [--help] [--version]

@@ -4,9 +4,9 @@
  * MTA track sub-ticket 6.1 (Debian-server-parity). Implements the local
  * queueing + submission path for the bash-os MTA: a durable on-disk
  * outbound queue written with the atomic-rename idiom, a UNIX-socket
- * submission daemon, and queue-inspection ops. Outbound SMTP/MX
- * delivery (6.3), alias compilation (6.2), and DKIM/SPF/DMARC (6.4-6.6)
- * are separate sub-tickets and are NOT implemented here.
+ * submission daemon, and queue-inspection ops. SMTP delivery over a supplied
+ * socket, aliases and DKIM are also implemented below. MX lookup, queue scheduling and retry policy belong
+ * to the caller; deliver-fd preserves the queued entry on every outcome.
  *
  * Subcommands:
  *     mail submit [-f SENDER] [--socket PATH] [--queue DIR] [--direct] [--] RCPT...
@@ -53,6 +53,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <limits.h>
 #include <ctype.h>
 #include <time.h>
 #include <signal.h>
@@ -98,6 +99,18 @@ bm_sigstop (int sig)
   bm_stop = 1;
 }
 
+/* bash hands a loadable one buffer for a variable set for a single
+   command (VAR=x cmd) and frees it when the next one is asked for, so a
+   value has to be taken away before another is read. */
+static const char *
+bm_env (const char *name, char *out, size_t outsz)
+{
+  const char *value = getenv (name);
+  if (!value || !*value) return NULL;
+  snprintf (out, outsz, "%s", value);
+  return out;
+}
+
 /* ---- small I/O helpers --------------------------------------------- */
 
 /* Write all n bytes; -1 on error. */
@@ -107,10 +120,11 @@ bm_write_all (int fd, const void *buf, size_t n)
   const unsigned char *p = buf;
   while (n > 0)
     {
+      if (bm_stop) return -1;
       ssize_t w = write (fd, p, n);
-      if (w < 0)
+      if (w <= 0)
         {
-          if (errno == EINTR) continue;
+          if (errno == EINTR && !bm_stop) continue;
           return -1;
         }
       p += w;
@@ -120,16 +134,34 @@ bm_write_all (int fd, const void *buf, size_t n)
 }
 
 /* Read exactly n bytes; -1 on error/short EOF. */
+/* Suppress SIGPIPE for socket writes without changing the shell's signal
+ * disposition. Files continue to use bm_write_all. */
+static int
+bm_send_all (int fd, const void *buf, size_t n)
+{
+  const unsigned char *p = buf;
+  while (n)
+    {
+      if (bm_stop) return -1;
+      ssize_t w = send (fd, p, n, MSG_NOSIGNAL);
+      if (w < 0 && errno == EINTR && !bm_stop) continue;
+      if (w <= 0) return -1;
+      p += w; n -= (size_t) w;
+    }
+  return 0;
+}
+
 static int
 bm_read_exact (int fd, void *buf, size_t n)
 {
   unsigned char *p = buf;
   while (n > 0)
     {
+      if (bm_stop) return -1;
       ssize_t r = read (fd, p, n);
       if (r < 0)
         {
-          if (errno == EINTR) continue;
+          if (errno == EINTR && !bm_stop) continue;
           return -1;
         }
       if (r == 0) return -1;            /* premature EOF */
@@ -148,9 +180,11 @@ bm_read_line (int fd, char *buf, size_t cap)
   for (;;)
     {
       char c;
+      if (bm_stop) return -1;
       ssize_t r = read (fd, &c, 1);
-      if (r < 0) { if (errno == EINTR) continue; return -1; }
+      if (r < 0) { if (errno == EINTR && !bm_stop) continue; return -1; }
       if (r == 0) return -1;
+      if (c == 0) return -1;
       if (c == '\n') { buf[i] = '\0'; return 0; }
       if (i + 1 >= cap) return -1;
       buf[i++] = c;
@@ -169,7 +203,7 @@ bm_read_all_fd (int fd, unsigned char **out, size_t *outlen, size_t max)
     {
       if (len == cap)
         {
-          if (cap >= max) { free (buf); return 1; }
+          if (cap >= max + 1) { free (buf); return 1; }
           size_t ncap = cap * 2;
           if (ncap > max + 1) ncap = max + 1;
           unsigned char *nb = realloc (buf, ncap);
@@ -177,7 +211,7 @@ bm_read_all_fd (int fd, unsigned char **out, size_t *outlen, size_t max)
           buf = nb; cap = ncap;
         }
       ssize_t r = read (fd, buf + len, cap - len);
-      if (r < 0) { if (errno == EINTR) continue; free (buf); return -1; }
+      if (r < 0) { if (errno == EINTR && !bm_stop) continue; free (buf); return -1; }
       if (r == 0) break;
       len += (size_t) r;
       if (len > max) { free (buf); return 1; }
@@ -219,7 +253,7 @@ bm_write_member (const char *dir, const char *name,
   int fd = open (path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
   if (fd < 0) return -1;
   if (bm_write_all (fd, buf, n) < 0) { close (fd); return -1; }
-  (void) fsync (fd);
+  if (fsync (fd) < 0) { close (fd); return -1; }
   if (close (fd) < 0) return -1;
   return 0;
 }
@@ -271,6 +305,7 @@ bm_enqueue_sub (const char *queue, const char *subdir, const char *sender,
                 const char *extra_meta, char *qid_out, size_t qid_cap)
 {
   char active[BM_PATH_MAX], tmpdir[BM_PATH_MAX], dest[BM_PATH_MAX];
+  int separator = 0;
 
   if (snprintf (active, sizeof active, "%s/%s", queue, subdir) >= (int) sizeof active)
     return -1;
@@ -304,10 +339,10 @@ bm_enqueue_sub (const char *queue, const char *subdir, const char *sender,
     for (size_t i = 0; i + 1 < msglen; i++)
       {
         if (msg[i] == '\n' && msg[i + 1] == '\n')
-          { split = i + 1; bodyoff = i + 2; break; }
+          { split = i + 1; bodyoff = i + 2; separator = 1; break; }
         if (i + 3 < msglen && msg[i] == '\r' && msg[i + 1] == '\n'
             && msg[i + 2] == '\r' && msg[i + 3] == '\n')
-          { split = i + 2; bodyoff = i + 4; break; }
+          { split = i + 2; bodyoff = i + 4; separator = 2; break; }
       }
     if (bm_write_member (tmpdir, "headers", msg, split) < 0)
       { bm_rmrf (tmpdir); return -1; }
@@ -329,6 +364,7 @@ bm_enqueue_sub (const char *queue, const char *subdir, const char *sender,
       fprintf (m, "qid=%s\n", qid);
       fprintf (m, "arrival=%ld\n", (long) time (NULL));
       fprintf (m, "size=%zu\n", msglen);
+      fprintf (m, "separator=%d\n", separator);
       fprintf (m, "sender=%s\n", sender ? sender : "");
       fprintf (m, "nrcpt=%d\n", nrcpt);
       if (extra_meta && *extra_meta) fputs (extra_meta, m);
@@ -374,6 +410,40 @@ bm_opt_val (WORD_LIST **pp)
   return n->word->word;
 }
 
+/* Addresses become line-oriented queue/SMTP fields. NUL is checked before
+ * this helper for length-delimited submission fields. */
+static int
+bm_valid_address (const char *s)
+{
+  if (strlen (s) >= BM_MAX_ADDR) return 0;
+  for (; *s; s++)
+    if ((unsigned char) *s < 32 || (unsigned char) *s == 127 || *s == '<' || *s == '>')
+      return 0;
+  return 1;
+}
+
+static int
+bm_number (const char *s, int minimum, int *out)
+{
+  char *end;
+  if (!s || !isdigit ((unsigned char) *s)) return -1;
+  errno = 0;
+  long value = strtol (s, &end, 10);
+  if (errno == ERANGE || *end || value < minimum || value > INT_MAX) return -1;
+  *out = (int) value;
+  return 0;
+}
+
+static int
+bm_valid_qid (const char *s)
+{
+  size_t n = strlen (s);
+  if (n < 1 || n >= 24) return 0;
+  for (; *s; s++)
+    if (!isxdigit ((unsigned char) *s)) return 0;
+  return 1;
+}
+
 /* ---- submit (client) ----------------------------------------------- */
 
 static int
@@ -398,20 +468,20 @@ bm_send_frame (int fd, const char *sender,
                const unsigned char *msg, size_t msglen)
 {
   char hdr[64];
-  if (bm_write_all (fd, "BASHMAIL1\n", 10) < 0) return -1;
+  if (bm_send_all (fd, "BASHMAIL1\n", 10) < 0) return -1;
   int n = snprintf (hdr, sizeof hdr, "FROM %zu\n", strlen (sender));
-  if (bm_write_all (fd, hdr, n) < 0) return -1;
-  if (bm_write_all (fd, sender, strlen (sender)) < 0) return -1;
+  if (bm_send_all (fd, hdr, n) < 0) return -1;
+  if (bm_send_all (fd, sender, strlen (sender)) < 0) return -1;
   for (int i = 0; i < nrcpt; i++)
     {
       n = snprintf (hdr, sizeof hdr, "RCPT %zu\n", strlen (rcpts[i]));
-      if (bm_write_all (fd, hdr, n) < 0) return -1;
-      if (bm_write_all (fd, rcpts[i], strlen (rcpts[i])) < 0) return -1;
+      if (bm_send_all (fd, hdr, n) < 0) return -1;
+      if (bm_send_all (fd, rcpts[i], strlen (rcpts[i])) < 0) return -1;
     }
   n = snprintf (hdr, sizeof hdr, "DATA %zu\n", msglen);
-  if (bm_write_all (fd, hdr, n) < 0) return -1;
-  if (bm_write_all (fd, msg, msglen) < 0) return -1;
-  if (bm_write_all (fd, "END\n", 4) < 0) return -1;
+  if (bm_send_all (fd, hdr, n) < 0) return -1;
+  if (bm_send_all (fd, msg, msglen) < 0) return -1;
+  if (bm_send_all (fd, "END\n", 4) < 0) return -1;
   return 0;
 }
 
@@ -419,8 +489,9 @@ static int
 bm_submit_cmd (WORD_LIST *args)
 {
   const char *sender = "";
-  const char *sockpath = getenv ("BASHMAIL_SUBMIT_SOCK");
-  const char *queue = getenv ("BASHMAIL_QUEUE_DIR");
+  char sock_held[512], queue_held[512];
+  const char *sockpath = bm_env ("BASHMAIL_SUBMIT_SOCK", sock_held, sizeof sock_held);
+  const char *queue = bm_env ("BASHMAIL_QUEUE_DIR", queue_held, sizeof queue_held);
   int direct = 0;
   char *rcpts[BM_MAX_RCPT];
   int nrcpt = 0;
@@ -448,6 +519,10 @@ bm_submit_cmd (WORD_LIST *args)
 
   if (nrcpt == 0)
     { builtin_error ("submit: no recipients"); return BM_EX_NOUSER; }
+
+  if (!bm_valid_address (sender)) return EX_USAGE;
+  for (int i = 0; i < nrcpt; i++)
+    if (!rcpts[i][0] || !bm_valid_address (rcpts[i])) return EX_USAGE;
 
   unsigned char *msg = NULL; size_t msglen = 0;
   int rr = bm_read_all_fd (0, &msg, &msglen, BM_MAX_MSG);
@@ -506,33 +581,48 @@ bm_serve_one (int cfd, const char *queue, size_t maxmsg)
   for (;;)
     {
       if (bm_read_line (cfd, line, sizeof line) < 0) { err = "truncated frame"; goto reply; }
-      if (!strcmp (line, "END")) break;
+      if (!strcmp (line, "END"))
+        {
+          if (!sender || !data || !nrcpt) { err = "incomplete frame"; goto reply; }
+          break;
+        }
 
-      char verb[8]; long len = -1;
-      if (sscanf (line, "%7s %ld", verb, &len) != 2 || len < 0)
+      char verb[8], *end; unsigned long len;
+      char *space = strchr (line, ' ');
+      if (!space || space == line || space - line >= (int) sizeof verb
+          || !isdigit ((unsigned char) space[1]))
         { err = "bad frame line"; goto reply; }
+      memcpy (verb, line, space - line); verb[space - line] = '\0';
+      errno = 0;
+      len = strtoul (space + 1, &end, 10);
+      if (errno == ERANGE || *end || data)
+        { err = "bad frame length/order"; goto reply; }
 
       if (!strcmp (verb, "FROM"))
         {
-          if (len >= BM_MAX_ADDR) { err = "sender too long"; goto reply; }
+          if (sender || nrcpt || len >= BM_MAX_ADDR) { err = "bad sender/order"; goto reply; }
           free (sender); sender = malloc ((size_t) len + 1);
           if (!sender) { err = "out of memory"; goto reply; }
           if (bm_read_exact (cfd, sender, (size_t) len) < 0) { err = "short sender"; goto reply; }
           sender[len] = '\0';
+          if (memchr (sender, 0, len) || !bm_valid_address (sender))
+            { err = "invalid sender"; goto reply; }
         }
       else if (!strcmp (verb, "RCPT"))
         {
-          if (len >= BM_MAX_ADDR) { err = "recipient too long"; goto reply; }
+          if (!sender || !len || len >= BM_MAX_ADDR) { err = "bad recipient/order"; goto reply; }
           if (nrcpt >= BM_MAX_RCPT) { err = "too many recipients"; goto reply; }
           char *r = malloc ((size_t) len + 1);
           if (!r) { err = "out of memory"; goto reply; }
           if (bm_read_exact (cfd, r, (size_t) len) < 0) { free (r); err = "short recipient"; goto reply; }
           r[len] = '\0';
+          if (memchr (r, 0, len) || !bm_valid_address (r))
+            { free (r); err = "invalid recipient"; goto reply; }
           rcpts[nrcpt++] = r;
         }
       else if (!strcmp (verb, "DATA"))
         {
-          if ((size_t) len > maxmsg) { err = "message too large"; goto reply; }
+          if (!sender || !nrcpt || len > maxmsg) { err = "bad data size/order"; goto reply; }
           free (data); data = malloc ((size_t) len ? (size_t) len : 1);
           if (!data) { err = "out of memory"; goto reply; }
           if (len && bm_read_exact (cfd, data, (size_t) len) < 0) { err = "short data"; goto reply; }
@@ -551,7 +641,7 @@ bm_serve_one (int cfd, const char *queue, size_t maxmsg)
       { err = "enqueue failed"; goto reply; }
     char ok[64];
     int n = snprintf (ok, sizeof ok, "OK %s\n", qid);
-    (void) bm_write_all (cfd, ok, n);
+    (void) bm_send_all (cfd, ok, n);
     goto done;
   }
 
@@ -559,7 +649,7 @@ reply:
   {
     char e[256];
     int n = snprintf (e, sizeof e, "ERR 75 %s\n", err ? err : "error");
-    (void) bm_write_all (cfd, e, n);
+    (void) bm_send_all (cfd, e, n);
   }
 done:
   free (sender);
@@ -583,8 +673,9 @@ bm_chown_mail (const char *path)
 static int
 bm_serve_cmd (WORD_LIST *args)
 {
-  const char *sockpath = getenv ("BASHMAIL_SUBMIT_SOCK");
-  const char *queue = getenv ("BASHMAIL_QUEUE_DIR");
+  char sock_held[512], queue_held[512];
+  const char *sockpath = bm_env ("BASHMAIL_SUBMIT_SOCK", sock_held, sizeof sock_held);
+  const char *queue = bm_env ("BASHMAIL_QUEUE_DIR", queue_held, sizeof queue_held);
   const char *conf = NULL;
   size_t maxmsg = BM_MAX_MSG;
 
@@ -637,7 +728,20 @@ bm_serve_cmd (WORD_LIST *args)
   memset (&sa, 0, sizeof sa);
   sa.sun_family = AF_UNIX;
   strncpy (sa.sun_path, sockpath, sizeof sa.sun_path - 1);
-  (void) unlink (sockpath);            /* clear stale socket */
+  struct stat existing;
+  if (lstat (sockpath, &existing) == 0)
+    {
+      int probe = S_ISSOCK (existing.st_mode) ? bm_connect_unix (sockpath) : -1;
+      if (!S_ISSOCK (existing.st_mode) || probe >= 0)
+        {
+          if (probe >= 0) close (probe);
+          close (lfd);
+          builtin_error ("serve: socket path already in use: %s", sockpath);
+          return EXECUTION_FAILURE;
+        }
+      if (errno != ECONNREFUSED || unlink (sockpath) < 0)
+        { close (lfd); return EXECUTION_FAILURE; }
+    }
   if (bind (lfd, (struct sockaddr *) &sa, sizeof sa) < 0)
     { builtin_error ("serve: bind %s: %s", sockpath, strerror (errno)); close (lfd); return EXECUTION_FAILURE; }
   (void) chmod (sockpath, 0660);
@@ -645,12 +749,14 @@ bm_serve_cmd (WORD_LIST *args)
   if (listen (lfd, BM_LISTEN_BACKLOG) < 0)
     { builtin_error ("serve: listen: %s", strerror (errno)); close (lfd); unlink (sockpath); return EXECUTION_FAILURE; }
 
-  struct sigaction act;
+  struct sigaction act, oldint, oldterm, oldpipe;
+  bm_stop = 0;
   memset (&act, 0, sizeof act);
   act.sa_handler = bm_sigstop;
-  sigaction (SIGINT, &act, NULL);
-  sigaction (SIGTERM, &act, NULL);
-  signal (SIGPIPE, SIG_IGN);
+  sigaction (SIGINT, &act, &oldint);
+  sigaction (SIGTERM, &act, &oldterm);
+  act.sa_handler = SIG_IGN;
+  sigaction (SIGPIPE, &act, &oldpipe);
 
   printf ("mail: serving submissions on %s (queue %s)\n", sockpath, queue);
   fflush (stdout);
@@ -660,16 +766,23 @@ bm_serve_cmd (WORD_LIST *args)
       int cfd = accept (lfd, NULL, NULL);
       if (cfd < 0)
         {
-          if (errno == EINTR) continue;
+          if (errno == EINTR && !bm_stop) continue;
           if (bm_stop) break;
           continue;
         }
+      struct timeval tv = { .tv_sec = 120, .tv_usec = 0 };
+      setsockopt (cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+      setsockopt (cfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
       bm_serve_one (cfd, queue, maxmsg);
       close (cfd);
     }
 
   close (lfd);
   (void) unlink (sockpath);
+  sigaction (SIGINT, &oldint, NULL);
+  sigaction (SIGTERM, &oldterm, NULL);
+  sigaction (SIGPIPE, &oldpipe, NULL);
+  bm_stop = 0;
   return EXECUTION_SUCCESS;
 }
 
@@ -678,19 +791,26 @@ bm_serve_cmd (WORD_LIST *args)
 /* Read a small queue member file (NUL-terminated) into a static-free
  * malloc buffer; returns NULL on error. */
 static char *
-bm_slurp (const char *dir, const char *name)
+bm_slurp_len (const char *dir, const char *name, size_t *outlen, size_t max)
 {
   char path[BM_PATH_MAX];
   if (snprintf (path, sizeof path, "%s/%s", dir, name) >= (int) sizeof path) return NULL;
   int fd = open (path, O_RDONLY | O_CLOEXEC);
   if (fd < 0) return NULL;
   unsigned char *buf = NULL; size_t len = 0;
-  if (bm_read_all_fd (fd, &buf, &len, 1 << 20) != 0) { close (fd); free (buf); return NULL; }
+  if (bm_read_all_fd (fd, &buf, &len, max) != 0) { close (fd); free (buf); return NULL; }
   close (fd);
   char *s = realloc (buf, len + 1);
   if (!s) { free (buf); return NULL; }
   s[len] = '\0';
+  if (outlen) *outlen = len;
   return s;
+}
+
+static char *
+bm_slurp (const char *dir, const char *name)
+{
+  return bm_slurp_len (dir, name, NULL, 1 << 20);
 }
 
 /* Extract a key=value from a meta blob into out (caller-sized). */
@@ -810,6 +930,7 @@ bm_queue_show_cmd (WORD_LIST *args)
   if (bm_qopt_queue (args, &queue, &qid) < 0 || !qid)
     { builtin_error ("queue-show: usage: queue-show QID [--queue DIR]"); return EX_USAGE; }
 
+  if (!bm_valid_qid (qid)) return EX_USAGE;
   char entry[BM_PATH_MAX];
   if (snprintf (entry, sizeof entry, "%s/active/%s", queue, qid) >= (int) sizeof entry)
     return EXECUTION_FAILURE;
@@ -817,11 +938,20 @@ bm_queue_show_cmd (WORD_LIST *args)
   if (stat (entry, &st) < 0 || !S_ISDIR (st.st_mode))
     { builtin_error ("queue-show: no such queue id: %s", qid); return EXECUTION_FAILURE; }
 
-  for (const char *m = "envelope"; m; m = NULL)
-    { char *s = bm_slurp (entry, m); if (s) { fputs (s, stdout); free (s); } }
-  printf ("--\n");
-  { char *h = bm_slurp (entry, "headers"); if (h) { fputs (h, stdout); free (h); } }
-  { char *b = bm_slurp (entry, "body"); if (b) { fputs (b, stdout); free (b); } }
+  char *env = bm_slurp (entry, "envelope");
+  size_t hlen, blen;
+  char *headers = bm_slurp_len (entry, "headers", &hlen, BM_MAX_MSG);
+  char *body = bm_slurp_len (entry, "body", &blen, BM_MAX_MSG);
+  if (!env || !headers || !body)
+    { free (env); free (headers); free (body); return EXECUTION_FAILURE; }
+  fputs (env, stdout); printf ("--\n");
+  fwrite (headers, 1, hlen, stdout);
+  char *meta = bm_slurp (entry, "meta"), value[8] = "1";
+  if (meta) { bm_meta_get (meta, "separator", value, sizeof value); free (meta); }
+  if (value[0] == '2') putchar ('\r');
+  if (value[0] != '0') putchar ('\n');
+  fwrite (body, 1, blen, stdout);
+  free (env); free (headers); free (body);
   return EXECUTION_SUCCESS;
 }
 
@@ -833,6 +963,7 @@ bm_queue_delete_cmd (WORD_LIST *args)
   if (bm_qopt_queue (args, &queue, &qid) < 0 || !qid)
     { builtin_error ("queue-delete: usage: queue-delete QID|ALL [--queue DIR]"); return EX_USAGE; }
 
+  if (strcmp (qid, "ALL") && !bm_valid_qid (qid)) return EX_USAGE;
   if (!strcmp (qid, "ALL"))
     {
       long n = 0;
@@ -1164,8 +1295,9 @@ bm_cmp_lines (const void *a, const void *b)
 static int
 bm_newaliases_cmd (WORD_LIST *args)
 {
-  const char *src = getenv ("BASHMAIL_ALIASES");
-  const char *db = getenv ("BASHMAIL_ALIASES_DB");
+  char src_held[512], db_held[512];
+  const char *src = bm_env ("BASHMAIL_ALIASES", src_held, sizeof src_held);
+  const char *db = bm_env ("BASHMAIL_ALIASES_DB", db_held, sizeof db_held);
   if (!src || !*src) src = BM_DEFAULT_ALIASES;
   if (!db || !*db) db = BM_DEFAULT_ALIASES_DB;
 
@@ -1248,9 +1380,10 @@ bm_newaliases_cmd (WORD_LIST *args)
 static int
 bm_expand_cmd (WORD_LIST *args)
 {
-  const char *db = getenv ("BASHMAIL_ALIASES_DB");
-  const char *aliases = getenv ("BASHMAIL_ALIASES");
-  const char *fwd_root = getenv ("BASHMAIL_FORWARD_ROOT");
+  char db_held[512], aliases_held[512], fwd_held[512];
+  const char *db = bm_env ("BASHMAIL_ALIASES_DB", db_held, sizeof db_held);
+  const char *aliases = bm_env ("BASHMAIL_ALIASES", aliases_held, sizeof aliases_held);
+  const char *fwd_root = bm_env ("BASHMAIL_FORWARD_ROOT", fwd_held, sizeof fwd_held);
   char *rcpts[BM_MAX_RCPT];
   int nrcpt = 0;
 
@@ -1315,7 +1448,7 @@ typedef struct {
 static int
 bm_smtp_write (bm_smtp *c, const void *buf, size_t n)
 {
-  if (!c->tls) return bm_write_all (c->fd, buf, n);
+  if (!c->tls) return bm_send_all (c->fd, buf, n);
   const unsigned char *p = buf; size_t left = n;
   while (left)
     {
@@ -1331,9 +1464,10 @@ static int
 bm_smtp_getc (bm_smtp *c)
 {
   unsigned char ch;
+  if (bm_stop) return -1;
   if (!c->tls)
     {
-      ssize_t r; do { r = read (c->fd, &ch, 1); } while (r < 0 && errno == EINTR);
+      ssize_t r; do { r = read (c->fd, &ch, 1); } while (r < 0 && errno == EINTR && !bm_stop);
       return r <= 0 ? -1 : (int) ch;
     }
   for (;;)
@@ -1353,19 +1487,27 @@ bm_smtp_reply (bm_smtp *c, char *caps, size_t capcap)
 {
   size_t cl = caps ? strlen (caps) : 0;
   int code = -1;
-  for (;;)
+  for (int lines = 0; lines < 100; lines++)
     {
       char line[1024]; size_t i = 0; int ch;
       while ((ch = bm_smtp_getc (c)) >= 0 && ch != '\n')
-        { if (ch == '\r') continue; if (i + 1 < sizeof line) line[i++] = (char) ch; }
-      if (ch < 0 && i == 0) return -1;
-      line[i] = '\0';
-      if (caps && cl + i + 2 < capcap) { memcpy (caps + cl, line, i); cl += i; caps[cl++] = '\n'; caps[cl] = '\0'; }
-      if (i >= 3 && isdigit ((unsigned char) line[0])) code = atoi (line);
-      if (i < 4 || line[3] != '-') break;     /* '-' = continuation */
-      if (ch < 0) break;
+        {
+          if (i + 1 >= sizeof line || ch == 0) return -1;
+          line[i++] = (char) ch;
+        }
+      if (ch < 0 || i < 5 || line[i - 1] != '\r') return -1;
+      line[--i] = '\0';
+      if (line[0] < '2' || line[0] > '5'
+          || !isdigit ((unsigned char) line[1]) || !isdigit ((unsigned char) line[2])
+          || (line[3] != ' ' && line[3] != '-')) return -1;
+      int current = (line[0] - '0') * 100 + (line[1] - '0') * 10 + line[2] - '0';
+      if (code >= 0 && current != code) return -1;
+      code = current;
+      if (caps && cl + i + 2 < capcap)
+        { memcpy (caps + cl, line, i); cl += i; caps[cl++] = '\n'; caps[cl] = '\0'; }
+      if (line[3] == ' ') return code;
     }
-  return code;
+  return -1;
 }
 
 static int
@@ -1435,23 +1577,48 @@ bm_smtp_close (bm_smtp *c)
     }
 }
 
-/* Send the DATA payload: CRLF-normalize and dot-stuff, then terminate
- * with CRLF "." CRLF. Returns 0 / -1. */
+/* DATA is assembled in bounded chunks. Per-line writes interact poorly with
+ * TCP's small-write/delayed-ACK behavior and cost two or three syscalls per
+ * line. This buffer is local to a transaction (also on the TLS path). */
+#define BM_DATA_BUFSIZE 65536
+static int
+bm_smtp_buffer (bm_smtp *c, unsigned char *buffer, size_t *used,
+                const void *data, size_t n)
+{
+  const unsigned char *p = data;
+  while (n)
+    {
+      size_t take = BM_DATA_BUFSIZE - *used;
+      if (take > n) take = n;
+      memcpy (buffer + *used, p, take);
+      *used += take; p += take; n -= take;
+      if (*used == BM_DATA_BUFSIZE)
+        {
+          if (bm_smtp_write (c, buffer, *used) < 0) return -1;
+          *used = 0;
+        }
+    }
+  return 0;
+}
+
+/* CRLF-normalize and dot-stuff, then terminate with "." CRLF. */
 static int
 bm_smtp_send_data (bm_smtp *c, const char *msg, size_t n)
 {
-  size_t i = 0;
+  unsigned char buffer[BM_DATA_BUFSIZE];
+  size_t i = 0, used = 0;
   while (i < n)
     {
       size_t j = i; while (j < n && msg[j] != '\n') j++;
       size_t len = j - i;
-      if (len && msg[i + len - 1] == '\r') len--;           /* drop CR; re-added below */
-      if (len > 0 && msg[i] == '.' && bm_smtp_write (c, ".", 1) < 0) return -1;
-      if (len && bm_smtp_write (c, msg + i, len) < 0) return -1;
-      if (bm_smtp_write (c, "\r\n", 2) < 0) return -1;
+      if (len && msg[i + len - 1] == '\r') len--;
+      if (len && msg[i] == '.' && bm_smtp_buffer (c, buffer, &used, ".", 1) < 0) return -1;
+      if (bm_smtp_buffer (c, buffer, &used, msg + i, len) < 0) return -1;
+      if (bm_smtp_buffer (c, buffer, &used, "\r\n", 2) < 0) return -1;
       i = (j < n) ? j + 1 : j;
     }
-  return bm_smtp_write (c, ".\r\n", 3);
+  if (bm_smtp_buffer (c, buffer, &used, ".\r\n", 3) < 0) return -1;
+  return bm_smtp_write (c, buffer, used);
 }
 
 /* Map an SMTP reply code to a delivery exit code. */
@@ -1459,7 +1626,8 @@ static int
 bm_classify (int code)
 {
   if (code < 0) return BM_EX_TEMPFAIL;          /* I/O / timeout */
-  if (code / 100 == 2 || code / 100 == 3) return EXECUTION_SUCCESS;
+  if (code / 100 == 2) return EXECUTION_SUCCESS;
+  if (code / 100 == 3) return BM_EX_TEMPFAIL; /* unexpected continuation */
   if (code / 100 == 4) return BM_EX_TEMPFAIL;
   return BM_EX_UNAVAIL;                          /* 5xx */
 }
@@ -1709,12 +1877,12 @@ bm_deliver_fd_cmd (WORD_LIST *args)
     {
       const char *a = p->word->word;
       if (!strcmp (a, "--")) { p = p->next; break; }
-      else if (!strcmp (a, "--fd")) { const char *v = bm_opt_val (&p); if (!v) goto usage; fd = atoi (v); }
+      else if (!strcmp (a, "--fd")) { const char *v = bm_opt_val (&p); if (bm_number (v, 0, &fd) < 0) goto usage; }
       else if (!strcmp (a, "--from")) { from = bm_opt_val (&p); if (!from) goto usage; }
       else if (!strcmp (a, "--queue")) { queue = bm_opt_val (&p); if (!queue) goto usage; }
       else if (!strcmp (a, "--qid")) { qid = bm_opt_val (&p); if (!qid) goto usage; }
-      else if (!strcmp (a, "--tls")) { const char *v = bm_opt_val (&p); if (!v) goto usage; tls_auto = strcmp (v, "off") != 0; }
-      else if (!strcmp (a, "--tls-verify")) { const char *v = bm_opt_val (&p); if (!v) goto usage; verify_peer = !strcmp (v, "peer"); }
+      else if (!strcmp (a, "--tls")) { const char *v = bm_opt_val (&p); if (!v || (strcmp (v, "off") && strcmp (v, "auto"))) goto usage; tls_auto = strcmp (v, "off") != 0; }
+      else if (!strcmp (a, "--tls-verify")) { const char *v = bm_opt_val (&p); if (!v || (strcmp (v, "none") && strcmp (v, "peer"))) goto usage; verify_peer = !strcmp (v, "peer"); }
       else if (!strcmp (a, "--tls-ca")) { ca = bm_opt_val (&p); if (!ca) goto usage; }
       else if (!strcmp (a, "--ehlo")) { ehlo = bm_opt_val (&p); if (!ehlo) goto usage; }
       else if (!strcmp (a, "--peer-name")) { peer_name = bm_opt_val (&p); if (!peer_name) goto usage; }
@@ -1723,13 +1891,21 @@ bm_deliver_fd_cmd (WORD_LIST *args)
       else if (!strcmp (a, "--dkim-domain")) { dkim_dom = bm_opt_val (&p); if (!dkim_dom) goto usage; }
       else if (!strcmp (a, "--dkim-alg")) { dkim_alg = bm_opt_val (&p); if (!dkim_alg) goto usage; }
       else if (!strcmp (a, "--dkim-ts")) { const char *v = bm_opt_val (&p); if (!v) goto usage; dkim_ts = atol (v); }
-      else if (!strcmp (a, "--timeout")) { const char *v = bm_opt_val (&p); if (!v) goto usage; timeout_ms = atoi (v); }
+      else if (!strcmp (a, "--timeout")) { const char *v = bm_opt_val (&p); if (bm_number (v, 1, &timeout_ms) < 0) goto usage; }
       else if (a[0] == '-' && a[1]) { builtin_error ("deliver-fd: unknown option: %s", a); return EX_USAGE; }
       else break;
     }
-  for (; p; p = p->next) { if (nrcpt < BM_MAX_RCPT) rcpts[nrcpt++] = p->word->word; }
+  for (; p; p = p->next)
+    {
+      if (nrcpt >= BM_MAX_RCPT) goto usage;
+      rcpts[nrcpt++] = p->word->word;
+    }
 
-  if (fd < 0 || !from || !qid || nrcpt == 0) { goto usage; }
+  if (fd < 0 || !from || !qid || nrcpt == 0 || timeout_ms <= 0
+      || !bm_valid_qid (qid) || !bm_valid_address (from)) goto usage;
+  for (int i = 0; i < nrcpt; i++)
+    if (!rcpts[i][0] || !bm_valid_address (rcpts[i])) goto usage;
+  if (ehlo && (!bm_valid_address (ehlo) || strlen (ehlo) > 255)) goto usage;
 
   char ehlo_buf[256];
   if (!ehlo) { ehlo_buf[0] = '\0'; gethostname (ehlo_buf, sizeof ehlo_buf - 1); ehlo = ehlo_buf[0] ? ehlo_buf : "localhost"; }
@@ -1743,27 +1919,39 @@ bm_deliver_fd_cmd (WORD_LIST *args)
   char entry[BM_PATH_MAX];
   if (snprintf (entry, sizeof entry, "%s/active/%s", queue, qid) >= (int) sizeof entry)
     return BM_EX_UNAVAIL;
-  char *headers = bm_slurp (entry, "headers");
-  char *body = bm_slurp (entry, "body");
-  if (!headers) { free (body); builtin_error ("deliver-fd: cannot read queue entry %s", qid); return BM_EX_UNAVAIL; }
-  if (!body) { body = strdup (""); }
+  size_t hlen = 0, blen = 0;
+  char *headers = bm_slurp_len (entry, "headers", &hlen, BM_MAX_MSG);
+  char *body = bm_slurp_len (entry, "body", &blen, BM_MAX_MSG);
+  if (!headers || !body || hlen + blen > BM_MAX_MSG)
+    { free (headers); free (body); builtin_error ("deliver-fd: cannot read queue entry %s", qid); return BM_EX_UNAVAIL; }
+  int separator = 1;              /* compatibility with older queue entries */
+  char *meta = bm_slurp (entry, "meta");
+  if (meta)
+    {
+      char value[8]; bm_meta_get (meta, "separator", value, sizeof value);
+      if (value[0] >= '0' && value[0] <= '2' && !value[1]) separator = value[0] - '0';
+      free (meta);
+    }
 
   /* DKIM (6.4): sign over the original headers + body; prepend the
    * resulting DKIM-Signature header to the outgoing message. */
   char *dkim = NULL;
   if (dkim_key && dkim_sel && dkim_dom)
     {
+      if (memchr (headers, 0, hlen) || memchr (body, 0, blen))
+        { free (headers); free (body); return BM_EX_UNAVAIL; }
       dkim = bm_dkim_header (headers, body, dkim_sel, dkim_dom, dkim_alg, dkim_key, dkim_ts);
       if (!dkim) { free (headers); free (body); builtin_error ("deliver-fd: DKIM signing failed"); return BM_EX_TEMPFAIL; }
     }
 
-  size_t hlen = strlen (headers), blen = strlen (body);
   size_t dlen = dkim ? strlen (dkim) : 0;
-  char *msg = malloc (dlen + 1 + hlen + 1 + blen + 1);
+  char *msg = malloc (dlen + 1 + hlen + 2 + blen + 1);
   if (!msg) { free (headers); free (body); free (dkim); return BM_EX_TEMPFAIL; }
   size_t mlen = 0;
   if (dkim) { memcpy (msg, dkim, dlen); mlen += dlen; msg[mlen++] = '\n'; }
-  memcpy (msg + mlen, headers, hlen); mlen += hlen; msg[mlen++] = '\n';
+  memcpy (msg + mlen, headers, hlen); mlen += hlen;
+  if (separator == 2) msg[mlen++] = '\r';
+  if (separator) msg[mlen++] = '\n';
   if (blen) { memcpy (msg + mlen, body, blen); mlen += blen; }
   msg[mlen] = '\0';
   free (headers); free (body); free (dkim);
@@ -1774,7 +1962,7 @@ bm_deliver_fd_cmd (WORD_LIST *args)
   int code, rc = EXECUTION_SUCCESS;
 
   code = bm_smtp_reply (&c, NULL, 0);                       /* greeting */
-  if (code / 100 != 2) { rc = bm_classify (code); goto done; }
+  if (code != 220) { rc = bm_classify (code); if (!rc) rc = BM_EX_TEMPFAIL; goto done; }
 
   snprintf (cmd, sizeof cmd, "EHLO %s\r\n", ehlo);
   code = bm_smtp_cmd (&c, cmd, caps, sizeof caps);
@@ -1812,12 +2000,12 @@ bm_deliver_fd_cmd (WORD_LIST *args)
       code = bm_smtp_cmd (&c, cmd, NULL, 0);
       accepted[i] = (code / 100 == 2) ? 1 : 0;
       if (accepted[i]) naccept++;
-      else if (code < 0 || code / 100 == 4) any_temp = 1;
+      else if (bm_classify (code) == BM_EX_TEMPFAIL) any_temp = 1;
     }
   if (naccept == 0) { rc = any_temp ? BM_EX_TEMPFAIL : BM_EX_UNAVAIL; goto done; }
 
   code = bm_smtp_cmd (&c, "DATA\r\n", NULL, 0);
-  if (code != 354) { rc = bm_classify (code); goto done; }
+  if (code != 354) { rc = bm_classify (code); if (!rc) rc = BM_EX_TEMPFAIL; goto done; }
   if (bm_smtp_send_data (&c, msg, mlen) < 0) { rc = BM_EX_TEMPFAIL; goto done; }
   code = bm_smtp_reply (&c, NULL, 0);
   if (code / 100 != 2) { rc = bm_classify (code); goto done; }
@@ -1825,7 +2013,7 @@ bm_deliver_fd_cmd (WORD_LIST *args)
   for (int i = 0; i < nrcpt; i++)
     if (accepted[i]) printf ("delivered %s\n", rcpts[i]);
   (void) bm_smtp_cmd (&c, "QUIT\r\n", NULL, 0);
-  rc = EXECUTION_SUCCESS;
+  rc = any_temp ? BM_EX_TEMPFAIL : (naccept < nrcpt ? BM_EX_UNAVAIL : EXECUTION_SUCCESS);
 
 done:
   bm_smtp_close (&c);
@@ -2011,7 +2199,7 @@ bm_smtpd_one (int cfd, const char *client_ip, const char *queue, const char *ehl
 
   bm_smtp_write (&c, "220 ", 4);
   bm_smtp_write (&c, ehlo, strlen (ehlo));
-  bm_smtp_write (&c, " ESMTP mail\r\n", 17);
+  bm_smtp_write (&c, " ESMTP mail\r\n", 13);
 
   for (;;)
     {
@@ -2147,10 +2335,13 @@ bm_smtpd_cmd (WORD_LIST *args)
   snprintf (inc, sizeof inc, "%s/incoming", queue); bm_mkdir_p (inc, 0700);
   snprintf (inc, sizeof inc, "%s/rejected", queue); bm_mkdir_p (inc, 0700);
 
-  struct sigaction act; memset (&act, 0, sizeof act);
+  struct sigaction act, oldint, oldterm, oldpipe;
+  bm_stop = 0;
+  memset (&act, 0, sizeof act);
   act.sa_handler = bm_sigstop;
-  sigaction (SIGINT, &act, NULL); sigaction (SIGTERM, &act, NULL);
-  signal (SIGPIPE, SIG_IGN);
+  sigaction (SIGINT, &act, &oldint); sigaction (SIGTERM, &act, &oldterm);
+  act.sa_handler = SIG_IGN;
+  sigaction (SIGPIPE, &act, &oldpipe);
 
   printf ("mail: smtpd listening on %s (queue %s)\n", bind_spec, queue);
   fflush (stdout);
@@ -2159,7 +2350,7 @@ bm_smtpd_cmd (WORD_LIST *args)
     {
       struct sockaddr_storage ss; socklen_t sl = sizeof ss;
       int cfd = accept (lfd, (struct sockaddr *) &ss, &sl);
-      if (cfd < 0) { if (errno == EINTR) continue; if (bm_stop) break; continue; }
+      if (cfd < 0) { if (errno == EINTR && !bm_stop) continue; if (bm_stop) break; continue; }
       char ip[INET6_ADDRSTRLEN] = "unknown";
       if (ss.ss_family == AF_INET)
         inet_ntop (AF_INET, &((struct sockaddr_in *) &ss)->sin_addr, ip, sizeof ip);
@@ -2172,6 +2363,10 @@ bm_smtpd_cmd (WORD_LIST *args)
       close (cfd);
     }
   close (lfd);
+  sigaction (SIGINT, &oldint, NULL);
+  sigaction (SIGTERM, &oldterm, NULL);
+  sigaction (SIGPIPE, &oldpipe, NULL);
+  bm_stop = 0;
   return EXECUTION_SUCCESS;
 
 usage:
@@ -2181,8 +2376,8 @@ usage:
 
 /* ---- dispatch ------------------------------------------------------ */
 
-int
-mail_builtin (WORD_LIST *list)
+static int
+bm_dispatch (WORD_LIST *list)
 {
   if (!list) { builtin_usage (); return EX_USAGE; }
   const char *cmd = list->word->word;
@@ -2202,6 +2397,17 @@ mail_builtin (WORD_LIST *list)
 
   builtin_error ("unknown subcommand: %s (try submit/serve/queue-list/queue-show/queue-delete/queue-flush/newaliases/expand/deliver-fd/smtpd/dkim-verify)", cmd);
   return EX_USAGE;
+}
+
+int
+mail_builtin (WORD_LIST *list)
+{
+  /* Bash's output FILE survives across builtin calls. */
+  clearerr (stdout);
+  int rc = bm_dispatch (list);
+  if (fflush (stdout) == EOF || ferror (stdout))
+    return rc == EXECUTION_SUCCESS ? EXECUTION_FAILURE : rc;
+  return rc;
 }
 
 char *mail_doc[] = {
@@ -2243,7 +2449,10 @@ char *mail_doc[] = {
   "        <QID> to RCPTs. With --dkim-*, prepends an RFC 6376 DKIM-Signature",
   "        (relaxed/relaxed; key read in C, never a shell var). Prints",
   "        'delivered <rcpt>' per accepted recipient. Exit 0 delivered, 75",
-  "        temp-fail (4xx/conn/TLS), 69 perm-fail (5xx).",
+  "        temp-fail (4xx/conn/TLS), 69 perm-fail (5xx). Mixed recipient",
+  "        results print only delivered recipients and return 75 if any",
+  "        temporary failure, else 69 if any permanent failure. The caller",
+  "        retains/retries only undelivered recipients and manages the queue.",
   "",
   "    mail smtpd --bind ADDR:PORT [--queue DIR] [--user mail] [--ehlo NAME]",
   "        Inbound SMTP server: bind (privileged port as root then drop to",

@@ -253,13 +253,13 @@ free_builtin (WORD_LIST *list)
             if (list->next == NULL) {
                 builtin_error ("%s requires seconds", w);
                 builtin_usage ();
-                return EX_USAGE;
+                return EXECUTION_FAILURE;
             }
             list = list->next;
             if (bf_parse_seconds (list->word->word, &seconds) < 0) {
                 builtin_error ("invalid seconds: %s", list->word->word);
                 builtin_usage ();
-                return EX_USAGE;
+                return EXECUTION_FAILURE;
             }
             repeat = 1;
         }
@@ -267,13 +267,13 @@ free_builtin (WORD_LIST *list)
             if (list->next == NULL) {
                 builtin_error ("%s requires a count", w);
                 builtin_usage ();
-                return EX_USAGE;
+                return EXECUTION_FAILURE;
             }
             list = list->next;
             if (bf_parse_count (list->word->word, &count) < 0) {
                 builtin_error ("invalid count: %s", list->word->word);
                 builtin_usage ();
-                return EX_USAGE;
+                return EXECUTION_FAILURE;
             }
             repeat = 1;
             count_set = 1;
@@ -282,7 +282,7 @@ free_builtin (WORD_LIST *list)
             if (bf_parse_seconds (w + 2, &seconds) < 0) {
                 builtin_error ("invalid seconds: %s", w + 2);
                 builtin_usage ();
-                return EX_USAGE;
+                return EXECUTION_FAILURE;
             }
             repeat = 1;
         }
@@ -290,7 +290,7 @@ free_builtin (WORD_LIST *list)
             if (bf_parse_seconds (w + 10, &seconds) < 0) {
                 builtin_error ("invalid seconds: %s", w + 10);
                 builtin_usage ();
-                return EX_USAGE;
+                return EXECUTION_FAILURE;
             }
             repeat = 1;
         }
@@ -298,7 +298,7 @@ free_builtin (WORD_LIST *list)
             if (bf_parse_count (w + 2, &count) < 0) {
                 builtin_error ("invalid count: %s", w + 2);
                 builtin_usage ();
-                return EX_USAGE;
+                return EXECUTION_FAILURE;
             }
             repeat = 1;
             count_set = 1;
@@ -307,7 +307,7 @@ free_builtin (WORD_LIST *list)
             if (bf_parse_count (w + 8, &count) < 0) {
                 builtin_error ("invalid count: %s", w + 8);
                 builtin_usage ();
-                return EX_USAGE;
+                return EXECUTION_FAILURE;
             }
             repeat = 1;
             count_set = 1;
@@ -331,19 +331,19 @@ free_builtin (WORD_LIST *list)
                             if (bf_parse_seconds (w + i + 1, &seconds) < 0) {
                                 builtin_error ("invalid seconds: %s", w + i + 1);
                                 builtin_usage ();
-                                return EX_USAGE;
+                                return EXECUTION_FAILURE;
                             }
                         } else {
                             if (list->next == NULL) {
                                 builtin_error ("-s requires seconds");
                                 builtin_usage ();
-                                return EX_USAGE;
+                                return EXECUTION_FAILURE;
                             }
                             list = list->next;
                             if (bf_parse_seconds (list->word->word, &seconds) < 0) {
                                 builtin_error ("invalid seconds: %s", list->word->word);
                                 builtin_usage ();
-                                return EX_USAGE;
+                                return EXECUTION_FAILURE;
                             }
                         }
                         repeat = 1;
@@ -354,19 +354,19 @@ free_builtin (WORD_LIST *list)
                             if (bf_parse_count (w + i + 1, &count) < 0) {
                                 builtin_error ("invalid count: %s", w + i + 1);
                                 builtin_usage ();
-                                return EX_USAGE;
+                                return EXECUTION_FAILURE;
                             }
                         } else {
                             if (list->next == NULL) {
                                 builtin_error ("-c requires a count");
                                 builtin_usage ();
-                                return EX_USAGE;
+                                return EXECUTION_FAILURE;
                             }
                             list = list->next;
                             if (bf_parse_count (list->word->word, &count) < 0) {
                                 builtin_error ("invalid count: %s", list->word->word);
                                 builtin_usage ();
-                                return EX_USAGE;
+                                return EXECUTION_FAILURE;
                             }
                         }
                         repeat = 1;
@@ -376,14 +376,14 @@ free_builtin (WORD_LIST *list)
                     default:
                         builtin_error ("unknown flag: -%c", w[i]);
                         builtin_usage ();
-                        return EX_USAGE;
+                        return EXECUTION_FAILURE;
                 }
             }
         }
         else {
             builtin_error ("unknown flag: %s", w);
             builtin_usage ();
-            return EX_USAGE;
+            return EXECUTION_FAILURE;
         }
         list = list->next;
     }
@@ -391,7 +391,7 @@ free_builtin (WORD_LIST *list)
     if (list != NULL) {
         builtin_error ("unexpected operand: %s", list->word->word);
         builtin_usage ();
-        return EX_USAGE;
+        return EXECUTION_FAILURE;
     }
 
     for (unsigned int i = 0; ; i++) {

@@ -374,7 +374,8 @@ char *fail2ban_doc[] = {
   "(status/banip/unbanip/reload), validates IP/jail tokens, and formats the",
   "TAB-separated ban.db into fail2ban-client status output. Owns no firewall",
   "logic (fw remains the firewall actor) and never mutates the db.",
-  "Exit: 0 ok, 1 failure, 2 usage / out-of-subset / invalid token.",
+  "Exit: 0 ok, 1 failure (including false validate-ip/validate-jail predicates).",
+  "Status 2 is usage, an out-of-subset command, or invalid parse-command tokens.",
   (char *) NULL
 };
 

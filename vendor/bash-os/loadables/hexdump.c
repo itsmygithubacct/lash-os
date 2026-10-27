@@ -697,9 +697,8 @@ hexdump_builtin (WORD_LIST *list)
 {
     hd_opts o = { .canonical = 0, .format = NULL, .limit = -1, .skip = 0, .verbose = 0 };
 
-    /* Manual argv scan — we deliberately avoid getopt so behavior
-       matches util-linux's hexdump tolerance of clustered shorts and
-       `-Cn LIMIT` style. Stop on the first non-flag word or `--`. */
+    /* Manual argv scan for separate short options and attached -n/-s/-e
+       arguments. Stop on the first non-flag word or `--`. */
     while (list && list->word->word[0] == '-' && list->word->word[1]) {
         const char *w = list->word->word;
         if (!strcmp (w, "--")) { list = list->next; break; }
@@ -713,11 +712,11 @@ hexdump_builtin (WORD_LIST *list)
             if (w[2] != '\0') {
                 nv = w + 2;
             } else {
-                if (!list->next) { builtin_error ("-n needs LIMIT"); return EX_USAGE; }
+                if (!list->next) { builtin_error ("-n needs LIMIT"); return EXECUTION_FAILURE; }
                 list = list->next;
                 nv = list->word->word;
             }
-            if (hd_parse_count (nv, &o.limit, "-n LIMIT") < 0) return EX_USAGE;
+            if (hd_parse_count (nv, &o.limit, "-n LIMIT") < 0) return EXECUTION_FAILURE;
             list = list->next;
             continue;
         }
@@ -726,11 +725,11 @@ hexdump_builtin (WORD_LIST *list)
             if (w[2] != '\0') {
                 sv = w + 2;
             } else {
-                if (!list->next) { builtin_error ("-s needs OFFSET"); return EX_USAGE; }
+                if (!list->next) { builtin_error ("-s needs OFFSET"); return EXECUTION_FAILURE; }
                 list = list->next;
                 sv = list->word->word;
             }
-            if (hd_parse_count (sv, &o.skip, "-s OFFSET") < 0) return EX_USAGE;
+            if (hd_parse_count (sv, &o.skip, "-s OFFSET") < 0) return EXECUTION_FAILURE;
             list = list->next;
             continue;
         }
@@ -738,7 +737,7 @@ hexdump_builtin (WORD_LIST *list)
             if (w[2] != '\0') {
                 o.format = (char *)w + 2;
             } else {
-                if (!list->next) { builtin_error ("-e needs FORMAT"); return EX_USAGE; }
+                if (!list->next) { builtin_error ("-e needs FORMAT"); return EXECUTION_FAILURE; }
                 list = list->next;
                 o.format = list->word->word;
             }
@@ -761,15 +760,17 @@ hexdump_builtin (WORD_LIST *list)
         if (!strcmp (w, "-x")) { o.format = "\"%07.7_ax \" 8/2 \"   %04x \" \"\\n\"";  o.shortcut = 1; list = list->next; continue; }
         builtin_error ("unknown flag: %s (try -C, -n, -s, --help)", w);
         builtin_usage ();
-        return EX_USAGE;
+        return EXECUTION_FAILURE;
     }
 
     if (o.format) {
         hd_fmt_prog prog = {0};
         if (hd_parse_format (o.format, &prog) < 0) {
             hd_fmt_free (&prog);
-            return EX_USAGE;
+            return EXECUTION_FAILURE;
         }
+
+        if (o.limit == 0) { hd_fmt_free (&prog); return EXECUTION_SUCCESS; }
 
         long long remaining = o.limit;
         long long skip_remaining = o.skip;
@@ -824,13 +825,15 @@ hexdump_builtin (WORD_LIST *list)
                end-of-input only for its built-in shortcut formats
                (-b/-c/-d/-o/-x). A user-supplied `-e` program never
                gets it — even if the program literally contains %_ax. */
-            if (o.shortcut)
+            if (o.shortcut && (base > 0 || data.len > 0))
                 printf ("%07llx\n", (unsigned long long)(base + (long long)data.len));
         }
         hd_buf_free (&data);
         hd_fmt_free (&prog);
         return rc;
     }
+
+    if (o.limit == 0) return EXECUTION_SUCCESS;
 
     long long off = 0;
     long long remaining = o.limit;
@@ -898,8 +901,10 @@ hexdump_builtin (WORD_LIST *list)
     /* Final EOF offset:
          -C       → 8 hex digits ("%08llx")
          default  → 7 hex digits ("%07llx") */
-    if (o.canonical) printf ("%08llx\n", off);
-    else             printf ("%07llx\n", off);
+    if (off > 0) {
+        if (o.canonical) printf ("%08llx\n", off);
+        else             printf ("%07llx\n", off);
+    }
 
     return rc;
 }

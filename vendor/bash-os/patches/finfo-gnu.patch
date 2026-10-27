@@ -1,0 +1,11 @@
+--- builtins/finfo.c
++++ builtins/finfo.c
+@@ -192,7 +192,7 @@
+ static int
+ getperm(int m)
+ {
+-	return (m & (S_IRWXU|S_IRWXG|S_IRWXO|S_ISUID|S_ISGID));
++	return (m & (S_IRWXU|S_IRWXG|S_IRWXO|S_ISUID|S_ISGID|S_ISVTX));
+ }
+ 
+ static void

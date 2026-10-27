@@ -381,6 +381,24 @@ bpw_passwd_path (void)
   return path;
 }
 
+/* Split all seven passwd fields, including empty ones such as GECOS.
+   strtok_r skips empty fields and silently shifts HOME into SHELL. */
+static int
+bpw_passwd_fields (char *line, char *fields[7])
+{
+  char *p = line;
+  for (int i = 0; i < 6; i++)
+    {
+      fields[i] = p;
+      p = strchr (p, ':');
+      if (!p) return -1;
+      *p++ = '\0';
+    }
+  if (strchr (p, ':')) return -1;
+  fields[6] = p;
+  return 0;
+}
+
 static const char *
 bpw_group_path (void)
 {
@@ -496,6 +514,25 @@ bpw_shadow_phc (const char *user, char *out, size_t outsz)
   return rc;
 }
 
+/* Decimal id, same acceptance as login lookup: empty and non-numeric
+   fields are rejected rather than becoming uid 0 or gid 0. */
+static int
+bpw_parse_id (const char *s, unsigned int *out)
+{
+  unsigned long v = 0;
+  if (!s || !*s || !out) return -1;
+  for (const char *p = s; *p; p++)
+    {
+      if (*p < '0' || *p > '9') return -1;
+      unsigned digit = (unsigned) (*p - '0');
+      if (v > (4294967295UL - digit) / 10) return -1;
+      v = v * 10 + digit;
+    }
+  if (v >= 4294967295UL) return -1;
+  *out = (unsigned int) v;
+  return 0;
+}
+
 static int
 bpw_lookup_user (const char *user, bpw_user *out)
 {
@@ -508,22 +545,19 @@ bpw_lookup_user (const char *user, bpw_user *out)
   while ((n = getline (&line, &cap, f)) > 0)
     {
       if (n && line[n - 1] == '\n') line[n - 1] = '\0';
-      char *save = NULL;
-      char *name = strtok_r (line, ":", &save);
-      strtok_r (NULL, ":", &save);
-      char *uid = strtok_r (NULL, ":", &save);
-      char *gid = strtok_r (NULL, ":", &save);
-      char *gecos = strtok_r (NULL, ":", &save);
-      char *home = strtok_r (NULL, ":", &save);
-      char *shell = strtok_r (NULL, ":", &save);
-      if (!name || strcmp (name, user) != 0) continue;
+      char *fields[7];
+      if (bpw_passwd_fields (line, fields) < 0 ||
+          strcmp (fields[0], user) != 0) continue;
+      unsigned int uid, gid;
+      if (bpw_parse_id (fields[2], &uid) < 0 || bpw_parse_id (fields[3], &gid) < 0)
+        continue;
       memset (out, 0, sizeof *out);
-      snprintf (out->name, sizeof out->name, "%s", name);
-      out->uid = uid ? (unsigned int) strtoul (uid, NULL, 10) : 0;
-      out->gid = gid ? (unsigned int) strtoul (gid, NULL, 10) : 0;
-      snprintf (out->gecos, sizeof out->gecos, "%s", gecos ? gecos : "");
-      snprintf (out->home, sizeof out->home, "%s", home ? home : "/");
-      snprintf (out->shell, sizeof out->shell, "%s", shell ? shell : "/bin/bash");
+      snprintf (out->name, sizeof out->name, "%s", fields[0]);
+      out->uid = uid;
+      out->gid = gid;
+      snprintf (out->gecos, sizeof out->gecos, "%s", fields[4]);
+      snprintf (out->home, sizeof out->home, "%s", *fields[5] ? fields[5] : "/");
+      snprintf (out->shell, sizeof out->shell, "%s", *fields[6] ? fields[6] : "/bin/bash");
       rc = 0;
       break;
     }
@@ -546,13 +580,11 @@ bpw_user_uid_token (const char *user, char *out, size_t outsz)
       while ((n = getline (&line, &cap, f)) > 0)
         {
           if (n && line[n - 1] == '\n') line[n - 1] = '\0';
-          char *save = NULL;
-          char *name = strtok_r (line, ":", &save);
-          strtok_r (NULL, ":", &save);
-          char *uid = strtok_r (NULL, ":", &save);
-          if (name && uid && strcmp (name, user) == 0)
+          char *fields[7];
+          if (bpw_passwd_fields (line, fields) == 0 &&
+              strcmp (fields[0], user) == 0 && *fields[2])
             {
-              snprintf (out, outsz, "%s", uid);
+              snprintf (out, outsz, "%s", fields[2]);
               free (line);
               fclose (f);
               return 0;
@@ -803,17 +835,27 @@ bpw_temp_open (const char *path, char *tmp, size_t tmpsz, mode_t mode)
 
   int n = snprintf (tmp, tmpsz, "%s/.%s.XXXXXX", dir, strrchr (path, '/') ? strrchr (path, '/') + 1 : path);
   if (n <= 0 || (size_t) n >= tmpsz)
-    { errno = ENAMETOOLONG; return -1; }
+    {
+      builtin_error ("temp file name too long for %s", path);
+      errno = ENAMETOOLONG;
+      return -1;
+    }
 
   int fd = mkstemp (tmp);
   if (fd < 0)
-    return -1;
+    {
+      int saved = errno;
+      builtin_error ("create temp file in %s: %s", dir, strerror (saved));
+      errno = saved;
+      return -1;
+    }
   if (fcntl (fd, F_SETFD, FD_CLOEXEC) < 0 ||
       fchmod (fd, mode) < 0)
     {
       int saved = errno;
       close (fd);
       unlink (tmp);
+      builtin_error ("prepare temp file %s: %s", tmp, strerror (saved));
       errno = saved;
       return -1;
     }
@@ -845,7 +887,7 @@ bpw_shadow_set (const char *user, const char *phc, int add_missing)
 
   char tmp[512];
   int fd = bpw_temp_open (path, tmp, sizeof tmp, 0600);
-  if (fd < 0) { if (in) fclose (in); builtin_error ("open %s: %s", tmp, strerror (errno)); return -1; }
+  if (fd < 0) { if (in) fclose (in); return -1; }
   FILE *out = fdopen (fd, "w");
   if (!out) { close (fd); unlink (tmp); if (in) fclose (in); return -1; }
 
@@ -1584,25 +1626,15 @@ bpw_list_cmd (WORD_LIST *args)
   while ((n = getline (&line, &cap, f)) > 0)
     {
       if (n && line[n - 1] == '\n') line[n - 1] = '\0';
-      char *copy = strdup (line);
-      if (!copy) continue;
-      char *save = NULL;
-      char *name = strtok_r (copy, ":", &save);
-      strtok_r (NULL, ":", &save);
-      char *uid = strtok_r (NULL, ":", &save);
-      char *gid = strtok_r (NULL, ":", &save);
-      strtok_r (NULL, ":", &save);
-      char *home = strtok_r (NULL, ":", &save);
-      char *shell = strtok_r (NULL, ":", &save);
-      if (name)
+      char *fields[7];
+      if (bpw_passwd_fields (line, fields) == 0 && *fields[0])
         {
           if (long_out)
-            printf ("%s:%s:%s:%s:%s\n", name, uid ? uid : "", gid ? gid : "",
-                    home ? home : "", shell ? shell : "");
+            printf ("%s:%s:%s:%s:%s\n", fields[0], fields[2], fields[3],
+                    fields[5], fields[6]);
           else
-            printf ("%s\n", name);
+            printf ("%s\n", fields[0]);
         }
-      free (copy);
     }
   free (line);
   fclose (f);

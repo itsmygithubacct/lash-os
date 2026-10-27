@@ -12,10 +12,10 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
-from runtime import digest, fetch
+from runtime import digest, fetch, guest_dependencies
 from workspace import ROOT, BUILD, DOWNLOADS, PATHS, prepare_cmake
 WORK = BUILD / 'deps'
-PACKAGES = json.loads((ROOT / 'vendor/bash-os/config/dependencies.json').read_text())
+PACKAGES = guest_dependencies(ROOT)
 
 
 def verified_archive(spec):

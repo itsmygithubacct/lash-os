@@ -27,6 +27,10 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <time.h>
+#include <ctype.h>
+#include <math.h>
+#include <limits.h>
+#include <sys/stat.h>
 #include <sys/ioctl.h>
 #include <linux/rtc.h>
 
@@ -57,6 +61,27 @@ bhc_is_leap (long long y)
   return (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0);
 }
 
+/* Linux RTC calendars have no leap-second encoding. Bound the year too,
+   before indexing months or converting driver data to time_t. */
+static int
+bhc_valid_rtc (const struct rtc_time *r)
+{
+  static const int days[] = {31,28,31,30,31,30,31,31,30,31,30,31};
+  if (r->tm_year < 0 || r->tm_year > 8099
+      || r->tm_mon < 0 || r->tm_mon > 11
+      || r->tm_hour < 0 || r->tm_hour > 23
+      || r->tm_min < 0 || r->tm_min > 59
+      || r->tm_sec < 0 || r->tm_sec > 59
+      || r->tm_mday < 1
+      || r->tm_mday > days[r->tm_mon]
+          + (r->tm_mon == 1 && bhc_is_leap (r->tm_year + 1900)))
+    {
+      builtin_error ("invalid RTC calendar (supported years: 1900..9999)");
+      return -1;
+    }
+  return 0;
+}
+
 static long long
 bhc_days_before_year (long long y)
 {
@@ -64,7 +89,7 @@ bhc_days_before_year (long long y)
   return yy * 365 + yy / 4 - yy / 100 + yy / 400;
 }
 
-static time_t
+static long long
 bhc_timegm_rtc (const struct rtc_time *r)
 {
   static const int mdays_norm[12] =
@@ -78,7 +103,7 @@ bhc_timegm_rtc (const struct rtc_time *r)
         days++;
     }
   days += r->tm_mday - 1;
-  return (time_t) (days * 86400LL + r->tm_hour * 3600
+  return (days * 86400LL + r->tm_hour * 3600
                    + r->tm_min * 60 + r->tm_sec);
 }
 
@@ -86,6 +111,8 @@ static int
 bhc_rtc_to_time (const struct rtc_time *rt, enum bhc_time_mode mode,
                  time_t *out)
 {
+  if (bhc_valid_rtc (rt) < 0)
+    return -1;
   if (mode == BHC_LOCALTIME)
     {
       struct tm tmv;
@@ -99,17 +126,33 @@ bhc_rtc_to_time (const struct rtc_time *rt, enum bhc_time_mode mode,
       tmv.tm_wday = rt->tm_wday;
       tmv.tm_yday = rt->tm_yday;
       tmv.tm_isdst = -1;
-      errno = 0;
       *out = mktime (&tmv);
-      if (*out == (time_t) -1 && errno != 0)
+      /* -1 is a valid epoch. Successful timezone loading may still leave
+         errno set, so verify the resulting wall calendar instead. This also
+         rejects overflow and mktime's normalization across a DST gap. */
+      struct tm check;
+      if (localtime_r (out, &check) == NULL)
         {
-          builtin_error ("mktime: %s", strerror (errno));
+          builtin_error ("localtime_r: %s", strerror (errno));
+          return -1;
+        }
+      if (check.tm_year != rt->tm_year || check.tm_mon != rt->tm_mon
+          || check.tm_mday != rt->tm_mday || check.tm_hour != rt->tm_hour
+          || check.tm_min != rt->tm_min || check.tm_sec != rt->tm_sec)
+        {
+          builtin_error ("nonexistent or out-of-range local RTC time");
           return -1;
         }
       return 0;
     }
 
-  *out = bhc_timegm_rtc (rt);
+  long long seconds = bhc_timegm_rtc (rt);
+  *out = (time_t) seconds;
+  if ((long long) *out != seconds)
+    {
+      builtin_error ("RTC time is outside time_t range");
+      return -1;
+    }
   return 0;
 }
 
@@ -135,18 +178,62 @@ bhc_time_to_rtc (time_t t, enum bhc_time_mode mode, struct rtc_time *rt)
   rt->tm_wday = tmv.tm_wday;
   rt->tm_yday = tmv.tm_yday;
   rt->tm_isdst = 0;
-  return 0;
+  return bhc_valid_rtc (rt);
 }
 
 static int
 bhc_read_line (FILE *fp, char *buf, size_t len, const char *path)
 {
-  if (fgets (buf, len, fp) == NULL)
+  size_t n = 0;
+  int c;
+  while ((c = fgetc (fp)) != EOF && c != '\n')
     {
-      builtin_error ("%s: invalid adjtime file", path);
-      return -1;
+      if (c == 0 || n + 1 >= len)
+        goto invalid;
+      buf[n++] = c;
     }
-  buf[strcspn (buf, "\r\n")] = '\0';
+  if (ferror (fp) || (c == EOF && n == 0))
+    goto invalid;
+  if (n && buf[n-1] == '\r') n--;
+  buf[n] = '\0';
+  return 0;
+invalid:
+  builtin_error ("%s: invalid adjtime file", path);
+  return -1;
+}
+
+static char *
+bhc_skip_space (char *p)
+{
+  while (isspace ((unsigned char) *p)) p++;
+  return p;
+}
+
+/* Parse each field separately: scanf accepts overflowing integers and trailing
+   garbage, and nonfinite floats would make later time_t casts undefined. */
+static int
+bhc_adj_double (char **p, double *v)
+{
+  char *end;
+  *p = bhc_skip_space (*p);
+  errno = 0;
+  *v = strtod (*p, &end);
+  if (errno || end == *p || !isfinite (*v)
+      || (*end && !isspace ((unsigned char) *end))) return -1;
+  *p = end;
+  return 0;
+}
+
+static int
+bhc_adj_integer (char **p, long long *v)
+{
+  char *end;
+  *p = bhc_skip_space (*p);
+  errno = 0;
+  *v = strtoll (*p, &end, 10);
+  if (errno || end == *p
+      || (*end && !isspace ((unsigned char) *end))) return -1;
+  *p = end;
   return 0;
 }
 
@@ -154,7 +241,7 @@ static int
 bhc_parse_adjtime (const char *path, struct bhc_adjtime *adj)
 {
   char line1[128], line2[128], line3[128];
-  char *endp;
+  char *cursor;
   FILE *fp;
 
   adj->drift_factor = 0.0;
@@ -179,19 +266,30 @@ bhc_parse_adjtime (const char *path, struct bhc_adjtime *adj)
       fclose (fp);
       return -1;
     }
-  fclose (fp);
+  int c, extra = 0;
+  while ((c = fgetc (fp)) != EOF)
+    if (!isspace ((unsigned char) c)) extra = 1;
+  if (ferror (fp)) extra = 1;
+  if (fclose (fp) != 0) extra = 1;
+  if (extra)
+    {
+      builtin_error ("%s: invalid adjtime trailing data", path);
+      return -1;
+    }
 
-  if (sscanf (line1, "%lf %lld %lf",
-              &adj->drift_factor, &adj->last_adjust,
-              &adj->not_adjusted) != 3)
+  cursor = line1;
+  if (bhc_adj_double (&cursor, &adj->drift_factor) < 0
+      || bhc_adj_integer (&cursor, &adj->last_adjust) < 0
+      || bhc_adj_double (&cursor, &adj->not_adjusted) < 0
+      || *bhc_skip_space (cursor))
     {
       builtin_error ("%s: invalid adjtime drift line", path);
       return -1;
     }
 
-  errno = 0;
-  adj->last_calib = strtoll (line2, &endp, 10);
-  if (errno != 0 || endp == line2 || (*endp != '\0' && *endp != ' '))
+  cursor = line2;
+  if (bhc_adj_integer (&cursor, &adj->last_calib) < 0
+      || *bhc_skip_space (cursor))
     {
       builtin_error ("%s: invalid adjtime calibration line", path);
       return -1;
@@ -213,41 +311,80 @@ bhc_parse_adjtime (const char *path, struct bhc_adjtime *adj)
 static int
 bhc_write_adjtime (const char *path, const struct bhc_adjtime *adj)
 {
-  FILE *fp = fopen (path, "w");
+  /* Replace only after a complete write. A failed write/close/rename must
+     leave the existing calibration intact and remove the private temporary. */
+  struct stat st;
+  char *target = realpath (path, NULL);
+  if (target == NULL)
+    {
+      /* A new adjfile is allowed; a broken symlink is not replaced. */
+      if (errno != ENOENT || lstat (path, &st) == 0)
+        { builtin_error ("%s: cannot resolve adjtime path", path); return -1; }
+      target = strdup (path);
+      if (target == NULL) { builtin_error ("out of memory"); return -1; }
+    }
+  size_t len = strlen (target);
+  char *temp = malloc (len + sizeof ".XXXXXX");
+  if (temp == NULL)
+    { builtin_error ("out of memory"); free (target); return -1; }
+  sprintf (temp, "%s.XXXXXX", target);
+  int fd = mkstemp (temp);
+  if (fd < 0)
+    { builtin_error ("%s: %s", path, strerror (errno)); free (temp); free (target); return -1; }
+  int failed = 0;
+  if (stat (target, &st) == 0)
+    {
+      if (fchown (fd, st.st_uid, st.st_gid) < 0
+          || fchmod (fd, st.st_mode & 0777) < 0) failed = 1;
+    }
+  else if (errno != ENOENT) failed = 1;
+  FILE *fp = fdopen (fd, "w");
   if (fp == NULL)
+    { failed = 1; close (fd); }
+  else
     {
-      builtin_error ("%s: %s", path, strerror (errno));
-      return -1;
+      if (fprintf (fp, "%.6f %lld %.6f\n%lld\n%s\n",
+                   adj->drift_factor, adj->last_adjust, adj->not_adjusted,
+                   adj->last_calib,
+                   adj->mode == BHC_LOCALTIME ? "LOCAL" : "UTC") < 0)
+        failed = 1;
+      if (fclose (fp) != 0) failed = 1;
     }
-  /* close the stream on the write-failure path too: short-circuiting the
-     fclose behind the fprintf test leaked it */
-  int failed = fprintf (fp, "%.6f %lld %.6f\n%lld\n%s\n",
-                        adj->drift_factor, adj->last_adjust, adj->not_adjusted,
-                        adj->last_calib,
-                        adj->mode == BHC_LOCALTIME ? "LOCAL" : "UTC") < 0;
-  if (fclose (fp) != 0)
-    failed = 1;
+  if (!failed && rename (temp, target) < 0) failed = 1;
+  int saved_errno = errno;
+  if (failed) unlink (temp);
+  free (temp);
+  free (target);
   if (failed)
-    {
-      builtin_error ("%s: %s", path, strerror (errno));
-      return -1;
-    }
+    { builtin_error ("%s: %s", path, strerror (saved_errno)); return -1; }
   return 0;
 }
 
-static double
-bhc_drift_correction (const struct bhc_adjtime *adj, time_t rtc_time)
+static int
+bhc_correct_time (const struct bhc_adjtime *adj, time_t rtc_time,
+                  time_t *adjusted, double *remainder)
 {
-  if (adj->last_adjust == 0)
-    return 0.0;
-  return (((double) rtc_time - (double) adj->last_adjust)
-          * adj->drift_factor / BHC_SECONDS_PER_DAY) + adj->not_adjusted;
+  long double correction = 0;
+  if (adj->last_adjust != 0)
+    correction = (((long double) rtc_time - adj->last_adjust)
+                   * adj->drift_factor / BHC_SECONDS_PER_DAY) + adj->not_adjusted;
+  long double whole = truncl (correction);
+  long double value = (long double) rtc_time - whole;
+  long double limit = ldexpl (1.0L, sizeof (time_t) * CHAR_BIT - 1);
+  if (!isfinite (value) || value < -limit || value >= limit)
+    {
+      builtin_error ("adjtime correction is outside time_t range");
+      return -1;
+    }
+  *adjusted = (time_t) value;
+  *remainder = (double) (correction - whole);
+  return 0;
 }
 
 static int
 bhc_open_rtc (const char *path, int write_mode)
 {
-  int fd = open (path, write_mode ? O_WRONLY : O_RDONLY);
+  int fd = open (path, (write_mode ? O_WRONLY : O_RDONLY) | O_CLOEXEC);
   if (fd < 0)
     builtin_error ("%s: %s", path, strerror (errno));
   return fd;
@@ -265,7 +402,8 @@ bhc_read_rtc (const char *path, struct rtc_time *rt)
       close (fd);
       return -1;
     }
-  close (fd);
+  if (close (fd) < 0)
+    { builtin_error ("close RTC: %s", strerror (errno)); return -1; }
   return 0;
 }
 
@@ -281,16 +419,26 @@ bhc_write_rtc (const char *path, const struct rtc_time *rt)
       close (fd);
       return -1;
     }
-  close (fd);
+  if (close (fd) < 0)
+    { builtin_error ("close RTC: %s", strerror (errno)); return -1; }
   return 0;
 }
 
-static void
+static int
+bhc_output_status (void)
+{
+  if (fflush (stdout) == EOF || ferror (stdout))
+    { builtin_error ("write error: %s", strerror (errno)); return EXECUTION_FAILURE; }
+  return EXECUTION_SUCCESS;
+}
+
+static int
 bhc_print_rtc (const struct rtc_time *rt)
 {
   printf ("%04d-%02d-%02dT%02d:%02d:%02d\n",
           rt->tm_year + 1900, rt->tm_mon + 1, rt->tm_mday,
           rt->tm_hour, rt->tm_min, rt->tm_sec);
+  return bhc_output_status ();
 }
 
 static int
@@ -300,8 +448,9 @@ bhc_show (const char *rtc_path)
   memset (&rt, 0, sizeof rt);
   if (bhc_read_rtc (rtc_path, &rt) < 0)
     return EXECUTION_FAILURE;
-  bhc_print_rtc (&rt);
-  return EXECUTION_SUCCESS;
+  if (bhc_valid_rtc (&rt) < 0)
+    return EXECUTION_FAILURE;
+  return bhc_print_rtc (&rt);
 }
 
 static int
@@ -315,8 +464,9 @@ bhc_hctosys (const char *rtc_path, enum bhc_time_mode mode,
     return EXECUTION_FAILURE;
   if (bhc_rtc_to_time (&rt, mode, &ts.tv_sec) < 0)
     return EXECUTION_FAILURE;
-  if (use_adjtime)
-    ts.tv_sec -= (time_t) bhc_drift_correction (adj, ts.tv_sec);
+  double remainder;
+  if (use_adjtime && bhc_correct_time (adj, ts.tv_sec, &ts.tv_sec, &remainder) < 0)
+    return EXECUTION_FAILURE;
   ts.tv_nsec = 0;
   if (clock_settime (CLOCK_REALTIME, &ts) < 0)
     {
@@ -327,7 +477,8 @@ bhc_hctosys (const char *rtc_path, enum bhc_time_mode mode,
 }
 
 static int
-bhc_systohc (const char *rtc_path, enum bhc_time_mode mode)
+bhc_systohc (const char *rtc_path, enum bhc_time_mode mode,
+             const char *adj_path, struct bhc_adjtime *adj, int use_adjtime)
 {
   struct timespec ts;
   struct rtc_time rt;
@@ -341,6 +492,14 @@ bhc_systohc (const char *rtc_path, enum bhc_time_mode mode)
     return EXECUTION_FAILURE;
   if (bhc_write_rtc (rtc_path, &rt) < 0)
     return EXECUTION_FAILURE;
+  if (use_adjtime)
+    {
+      adj->last_adjust = adj->last_calib = (long long) ts.tv_sec;
+      adj->not_adjusted = 0;
+      adj->mode = mode;
+      if (bhc_write_adjtime (adj_path, adj) < 0)
+        return EXECUTION_FAILURE;
+    }
   return EXECUTION_SUCCESS;
 }
 
@@ -350,7 +509,7 @@ bhc_adjust (const char *rtc_path, const char *adj_path,
 {
   struct rtc_time rt;
   time_t rtc_time, adjusted;
-  double correction;
+  double remainder;
 
   if (adj->last_adjust == 0)
     {
@@ -364,18 +523,17 @@ bhc_adjust (const char *rtc_path, const char *adj_path,
   if (bhc_rtc_to_time (&rt, mode, &rtc_time) < 0)
     return EXECUTION_FAILURE;
 
-  correction = bhc_drift_correction (adj, rtc_time);
-  if (correction < 1.0 && correction > -1.0)
+  if (bhc_correct_time (adj, rtc_time, &adjusted, &remainder) < 0)
+    return EXECUTION_FAILURE;
+  if (adjusted == rtc_time)
     return EXECUTION_SUCCESS;
-
-  adjusted = rtc_time - (time_t) correction;
   if (bhc_time_to_rtc (adjusted, mode, &rt) < 0)
     return EXECUTION_FAILURE;
   if (bhc_write_rtc (rtc_path, &rt) < 0)
     return EXECUTION_FAILURE;
 
   adj->last_adjust = (long long) adjusted;
-  adj->not_adjusted = 0.0;
+  adj->not_adjusted = remainder;
   adj->mode = mode;
   if (bhc_write_adjtime (adj_path, adj) < 0)
     return EXECUTION_FAILURE;
@@ -392,11 +550,13 @@ bhc_help (void)
   puts ("       hwclock --adjust [--adjfile PATH] [--rtc PATH|--rtc=PATH]");
   puts ("       hwclock --help | --version");
   puts ("Default mode treats RTC as UTC unless /etc/adjtime says LOCAL.");
+  puts ("--show prints the raw RTC calendar as YYYY-MM-DDTHH:MM:SS.");
+  puts ("Local conversions reject DST gaps; repeated DST hours follow libc mktime.");
   puts ("Short forms (util-linux): -r show, -s hctosys, -w systohc, -a adjust,");
   puts ("  -u utc, -l localtime, -f PATH rtc, -V version.");
   puts ("--adjfile PATH selects an alternate adjtime file; --noadjfile disables it.");
   puts ("--hctosys/--systohc need CAP_SYS_TIME.");
-  return EXECUTION_SUCCESS;
+  return bhc_output_status ();
 }
 
 int
@@ -411,13 +571,14 @@ hwclock_builtin (WORD_LIST *list)
   const char *adj_path = BHC_ADJTIME_PATH;
   struct bhc_adjtime adj;
 
+  clearerr (stdout);
   for (; list; list = list->next)
     {
       const char *arg = list->word->word;
       if (strcmp (arg, "--help") == 0 || strcmp (arg, "-h") == 0)
         return bhc_help ();
       if (strcmp (arg, "--version") == 0 || strcmp (arg, "-V") == 0)
-        { puts ("hwclock 0.4"); return EXECUTION_SUCCESS; }
+        { puts ("hwclock 0.4"); return bhc_output_status (); }
       if (strcmp (arg, "--adjfile") == 0)
         {
           list = list->next;
@@ -428,6 +589,8 @@ hwclock_builtin (WORD_LIST *list)
               return EX_USAGE;
             }
           adj_path = list->word->word;
+          if (*adj_path == '\0')
+            { builtin_error ("--adjfile: empty path"); return EX_USAGE; }
           use_adjtime = 1;
           continue;
         }
@@ -474,6 +637,8 @@ hwclock_builtin (WORD_LIST *list)
               return EX_USAGE;
             }
           rtc_path = list->word->word;
+          if (*rtc_path == '\0')
+            { builtin_error ("--rtc: empty path"); return EX_USAGE; }
           continue;
         }
       if (strncmp (arg, "--rtc=", 6) == 0)
@@ -555,7 +720,7 @@ hwclock_builtin (WORD_LIST *list)
     case BHC_HCTOSYS:
       return bhc_hctosys (rtc_path, time_mode, &adj, use_adjtime);
     case BHC_SYSTOHC:
-      return bhc_systohc (rtc_path, time_mode);
+      return bhc_systohc (rtc_path, time_mode, adj_path, &adj, use_adjtime);
     case BHC_ADJUST:
       return bhc_adjust (rtc_path, adj_path, time_mode, &adj);
     }
@@ -582,6 +747,8 @@ char *hwclock_doc[] = {
   "    hwclock --help | --version",
   "",
   "Default mode treats RTC as UTC unless adjtime says LOCAL.",
+  "--show prints the raw RTC calendar as YYYY-MM-DDTHH:MM:SS (years 1900..9999).",
+  "Local conversions reject DST gaps; repeated DST hours follow libc mktime.",
   "Short forms (util-linux): -r/-s/-w/-a actions; -u/-l mode; -f PATH rtc; -V version.",
   "--adjfile PATH selects an alternate adjtime file; --noadjfile disables it.",
   "Set paths need CAP_SYS_TIME.",

@@ -74,7 +74,7 @@ typedef struct ndu_node {
     off_t    asize;   /* aggregated apparent bytes (st_size), deduped */
     long     items;   /* count of descendant entries (excl. self) */
     int      is_dir;
-    int      err;     /* could not read this directory */
+    int      err;     /* saved errno for an incomplete scan */
     dev_t    dev;
     ino_t    ino;
     struct ndu_node  *parent;
@@ -185,8 +185,9 @@ ndu_scan (const char *path, const char *name, const ndu_opt *o,
 {
     struct stat st;
     if (lstat (path, &st) != 0) {
+        int scan_errno = errno;
         ndu_node *n = ndu_new (name);
-        if (n) n->err = 1;
+        if (n) n->err = scan_errno;
         return n;
     }
 
@@ -222,40 +223,67 @@ ndu_scan (const char *path, const char *name, const ndu_opt *o,
         return n;
 
     DIR *d = opendir (path);
-    if (!d) { n->err = 1; return n; }
+    if (!d) { n->err = errno; return n; }
 
     /* Read child names first, then closedir, then recurse — avoids holding
        an fd open per directory level (fd exhaustion on deep trees). */
     char **names = NULL; int ncap = 0, nn = 0;
     struct dirent *de;
-    while ((de = readdir (d)) != NULL) {
+    for (;;) {
+        errno = 0;
+        de = readdir (d);
+        if (!de) { if (errno) n->err = errno; break; }
         if (!strcmp (de->d_name, ".") || !strcmp (de->d_name, "..")) continue;
         if (nn == ncap) {
             int c2 = ncap ? ncap * 2 : 16;
             char **t = (char **) realloc (names, (size_t) c2 * sizeof *t);
-            if (!t) { n->err = 1; break; }
+            if (!t) { n->err = ENOMEM; break; }
             names = t; ncap = c2;
         }
         names[nn] = strdup (de->d_name);
-        if (!names[nn]) { n->err = 1; break; }
+        if (!names[nn]) { n->err = ENOMEM; break; }
         nn++;
     }
-    closedir (d);
+    if (closedir (d) != 0 && !n->err) n->err = errno;
 
     for (int i = 0; i < nn; i++) {
         char *cp = ndu_join (path, names[i]);
-        if (!cp) { n->err = 1; free (names[i]); continue; }
+        if (!cp) { n->err = ENOMEM; free (names[i]); continue; }
         ndu_node *c = ndu_scan (cp, names[i], o, seen, dev_root);
         free (cp);
         free (names[i]);
-        if (!c) { n->err = 1; continue; }
-        if (ndu_add_child (n, c) != 0) { ndu_free (c); n->err = 1; continue; }
+        if (!c) { n->err = ENOMEM; continue; }
+        if (ndu_add_child (n, c) != 0) { ndu_free (c); n->err = ENOMEM; continue; }
         n->disk  += c->disk;
         n->asize += c->asize;
         n->items += c->items + 1;
     }
     free (names);
     return n;
+}
+
+/* Keep partial directory totals useful, while reporting every incomplete
+   scan and returning failure instead of presenting it as complete usage. */
+static int
+ndu_report_errors (const ndu_node *n, const char *path)
+{
+    int rc = EXECUTION_SUCCESS;
+    if (n->err) {
+        builtin_error ("%s: %s", path, strerror (n->err));
+        rc = EXECUTION_FAILURE;
+    }
+    for (int i = 0; i < n->nchild; i++) {
+        char *cp = ndu_join (path, n->child[i]->name);
+        if (!cp) {
+            builtin_error ("out of memory reporting scan of %s", path);
+            rc = EXECUTION_FAILURE;
+            continue;
+        }
+        if (ndu_report_errors (n->child[i], cp) != EXECUTION_SUCCESS)
+            rc = EXECUTION_FAILURE;
+        free (cp);
+    }
+    return rc;
 }
 
 /* --- batch: du-compatible per-directory listing (post-order) ----------- */
@@ -530,13 +558,20 @@ ncdu_builtin (WORD_LIST *list)
     hlset seen; memset (&seen, 0, sizeof seen);
     struct stat rst;
     dev_t dev_root = 0;
-    if (lstat (path, &rst) == 0) dev_root = rst.st_dev;
+    if (lstat (path, &rst) != 0) {
+        builtin_error ("%s: %s", path, strerror (errno));
+        return EXECUTION_FAILURE;
+    }
+    dev_root = rst.st_dev;
 
     ndu_node *root = ndu_scan (path, path, &o, &seen, dev_root);
     free (seen.s);
     if (!root) { builtin_error ("out of memory scanning %s", path); return EXECUTION_FAILURE; }
 
-    int rc = EXECUTION_SUCCESS;
+    int rc = ndu_report_errors (root, path);
+    /* The operand may have disappeared between the initial stat and scan.
+       A failed stat has no usable total or listing row to print. */
+    if (root->err && !root->is_dir) { ndu_free (root); return rc; }
     if (do_total) {
         printf ("%lld\n", (long long) ndu_val (root, &o));
     } else if (do_print || !isatty (STDOUT_FILENO)) {
@@ -548,7 +583,8 @@ ncdu_builtin (WORD_LIST *list)
         if (!root->is_dir) {
             printf ("%lld\t%s\n", (long long) ndu_val (root, &o), path);
         } else {
-            rc = ndu_browse (root, &o);
+            if (ndu_browse (root, &o) != EXECUTION_SUCCESS)
+                rc = EXECUTION_FAILURE;
         }
     }
 
@@ -564,6 +600,7 @@ char *ncdu_doc[] = {
     "Scans PATH (default '.') and presents an interactive full-screen browser",
     "(raw termios + ANSI, no ncurses). Disk usage follows GNU du: blocks*512,",
     "hardlinks counted once. Non-tty stdout falls back to a du-compatible listing.",
+    "Scan errors are diagnosed and return failure; unavailable operands emit no row.",
     "",
     "Options:",
     "    -a, --apparent-size   report apparent size (st_size)",

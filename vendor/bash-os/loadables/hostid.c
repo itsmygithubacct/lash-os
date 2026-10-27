@@ -90,7 +90,7 @@ hostid_builtin (WORD_LIST *list)
     if (list) {
         builtin_error ("hostid takes no arguments");
         builtin_usage ();
-        return EX_USAGE;
+        return EXECUTION_FAILURE;
     }
     const char *machine_id_path = getenv ("BASHHOSTID_MACHINE_ID_PATH");
     unsigned long id;

@@ -620,6 +620,18 @@ bcl_attempt (const char *req, size_t reqlen, int raw, int insecure,
   return net;
 }
 
+/* bash hands a loadable one buffer for a variable set for a single
+   command (VAR=x cmd) and frees it when the next one is asked for, so a
+   value has to be taken away before another is read. */
+static const char *
+bcl_env (const char *name, char *out, size_t outsz)
+{
+  const char *value = getenv (name);
+  if (!value || !*value) return NULL;
+  snprintf (out, outsz, "%s", value);
+  return out;
+}
+
 /* POST a fully-formed JSON request BODY (blen bytes) to /v1/messages, with
  * bounded exponential-backoff retry on 429/5xx and transient network failures
  * (retried only before any stdout output, so a partial stream is never
@@ -643,10 +655,14 @@ bcl_send (const char *body, size_t blen, int raw, int insecure)
   if (mlock (kbuf, klen + 1) < 0 && errno == EAGAIN)
     builtin_error ("claude: warning: could not mlock API key (RLIMIT_MEMLOCK too small; run `mlock all` or raise ulimit -l)");
 
-  const char *host = getenv ("BASHCLAUDE_HOST"); if (!host || !*host) host = BCL_DEFAULT_HOST;
-  const char *apiver = getenv ("BASHCLAUDE_API_VERSION"); if (!apiver || !*apiver) apiver = BCL_API_VERSION;
-  const char *ca = getenv ("BASHCLAUDE_CA"); if (ca && !*ca) ca = NULL;
-  const char *ps = getenv ("BASHCLAUDE_PORT");
+  char host_held[512], apiver_held[64], ca_held[4096], ps_held[32];
+  const char *host = bcl_env ("BASHCLAUDE_HOST", host_held, sizeof host_held);
+  if (!host) host = BCL_DEFAULT_HOST;
+  const char *apiver = bcl_env ("BASHCLAUDE_API_VERSION", apiver_held,
+                                sizeof apiver_held);
+  if (!apiver) apiver = BCL_API_VERSION;
+  const char *ca = bcl_env ("BASHCLAUDE_CA", ca_held, sizeof ca_held);
+  const char *ps = bcl_env ("BASHCLAUDE_PORT", ps_held, sizeof ps_held);
   int port = (ps && *ps) ? atoi (ps) : BCL_DEFAULT_PORT;
 
   sbuf req = {0};
@@ -783,8 +799,8 @@ bcl_cmd_parse_response (WORD_LIST *l)
 static const char *
 bcl_default_model (void)
 {
-  const char *m = getenv ("BASHCLAUDE_MODEL");
-  return (m && *m) ? m : BCL_DEFAULT_MODEL;
+  static char held[128];
+  return bcl_env ("BASHCLAUDE_MODEL", held, sizeof held) ? held : BCL_DEFAULT_MODEL;
 }
 
 static int

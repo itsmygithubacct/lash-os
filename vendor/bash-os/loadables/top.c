@@ -47,6 +47,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <limits.h>
 #include <fcntl.h>
 #include <ctype.h>
 #include <dirent.h>
@@ -86,6 +87,7 @@ typedef struct {
     long  rss_pages;    /* RSS in pages */
     long  vsize_bytes;
     long  nice;
+    unsigned long long starttime; /* identity across PID reuse */
     /* derived */
     long  cpu_total;    /* utime + stime, current snapshot */
     long  cpu_delta;    /* (utime+stime) - prev (utime+stime) */
@@ -94,7 +96,7 @@ typedef struct {
 
 /* --- system-wide snapshot ------------------------------------------------ */
 typedef struct {
-    long  cpu_jiffies_total;  /* sum of all fields in /proc/stat cpu line */
+    long  cpu_jiffies_total;  /* first eight fields of /proc/stat cpu line */
     long  mem_total_kb;
     long  mem_avail_kb;
     long  swap_total_kb;
@@ -120,7 +122,7 @@ static const char *btop_sort_name[BTOP_SORT__COUNT] = {
 typedef struct {
     int  pid;
     long cpu_total;
-    long cpu_jiffies_total;  /* system total at that snapshot */
+    unsigned long long starttime;
 } btop_prev;
 
 static btop_prev *btop_prev_tbl = NULL;
@@ -185,13 +187,13 @@ btop_read_stat (int pid, btop_proc *p)
         "%*u %*u %*u %*u "                       /* minflt cminflt majflt cmajflt */
         "%ld %ld %*d %*d "                       /* utime stime cutime cstime */
         "%ld %ld "                               /* priority nice */
-        "%*d %*d %*d "                           /* num_threads itrealvalue starttime placeholder */
+        "%*d %*d %llu "                           /* num_threads itrealvalue starttime */
         "%ld %ld",                               /* vsize rss */
         &p->state, &p->ppid,
         &p->utime, &p->stime,
-        &prio, &p->nice,
+        &prio, &p->nice, &p->starttime,
         &p->vsize_bytes, &p->rss_pages);
-    if (got < 4) return -1;
+    if (got != 9) return -1;
 
     p->pid = pid;
     p->cpu_total = p->utime + p->stime;
@@ -234,7 +236,7 @@ btop_read_stat (int pid, btop_proc *p)
     return 0;
 }
 
-/* Read /proc/stat first 'cpu' line; sum fields = total jiffies across CPUs. */
+/* Read /proc/stat first 'cpu' line; sum the first eight fields (guest is already in user/nice). */
 static long
 btop_read_cpu_total (void)
 {
@@ -250,7 +252,7 @@ btop_read_cpu_total (void)
     char *p = buf + 3;
     long total = 0;
     char *end;
-    while (*p && *p != '\n') {
+    for (int field = 0; field < 8 && *p && *p != '\n'; field++) {
         while (*p == ' ' || *p == '\t') p++;
         if (*p == '\n' || *p == '\0') break;
         long v = strtol (p, &end, 10);
@@ -334,10 +336,11 @@ btop_sample (btop_proc *procs, int cap, btop_sys *sys)
 
 /* --- prev-snapshot lookup ---------------------------------------------- */
 static long
-btop_prev_lookup (int pid)
+btop_prev_lookup (int pid, unsigned long long starttime)
 {
     for (int i = 0; i < btop_prev_n; i++)
-        if (btop_prev_tbl[i].pid == pid) return btop_prev_tbl[i].cpu_total;
+        if (btop_prev_tbl[i].pid == pid && btop_prev_tbl[i].starttime == starttime)
+            return btop_prev_tbl[i].cpu_total;
     return -1;
 }
 
@@ -352,6 +355,7 @@ btop_prev_store (btop_proc *procs, int n, long cpu_total)
     for (int i = 0; i < n; i++) {
         btop_prev_tbl[i].pid = procs[i].pid;
         btop_prev_tbl[i].cpu_total = procs[i].cpu_total;
+        btop_prev_tbl[i].starttime = procs[i].starttime;
     }
 }
 
@@ -360,10 +364,9 @@ static void
 btop_compute_pcpu (btop_proc *procs, int n, long cpu_total)
 {
     long delta_total = cpu_total - btop_prev_total;
-    if (delta_total <= 0) delta_total = 1;  /* avoid div-by-zero */
     for (int i = 0; i < n; i++) {
-        long prev = btop_prev_lookup (procs[i].pid);
-        if (prev < 0) { procs[i].cpu_delta = 0; procs[i].pcpu = 0.0; continue; }
+        long prev = btop_prev_lookup (procs[i].pid, procs[i].starttime);
+        if (prev < 0 || delta_total <= 0) { procs[i].cpu_delta = 0; procs[i].pcpu = 0.0; continue; }
         long d = procs[i].cpu_total - prev;
         if (d < 0) d = 0;
         procs[i].cpu_delta = d;
@@ -539,7 +542,28 @@ btop_run_once (btop_sort sort, int row_cap)
         btop_print_row (stdout, &procs[i]);
 
     free (procs);
+    if (fflush (stdout) == EOF || ferror (stdout)) {
+        builtin_error ("write error: %s", strerror (errno));
+        return EXECUTION_FAILURE;
+    }
     return EXECUTION_SUCCESS;
+}
+
+/* Strict decimal input: reject prefixes, whitespace, suffixes and overflow. */
+static int
+btop_parse_int (const char *s, int min, int max, int *value)
+{
+    if (!s || !*s) return -1;
+    const char *p = s;
+    if (*p == '-' && min < 0) p++;
+    if (!*p) return -1;
+    for (; *p; p++) if (*p < '0' || *p > '9') return -1;
+    errno = 0;
+    char *end;
+    long v = strtol (s, &end, 10);
+    if (errno == ERANGE || *end || v < min || v > max) return -1;
+    *value = (int) v;
+    return 0;
 }
 
 /* --- interactive mode -------------------------------------------------- */
@@ -550,6 +574,10 @@ btop_run_interactive (int delay_sec, btop_sort sort, int max_iters, int row_cap)
     if (!procs) { builtin_error ("out of memory"); return EXECUTION_FAILURE; }
     btop_sys sys; memset (&sys, 0, sizeof sys);
 
+    struct sigaction old_winch, old_term, old_hup;
+    sigaction (SIGWINCH, NULL, &old_winch);
+    sigaction (SIGTERM, NULL, &old_term);
+    sigaction (SIGHUP, NULL, &old_hup);
     if (bls_init () != 0) { free (procs); builtin_error ("not a terminal"); return EXECUTION_FAILURE; }
     bls_win *win = bls_stdscr ();
     bls_timeout (delay_sec * 1000);
@@ -578,9 +606,12 @@ btop_run_interactive (int delay_sec, btop_sort sort, int max_iters, int row_cap)
 
             /* Clamp scroll offset against the post-sample list. */
             if (scroll < 0) scroll = 0;
-            if (n > 0 && scroll > n - 1) scroll = n - 1;
+            if (n == 0) scroll = 0;
+            else if (scroll > n - 1) scroll = n - 1;
             last_n = n;
 
+            /* Let the helper apply a pending resize before calculating rows. */
+            bls_refresh (win);
             bls_erase (win);
             int hr = btop_draw_header (win, &sys, delay_sec, sort, extra);
             int limit = bls_lines () - hr;
@@ -662,9 +693,11 @@ btop_run_interactive (int delay_sec, btop_sort sort, int max_iters, int row_cap)
             case 'n': case 'N': {
                 char buf[32];
                 if (bls_getnstr (win, bls_lines () - 1, 0,"delay (s): ", buf, sizeof buf) > 0) {
-                    int v = atoi (buf);
-                    if (v > 0 && v < 3600) { delay_sec = v; bls_timeout (delay_sec * 1000); }
-                    snprintf (extra, sizeof extra, "delay → %ds", delay_sec);
+                    int v;
+                    if (btop_parse_int (buf, 1, 3599, &v) == 0) {
+                        delay_sec = v; bls_timeout (delay_sec * 1000);
+                        snprintf (extra, sizeof extra, "delay → %ds", delay_sec);
+                    } else snprintf (extra, sizeof extra, "invalid delay (1..3599)");
                 }
                 redraw = 1;
                 break;
@@ -677,13 +710,13 @@ btop_run_interactive (int delay_sec, btop_sort sort, int max_iters, int row_cap)
                 if (bls_getnstr (win, bls_lines () - 1, 0,"signal [TERM]: ", sigbuf, sizeof sigbuf) < 0) {
                     redraw = 1; break;
                 }
-                int pid = atoi (pidbuf);
-                int sig = SIGTERM;
-                if (sigbuf[0]) {
-                    int v = atoi (sigbuf);
-                    if (v > 0) sig = v;
+                int pid, sig = SIGTERM;
+                if (btop_parse_int (pidbuf, 1, INT_MAX, &pid) < 0 ||
+                    (sigbuf[0] && btop_parse_int (sigbuf, 1, NSIG - 1, &sig) < 0)) {
+                    snprintf (extra, sizeof extra, "invalid PID or signal");
+                    redraw = 1; break;
                 }
-                if (pid > 0 && kill (pid, sig) == 0)
+                if (kill (pid, sig) == 0)
                     snprintf (extra, sizeof extra, "kill -%d %d ok", sig, pid);
                 else
                     snprintf (extra, sizeof extra, "kill -%d %d: %s", sig, pid, strerror (errno));
@@ -698,8 +731,12 @@ btop_run_interactive (int delay_sec, btop_sort sort, int max_iters, int row_cap)
                 if (bls_getnstr (win, bls_lines () - 1, 0,"delta: ", nicebuf, sizeof nicebuf) <= 0) {
                     redraw = 1; break;
                 }
-                int pid = atoi (pidbuf);
-                int delta = atoi (nicebuf);
+                int pid, delta;
+                if (btop_parse_int (pidbuf, 1, INT_MAX, &pid) < 0 ||
+                    btop_parse_int (nicebuf, -40, 40, &delta) < 0) {
+                    snprintf (extra, sizeof extra, "invalid PID or nice delta (-40..40)");
+                    redraw = 1; break;
+                }
                 errno = 0;
                 int cur = getpriority (PRIO_PROCESS, (id_t) pid);
                 if (cur == -1 && errno != 0) {
@@ -720,6 +757,9 @@ btop_run_interactive (int delay_sec, btop_sort sort, int max_iters, int row_cap)
 
 out:
     bls_end ();
+    sigaction (SIGWINCH, &old_winch, NULL);
+    sigaction (SIGTERM, &old_term, NULL);
+    sigaction (SIGHUP, &old_hup, NULL);
     free (procs);
     return rc;
 }
@@ -762,15 +802,17 @@ top_builtin (WORD_LIST *list)
         if (!strcmp (w, "-n")) {
             list = list->next;
             if (!list) { builtin_error ("-n requires COUNT"); return EX_USAGE; }
-            iters = atoi (list->word->word);
-            if (iters < 0) iters = 0;
+            if (btop_parse_int (list->word->word, 0, INT_MAX, &iters) < 0) {
+                builtin_error ("invalid count: %s", list->word->word); return EX_USAGE;
+            }
             list = list->next; continue;
         }
         if (!strcmp (w, "-d")) {
             list = list->next;
             if (!list) { builtin_error ("-d requires SEC"); return EX_USAGE; }
-            delay = atoi (list->word->word);
-            if (delay < 1) delay = 1;
+            if (btop_parse_int (list->word->word, 1, 3599, &delay) < 0) {
+                builtin_error ("invalid delay (1..3599): %s", list->word->word); return EX_USAGE;
+            }
             list = list->next; continue;
         }
         if (!strcmp (w, "-o")) {
@@ -786,17 +828,23 @@ top_builtin (WORD_LIST *list)
         if (!strcmp (w, "-r")) {
             list = list->next;
             if (!list) { builtin_error ("-r requires N"); return EX_USAGE; }
-            row_cap = atoi (list->word->word);
-            if (row_cap < 0) row_cap = 0;
+            if (btop_parse_int (list->word->word, 0, INT_MAX, &row_cap) < 0) {
+                builtin_error ("invalid row cap: %s", list->word->word); return EX_USAGE;
+            }
             list = list->next; continue;
         }
         builtin_error ("unknown option: %s", w);
         return EX_USAGE;
     }
 
-    if (once)
-        return btop_run_once (sort, row_cap);
-    return btop_run_interactive (delay, sort, iters, row_cap);
+    if (list) { builtin_error ("unexpected operand: %s", list->word->word); return EX_USAGE; }
+    /* Previous samples belong only to this invocation, including failure paths. */
+    btop_prev_n = 0; btop_prev_total = 0;
+    int rc = once ? btop_run_once (sort, row_cap)
+                  : btop_run_interactive (delay, sort, iters, row_cap);
+    free (btop_prev_tbl); btop_prev_tbl = NULL;
+    btop_prev_n = 0; btop_prev_total = 0;
+    return rc;
 }
 
 char *top_doc[] = {
@@ -805,10 +853,10 @@ char *top_doc[] = {
     "    top [--once|-b] [-n COUNT] [-d SEC] [-o COL] [-r N]",
     "",
     "    --once / -b   one snapshot, write to stdout, exit (batch).",
-    "    -n COUNT      run COUNT interactive redraws then exit.",
-    "    -d SEC        refresh interval (integer seconds, default 2).",
+    "    -n COUNT      run COUNT interactive redraws then exit (0: unlimited).",
+    "    -d SEC        refresh interval (integer 1..3599 seconds, default 2).",
     "    -o COL        initial sort: cpu | mem | pid | time (default cpu).",
-    "    -r N          cap process rows shown (default = tty rows - 5).",
+    "    -r N          cap process rows shown (0: available terminal rows).",
     "",
     "Interactive keys:",
     "    q / ESC       exit.",
@@ -825,6 +873,8 @@ char *top_doc[] = {
     "Mem total/used/avail (kB); Swap total/used/free (kB). Row columns:",
     "PID USER %CPU RSS S COMMAND. %CPU is computed across two snapshots",
     "(refresh interval in interactive mode, 200ms in --once).",
+    "CPU percentages are a share of total machine time; ties use descending PID.",
+    "New/reused PIDs have zero CPU delta until their next observation.",
     (char *) NULL
 };
 

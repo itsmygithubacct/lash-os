@@ -27,7 +27,7 @@
  *   YYYY-MM-DD                (date-only; time = 00:00:00)
  *   @SECONDS                  (epoch seconds — useful for scripts)
  *   now                       (alias for current time)
- * Anything else returns EX_USAGE. For richer parsing use system+ date.
+ * Unsupported formats return failure. For richer parsing use system+ date.
  *
  * --- LICENSE --- MIT, same boilerplate as binhex.c.
  */
@@ -41,6 +41,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <limits.h>
 #include <time.h>
 
 #include "loadables.h"
@@ -142,24 +143,23 @@ bd_weekday_index (const char *p)
 }
 
 static int
-bd_valid_tm_utc (struct tm *t)
+bd_convert_tm (struct tm *t, int utc, time_t *out)
 {
-    struct tm check;
     int year = t->tm_year;
     int mon = t->tm_mon;
     int mday = t->tm_mday;
     int hour = t->tm_hour;
     int min = t->tm_min;
     int sec = t->tm_sec;
-    time_t tt = timegm (t);
-    if (tt == (time_t) -1)
+    errno = 0;
+    time_t tt = utc ? timegm (t) : mktime (t);
+    if (tt == (time_t) -1 && errno != 0)
         return -1;
-    if (!gmtime_r (&tt, &check))
+    if (t->tm_year != year || t->tm_mon != mon ||
+        t->tm_mday != mday || t->tm_hour != hour ||
+        t->tm_min != min || t->tm_sec != sec)
         return -1;
-    if (check.tm_year != year || check.tm_mon != mon ||
-        check.tm_mday != mday || check.tm_hour != hour ||
-        check.tm_min != min || check.tm_sec != sec)
-        return -1;
+    *out = tt;
     return 0;
 }
 
@@ -225,31 +225,55 @@ bd_parse_rfc_lenient (const char *s, time_t *out)
     t.tm_min = minute;
     t.tm_sec = second;
     t.tm_isdst = -1;
-    if (bd_valid_tm_utc (&t) < 0)
+    if (bd_convert_tm (&t, 1, out) < 0)
         return -1;
-    *out = timegm (&t) - (time_t) offset;
-    return *out == (time_t) -1 ? -1 : 0;
+    *out -= (time_t) offset;
+    return 0;
 }
 
 static int
-bd_parse_d (const char *s, time_t *out, int utc)
+bd_parse_d (const char *s, time_t *out, long *nsec, int utc)
 {
-    if (!strcmp (s, "now")) { *out = time (NULL); return 0; }
+    *nsec = 0;
+    if (!strcmp (s, "now")) {
+        struct timespec now;
+        if (clock_gettime (CLOCK_REALTIME, &now) < 0) return -1;
+        *out = now.tv_sec;
+        *nsec = now.tv_nsec;
+        return 0;
+    }
     if (s[0] == '@') {
         char *end;
+        errno = 0;
         long long ll = strtoll (s + 1, &end, 10);
-        if (end == s + 1) return -1;
-        /* Accept a fractional tail "@SEC.frac" — GNU truncates toward the
-           integer second for whole-second output. Require the tail to be a
-           '.' followed by zero or more decimal digits and nothing else. */
+        if (errno == ERANGE || end == s + 1) return -1;
+        /* Store a floor second plus nonnegative nanoseconds. Negative
+           fractions need a borrow, including -0 and sub-nanosecond input. */
         if (*end == '.') {
             const char *q = end + 1;
-            while (*q >= '0' && *q <= '9') q++;
+            int digits = 0, remainder = 0;
+            if (*q < '0' || *q > '9') return -1;
+            while (*q >= '0' && *q <= '9') {
+                if (digits < 9) {
+                    *nsec = *nsec * 10 + (*q - '0');
+                    digits++;
+                } else if (*q != '0') remainder = 1;
+                q++;
+            }
             if (*q != '\0') return -1;
+            while (digits++ < 9) *nsec *= 10;
+            const char *sign = s + 1;
+            while (*sign == ' ' || *sign == '\t') sign++;
+            if (*sign == '-' && (*nsec || remainder)) {
+                if (ll == LLONG_MIN) return -1;
+                ll--;
+                *nsec = 1000000000L - *nsec - remainder;
+            }
         } else if (*end != '\0') {
             return -1;
         }
         *out = (time_t) ll;
+        if ((long long) *out != ll) return -1;
         return 0;
     }
     if (bd_parse_rfc_lenient (s, out) == 0)
@@ -281,8 +305,7 @@ bd_parse_d (const char *s, time_t *out, int utc)
         if (e && fmt_terminal_ok[i] && (*e == '\0' || (*e == 'Z' && e[1] == '\0')
             || strcmp (e, " UTC") == 0)) {
             int zulu = (*e == 'Z') || strcmp (e, " UTC") == 0 || fmt_zulu[i];
-            *out = (zulu || utc) ? timegm (&t) : mktime (&t);
-            return *out == (time_t) -1 ? -1 : 0;
+            return bd_convert_tm (&t, zulu || utc, out);
         }
         if (e && i < 9) {
             while (*e == ' ' || *e == '\t') e++;
@@ -290,8 +313,9 @@ bd_parse_d (const char *s, time_t *out, int utc)
         if (e && i < 9 && (*e == '+' || *e == '-')) {
             long offset;
             if (bd_parse_tz_offset (e, &offset) == 0) {
-                *out = timegm (&t) - (time_t) offset;
-                return *out == (time_t) -1 ? -1 : 0;
+                if (bd_convert_tm (&t, 1, out) < 0) return -1;
+                *out -= (time_t) offset;
+                return 0;
             }
         }
         memset (&t, 0, sizeof t);
@@ -383,7 +407,7 @@ bd_strftime_one (char spec, const struct tm *tm, char *dst, size_t dstsz)
 }
 
 static char *
-bd_expand_gnu_tz_formats (const char *fmt, const struct tm *tm, time_t t, int utc)
+bd_expand_gnu_tz_formats (const char *fmt, const struct tm *tm, time_t t, long nsec, int utc)
 {
     size_t len = strlen (fmt);
     size_t cap = len * 3 + 32;
@@ -452,15 +476,14 @@ bd_expand_gnu_tz_formats (const char *fmt, const struct tm *tm, time_t t, int ut
         char spec = (k < len) ? fmt[k] : '\0';
         int have_flags = (k > i + 1);   /* anything between '%' and spec */
 
-        /* (a) Sub-second precision: %N (9 digits) or %[1-9]N. Integer epoch
-           => all zeros. Bare %N already worked; keep that path too. */
+        /* Sub-second precision: %N (9 digits) or a requested prefix. */
         if (spec == 'N') {
             /* width digits present and > 0 => that many; otherwise bare %N
                which GNU treats as 9-digit nanoseconds. */
             size_t digits = (width_start < k && width > 0) ? width : 9;
             if (digits > 9) digits = 9;
             char nbuf[10];
-            memset (nbuf, '0', digits);
+            snprintf (nbuf, sizeof nbuf, "%09ld", nsec);
             nbuf[digits] = '\0';
             if (bd_buf_append (&out, &cap, &j, nbuf, digits) < 0) {
                 free (out);
@@ -648,7 +671,7 @@ date_builtin (WORD_LIST *list)
             if (!iso_fmt) {
                 builtin_error ("invalid ISO-8601 timespec: %s", w + 2);
                 builtin_usage ();
-                return EX_USAGE;
+                return EXECUTION_FAILURE;
             }
             list = list->next;
             continue;
@@ -658,7 +681,7 @@ date_builtin (WORD_LIST *list)
             if (!iso_fmt) {
                 builtin_error ("invalid ISO-8601 timespec: %s", w + 11);
                 builtin_usage ();
-                return EX_USAGE;
+                return EXECUTION_FAILURE;
             }
             list = list->next;
             continue;
@@ -666,14 +689,14 @@ date_builtin (WORD_LIST *list)
         if (!strcmp (w, "--rfc-3339")) {
             builtin_error ("--rfc-3339 needs TIMESPEC");
             builtin_usage ();
-            return EX_USAGE;
+            return EXECUTION_FAILURE;
         }
         if (!strncmp (w, "--rfc-3339=", 11)) {
             iso_fmt = bd_rfc3339_format (w + 11);
             if (!iso_fmt) {
                 builtin_error ("invalid RFC 3339 timespec: %s", w + 11);
                 builtin_usage ();
-                return EX_USAGE;
+                return EXECUTION_FAILURE;
             }
             list = list->next;
             continue;
@@ -682,7 +705,7 @@ date_builtin (WORD_LIST *list)
             if (!list->next) {
                 builtin_error ("%s needs STRING", w);
                 builtin_usage ();
-                return EX_USAGE;
+                return EXECUTION_FAILURE;
             }
             list = list->next;
             date_str = list->word->word;
@@ -693,7 +716,7 @@ date_builtin (WORD_LIST *list)
             if (w[7] == '\0') {
                 builtin_error ("--date needs STRING");
                 builtin_usage ();
-                return EX_USAGE;
+                return EXECUTION_FAILURE;
             }
             date_str = w + 7;
             list = list->next;
@@ -711,26 +734,35 @@ date_builtin (WORD_LIST *list)
         }
         builtin_error ("unknown arg: %s", w);
         builtin_usage ();
-        return EX_USAGE;
+        return EXECUTION_FAILURE;
     }
 
     time_t t;
+    long nsec;
     if (date_str) {
-        if (bd_parse_d (date_str, &t, utc) < 0) {
+        if (bd_parse_d (date_str, &t, &nsec, utc) < 0) {
             builtin_error ("date: cannot parse '%s' (try ISO 8601 or @SECONDS)", date_str);
-            return EX_USAGE;
+            return EXECUTION_FAILURE;
         }
     } else {
-        t = time (NULL);
+        struct timespec now;
+        if (clock_gettime (CLOCK_REALTIME, &now) < 0) {
+            builtin_error ("clock_gettime: %s", strerror (errno));
+            return EXECUTION_FAILURE;
+        }
+        t = now.tv_sec;
+        nsec = now.tv_nsec;
     }
 
     struct tm tm;
-    if (utc) gmtime_r (&t, &tm);
-    else     localtime_r (&t, &tm);
+    if (!(utc ? gmtime_r (&t, &tm) : localtime_r (&t, &tm))) {
+        builtin_error ("date out of range");
+        return EXECUTION_FAILURE;
+    }
 
     char buf[256];
     const char *use_fmt = fmt ? fmt : (iso_fmt ? iso_fmt : "%a %b %e %T %Z %Y");
-    char *expanded_fmt = bd_expand_gnu_tz_formats (use_fmt, &tm, t, utc);
+    char *expanded_fmt = bd_expand_gnu_tz_formats (use_fmt, &tm, t, nsec, utc);
     if (!expanded_fmt) {
         builtin_error ("out of memory");
         return EXECUTION_FAILURE;

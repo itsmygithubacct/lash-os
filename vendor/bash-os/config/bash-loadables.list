@@ -11,48 +11,48 @@
 
 basename|basename
 cat|cat
-chmod|chmod
+chmod|chmod [-Rfv] MODE FILE...
 cut|cut -b LIST | -c LIST | -f LIST [-d DELIM] [-s] [-z] [--complement] [--output-delimiter=STRING] [-a ARRAY] [FILE...]
-dirname|dirname
+dirname|dirname [-z|--zero] [--] NAME...
 head|head
-id|id
+id|id [-aGgnruz] [USER ...]
 ln|ln
-logname|logname
-mkdir|mkdir
-mkfifo|mkfifo
-mktemp|mktemp
-pathchk|pathchk
-printenv|printenv
-realpath|realpath
+logname|logname [--help] [--version]
+mkdir|mkdir [-p] [-m MODE] DIRECTORY...
+mkfifo|mkfifo [-m mode] fifo_name [fifo_name ...]
+mktemp|mktemp [-dqu] [-t PREFIX] [-v VAR] [TEMPLATE...]
+pathchk|pathchk [-p] pathname ...
+printenv|printenv [-0|--null] [--] [VARIABLE...]
+realpath|realpath [-a varname] [-ceqsv] pathname [pathname...]
 rm|rm
-rmdir|rmdir
+rmdir|rmdir [-p] [--ignore-fail-on-non-empty] DIRECTORY...
 seq|seq [-w] [-s STRING] [-f FORMAT] [FIRST [INCREMENT]] LAST
-sleep|sleep
+sleep|sleep NUMBER[SUFFIX]...
 stat|stat
-strftime|strftime
-strptime|strptime
+strftime|strftime format [seconds]
+strptime|strptime [-f format] date-time
 sync|sync
-tee|tee
-tty|tty
-uname|uname
-unlink|unlink
-whoami|whoami
+tee|tee [-ai] [file ...]
+tty|tty [-s]
+uname|uname [-amnrsvpio]
+unlink|unlink name
+whoami|whoami [--help] [--version]
 fdflags|fdflags
 finfo|finfo
-fltexpr|fltexpr
+fltexpr|fltexpr [-p] expression
 getconf|getconf
-setpgid|setpgid
+setpgid|setpgid pid pgrpid
 bashio|bashio
 bashpoll|bashpoll
 bashinotify|bashinotify
 bashclock|bashclock
 bashjson|bashjson
 binhex|binhex
-bashbase64|bashbase64
-bashtermraw|bashtermraw
+bashbase64|bashbase64 [-d] [-u] [-i] [-w N] [FILE] > output
+bashtermraw|bashtermraw raw|cooked|size|stty-g|stty-set STATE|keypress|cup ROW COL|clr-eol|clr-screen|clear|reset|show [on|off]|paste on|off
 bashkmod|bashkmod
-bashmount|bashmount
-bashlogger|bashlogger
+bashmount|bashmount [-t TYPE] [-o OPTS] [-B|-R|--remount|-u|-l|--mountpoint|--findmnt-table] SRC DST
+bashlogger|bashlogger [-i] [-t TAG] [-p PRI] [MESSAGE...]
 bashsyslogd|bashsyslogd
 ls|ls [OPTION]... [FILE]...
 cp|cp [-r] SRC... DST
@@ -69,12 +69,12 @@ free|free memory summary
 dd|dd if= of= ...
 df|df [FILE]
 du|du [FILE]
-reboot|reboot the system
-halt|halt the system
-poweroff|power off the system
+reboot|reboot [-f] [-n]
+halt|halt [-f] [-n]
+poweroff|poweroff [-f] [-n]
 chown|chown OWNER[:GROUP] FILE...
-rngseed|Credit and refresh the kernel random seed
-rtspcat|RTSP/RTP H.264 client, access units out as framed records
+rngseed|rngseed load|save FILE
+rtspcat|rtspcat URL [-o FD] [-n COUNT] [-k SECS] [-t SECS] [-v]
 httpd|HTTP server primitive: listen, accept one request, reply
 chgrp|chgrp GROUP FILE...
 tr|tr
@@ -90,7 +90,7 @@ hostname|hostname
 rev|rev
 fold|fold
 comm|comm
-paste|paste [-d LIST] FILE...
+paste|paste [-s] [-z] [-d DELIM] [FILE...]
 pgrep|pgrep PATTERN
 pidof|pidof NAME
 killall|killall NAME
@@ -113,63 +113,65 @@ ping|ping [-c N] HOST
 pax|POSIX pax ustar archives: list, -w create, -r extract, -rw copy
 
 # compression (libzstd loaded at run time; no link-time dependency)
-zstd|Compress or decompress files with zstd
-zstdcat|Decompress zstd files to standard output
+zstd|zstd [-1..-19] [-d] [-c] [-f] [-k|--rm] [-o OUT] [FILE...]
+zstdcat|zstdcat [FILE...]
 
 # util-linux family (imported 2026-09-06 from the upstream collection)
-flock|Manage advisory file locks via flock(2)
+flock|flock [-sxun] [-w SECONDS] [-E N] FD | FILE [command [args] | -c CMD]
 setsid|Run a program in a new session
 ionice|Get or set the I/O scheduling class and priority of a process
 blockdev|Call block-device ioctls from the command line
 ipcmk|Create System V IPC resources
 ipcctl|Run gated System V IPC control operations
-chattr|Change file attributes on a Linux filesystem
+chattr|chattr [-R] [+-=]MODE file...
 lsattr|List file attributes on a Linux filesystem
-mkswap|Set up a Linux swap area
+mkswap|mkswap [-L label] [-U uuid] [-p pagesize] [-f] device|file [size]
 swapon|Enable a swap area, or list the active ones
-swapoff|Disable a swap area
-wipefs|Detect or wipe filesystem / swap signatures
-fincore|Count pages of a file resident in core (the page cache)
+swapoff|swapoff [-a] [device...]
+wipefs|wipefs [-a] [-n] device...
+fincore|fincore [-b|--bytes] [-n|--noheadings] FILE...
 fsfreeze|Suspend or resume access to a filesystem
 losetup|Set up and control loop devices
 dmsetup|Low-level device-mapper control
 getfacl|Display POSIX.1e file access control lists
 setfacl|Set POSIX.1e file access control lists
 fstrim|Discard unused blocks on a mounted filesystem
-prlimit|prlimit(8) subset over prlimit(2)
+prlimit|prlimit --pid PID [-r RES [SOFT[:HARD]]] | --nofile=LIMIT COMMAND
 hwclock|hwclock(8) subset over /dev/rtc0
 renice|Change the niceness of running processes (POSIX renice)
 taskset|Run or query commands with a CPU affinity mask
 chrt|Show or change process scheduling policy and priority
-uclampset|Show process utilization clamp values through sched_getattr(2)
+uclampset|Show and change task or system utilization clamps
 
 # text and formatting tools (imported 2026-09-06 from the upstream collection)
 expand|Convert tabs to spaces (POSIX expand)
 unexpand|Convert spaces to tabs (POSIX unexpand)
-split|Split a file into pieces (POSIX split)
+split|split [-l N | -b SIZE] [-a SUFLEN] [INPUT [PREFIX]]
 csplit|Context-split a file (POSIX csplit)
 join|Relational join on two sorted files (POSIX join)
 pr|Format text for printing (POSIX pr)
 tac|Concatenate and print files in reverse (last record first)
-column|Aligned-column formatter (util-linux column subset)
+column|column [-x] [-c WIDTH] [-t [-s SEPSTR] [-o OUTSTR]] [FILE...]
 col|Filter CTL-H overstrike sequences (util-linux col)
-colrm|Remove byte-columns from each stdin line (util-linux colrm)
+colrm|colrm [START [END]]
 expr|Evaluate POSIX expr(1) expressions
 hexdump|Byte-oriented hex dump (hexdump-compatible, focused on -C canonical)
-tput|Query a curated terminfo-compatible ANSI capability table
+bashclear|bashclear [-x] [-T TERM] | -V | --version | --help
+clear|clear [-x] [-T TERM] | -V | --version | --help
+tput|tput [-T TERM] CAP [ARGS...] | tput query CAP [-T TERM] [-V VAR] [ARGS...] | tput cap-list [-T TERM] [-V VAR] | tput entry-list | tput info [-T TERM]
 tinfo|Read compiled terminfo entries
 strings|Print printable character sequences from files or stdin
 ed|ed [-s] [FILE]
-ar|Create, list, or extract simple ar archives. Writes are deterministic
+ar|ar [-D|-U] -t|-x|-r|-q|-s|s ARCHIVE [FILE...]
 uuencode|uuencode [-m] [FILE] NAME
 uudecode|Decode traditional uuencode and base64-uuencode streams
 
 # Process and system tools
-who|who
-w|w
+who|who [-abdHlmpqrstTu] [--help|--version] [FILE]
+w|w [-h|-H|--no-header] [--file FILE] [USER]
 uptime|uptime
 lsof|lsof
-timeout|timeout
+timeout|timeout [--help|--version] [--preserve-status] [--foreground] [-v|--verbose] [-s SIG] [-k DUR] DURATION CMD [ARG...]
 signal|signal
 hostid|hostid
 sysctl|sysctl
@@ -178,7 +180,7 @@ genl|genl
 mlock|mlock
 utmp|utmp
 userdb|userdb
-keyctl|keyctl
+keyctl|keyctl {session|add|search|print|revoke|clear} ...
 caps|caps
 cred|cred
 ns|ns
@@ -192,7 +194,7 @@ pcap|pcap
 dhcp6|dhcp6
 dhcpd6|dhcpd6
 sftp|sftp
-scp|scp
+scp|scp [--] SRC DST | scp [-r] [-P PORT] [-i KEY] [-l USER] [--openssh] SRC DST
 audit|audit
 fail2ban|fail2ban
 
@@ -200,7 +202,7 @@ fail2ban|fail2ban
 asort|asort
 totp|totp
 scrub|scrub
-bignum|bignum
+bignum|bignum add|sub|mul|divmod|mod|modexp|cmp|bits|shl|shr [-x] ARGS...
 tz|tz
 locale|locale
 scm|scm
@@ -211,46 +213,46 @@ batch|batch
 crontab|crontab
 payload|payload
 fsck|fsck
-mkfs|mkfs
-lpr|lpr
+mkfs|mkfs IMAGE [-L LABEL] [-b BLOCKSIZE] [-m PCT] [-F] [-n]
+lpr|lpr {submit FILE|- | list [-l] | cancel ID}
 opt|opt
 cal|cal
 man|man
 apropos|apropos
-whatis|whatis
-file|file
+whatis|whatis NAME [NAME ...]
+file|file [-bE] [--help|--version] FILE [FILE...]
 
 # Additional upstream loadables
 pty|pty
-expect|expect
-termpixel|termpixel
+expect|expect spawn|expect|expect-alt|send|sendline|send-secret|eof|close|log|log_user|interact ...
+termpixel|termpixel selftest|probe|render-demo|demo|key-read [options]
 termpixel_pong|termpixel_pong
 escdelay|escdelay
 fifo|fifo
 kgetch|kgetch
 wgetch|wgetch
-wget_wch|wget_wch
+wget_wch|wget_wch decode HEX... | read [FD]
 mouse|mouse
-script|script
+script|script record|replay ARGS
 buf|buf
 undo|undo
 clip|clip
-nano2|nano2
-watch|watch
-wall|wall
+nano2|nano2 selftest
+watch|watch [-n SEC] [-x] [-b] [-e] [-g] [-d] [-t|--no-title] [-p|--precise] [-C FILE] CMD [ARGS...]
+wall|wall [-n|--nobanner] [-t|--timeout N] [-g GROUP|--group GROUP] [-h|--help] [MSG ...]
 write|write
 
 # Additional upstream loadables
 awk|awk
-jq|jq
+jq|jq [-r] [-e] [-c] [-n] [-s|--stream] [-i INPUT_VAR] [-V OUT_VAR] {FILTER|-f FILTER_FILE} [FILE]
 bc|bc
 vec|vec
 sv|sv
-cron|cron
+cron|cron run [--once] [--interval SEC] | cron next [--from EPOCH] {MIN HOUR DOM MONTH DOW|@daily}
 curl|curl
 fw|fw
-dhcpd|dhcpd
-fdisk|fdisk
+dhcpd|dhcpd serve|run|respond|lease-list|lease-add|lease-remove ARGS...
+fdisk|fdisk DEV (interactive; or -i DEV) | [--no-act] -l DEV ... | --create-mbr DEV SPEC ... | --create-mbr-extended DEV EXT_SPEC LOGICAL_SPEC ... | --create-gpt DEV SPEC ... | --apply DEV {mbr|gpt} SPEC ... | --delete DEV N | --delete-compact DEV N | --insert-logical DEV START,SIZE[,TYPE[,BOOT]] | --reorder DEV | --set-attrs DEV N ATTRS | --activate DEV N {on|off} | --part-type DEV N TYPE | --set-part DEV N START,SIZE[,TYPE[,BOOT|NAME]] | --part-label DEV N NAME | --part-uuid DEV N UUID | --repair DEV | --verify DEV | --list-free DEV | --list-types | --disk-id DEV [STR]
 strace|strace
 coreutils|coreutils
 bsdgames|bsdgames
@@ -260,13 +262,13 @@ pcre|pcre
 zlib|zlib
 zcat|zcat
 netids|netids
-more|more
+more|more [-d] [-n LINES] [FILE...]
 less|less
 top|top
-slabtop|slabtop
-ncdu|ncdu
+slabtop|slabtop [-d SEC] [-o] [-s CHAR] [-h|-V]
+ncdu|ncdu [-axpt] [PATH]
 tui|tui
-vmstat|vmstat
+vmstat|vmstat [-afstnw] [-S UNIT] [-d|-D|-p DEV|-m] [DELAY [COUNT]]
 toml|toml
 sqlite|sqlite
 vi|vi
@@ -283,34 +285,41 @@ crypto|crypto
 claude|claude
 ldap|ldap
 integrity|integrity
-dns|dns
+dns|dns A|AAAA|MX|TXT|... HOST [-s SERVER] [-t TIMEOUT_MS] [-d] [--validate] [--skew SEC]
 login|login
 passwd|passwd
 auth|auth
 su|su
 doas|doas
 cksum|cksum
-obj|obj
+obj|obj cat|type|size|parse-tree|parse-commit|--batch|--batch-check|hash|blob|tree|commit|tag ARGS...
 index|index
 pack|pack
+git|git plumbing: objects, refs, config
 ssh|ssh
 pkg|pkg
 ntp|ntp
-mail|mail
-rsync|rsync
+mail|mail submit|serve|queue-list|queue-show|queue-delete [OPTIONS]
+rsync|rsync [-a] [-v] [-n] [-e RSH] SRC [SRC...] [HOST]:DEST
 wg|wg
 acme|acme
 uuidgen|uuidgen
-screen|screen
-sshd|sshd
+screen|screen <verb> [args...] [--help|--version]
+sshd|sshd <verb> [args...]
 tiv|tiv
 kitty|kitty
-sixel|sixel
+sixel|sixel [-w N] [-H N] [--base64] FILE
 nano|nano
 ts|ts
 hl|hl
-sudo|sudo
+sudo|sudo [-n] [-u USER] [-g GROUP] command [args...]
 
 # Persistent graphics canvas and optional GPU renderer
 gpu|gpu COMMAND [ARGUMENT ...]
 ptybroker|Persistent local raw PTYs with bounded native I/O
+
+# GNU-compatible command names
+base64|base64 [-di] [-w COLS] [FILE]
+sha256sum|sha256sum [-bctwz] [--tag] [FILE...]
+gzip|gzip [-cdfkntq1-9] [-S SUFFIX] [FILE...]
+tar|tar -c|-t|-x [-zv] [-f ARCHIVE] [-C DIR] [FILE...]

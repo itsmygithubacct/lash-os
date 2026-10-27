@@ -1495,6 +1495,59 @@ bk_mkdir_parent (const char *path)
     return bk_mkdir_p (tmp);
 }
 
+/* Build the same usable relative target as ln -sr. The source exists,
+   and the destination parent has already been created by this branch. */
+static int
+bk_weak_relative_target (const char *src, const char *dst, char *out, size_t cap)
+{
+    char source[PATH_MAX], parent[PATH_MAX], directory[PATH_MAX];
+    if (!realpath (src, source)) {
+        builtin_error ("weak-modules: realpath %s: %s", src, strerror (errno));
+        return EXECUTION_FAILURE;
+    }
+    if (snprintf (directory, sizeof directory, "%s", dst) >= (int) sizeof directory)
+        return EX_USAGE;
+    char *last = strrchr (directory, '/');
+    if (last) {
+        if (last == directory) last[1] = '\0';
+        else *last = '\0';
+    } else strcpy (directory, ".");
+    if (!realpath (directory, parent)) {
+        builtin_error ("weak-modules: realpath %s: %s", directory, strerror (errno));
+        return EXECUTION_FAILURE;
+    }
+
+    size_t i = 0, common = 0;
+    while (source[i] && parent[i] && source[i] == parent[i]) {
+        if (source[i] == '/') common = i + 1;
+        i++;
+    }
+    size_t from = common, to = common;
+    if (!parent[i] && (source[i] == '/' || !source[i])) {
+        from = i;
+        to = i + (source[i] == '/');
+    }
+    size_t used = 0;
+    for (size_t j = from; parent[j]; j++) {
+        if (j == from || parent[j - 1] == '/') {
+            if (used + 3 >= cap) goto too_long;
+            memcpy (out + used, "../", 3);
+            used += 3;
+        }
+    }
+    size_t rest = strlen (source + to);
+    if (used + rest >= cap) goto too_long;
+    memcpy (out + used, source + to, rest + 1);
+    if (!used && !rest) {
+        if (cap < 2) goto too_long;
+        strcpy (out, ".");
+    }
+    return EXECUTION_SUCCESS;
+too_long:
+    builtin_error ("weak-modules: relative target too long");
+    return EX_USAGE;
+}
+
 static int
 bk_weak_emit_one (const char *src, const char *dst, int dry)
 {
@@ -1506,6 +1559,10 @@ bk_weak_emit_one (const char *src, const char *dst, int dry)
     if (rc != EXECUTION_SUCCESS)
         return rc;
 
+    char target[PATH_MAX];
+    rc = bk_weak_relative_target (src, dst, target, sizeof target);
+    if (rc != EXECUTION_SUCCESS) return rc;
+
     struct stat st;
     if (lstat (dst, &st) == 0) {
         if (S_ISLNK (st.st_mode)) {
@@ -1513,7 +1570,7 @@ bk_weak_emit_one (const char *src, const char *dst, int dry)
             ssize_t n = readlink (dst, buf, sizeof buf - 1);
             if (n >= 0) {
                 buf[n] = '\0';
-                if (!strcmp (buf, src))
+                if (!strcmp (buf, target))
                     return EXECUTION_SUCCESS;
             }
         }
@@ -1524,7 +1581,7 @@ bk_weak_emit_one (const char *src, const char *dst, int dry)
         builtin_error ("weak-modules: lstat %s: %s", dst, strerror (errno));
         return EXECUTION_FAILURE;
     }
-    if (symlink (src, dst) != 0) {
+    if (symlink (target, dst) != 0) {
         builtin_error ("weak-modules: symlink %s: %s", dst, strerror (errno));
         return EXECUTION_FAILURE;
     }

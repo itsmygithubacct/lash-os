@@ -10,17 +10,24 @@
  *
  * --- SCOPE / SUBSET ---
  *
- *   rsync [-a] [-v] [-n] [--delete [--delete-confirm]] [-e RSH] SRC [SRC...] DEST
+ *   rsync [-a] [-rlptog] [-v] [-n] [--delete [--delete-confirm]] [-e RSH]
+ *         SRC [SRC...] DEST
  *
- *     -a        archive: preserve perms + mtime on transferred files.
- *               (v1 does NOT preserve owner/group — needs the loadable
- *               to run as root on the remote, which is not the common
- *               operator shape.)
+ *     -a        archive: -rlptog.
+ *     -r        recurse; without it directories are skipped
+ *               ("skipping directory NAME"), as stock rsync does.
+ *     -l        copy symlinks as symlinks; without it they are skipped.
+ *     -p        preserve permissions. Without it an existing file keeps
+ *               its mode and a new one gets the source's under the umask.
+ *     -t        preserve modification times (nanoseconds on the local
+ *               path, seconds over the rsh transport). Directories get
+ *               theirs after their contents are written.
+ *     -o, -g    preserve owner (root only, silently) and group.
  *     -v        verbose: print one "relpath\n" per file that is
- *               actually transferred. Files that match the remote's
- *               size+mtime are silently skipped.
+ *               actually transferred. Files that match the destination's
+ *               size+mtime are skipped (with -p their mode is still fixed).
  *     -n        dry-run: walk + probe + print verbose lines, but
- *               never run the writing remote command.
+ *               never write.
  *     -e RSH    rsh command string. Words are whitespace-split (no
  *               shell quoting). Default: `ssh`.
  *     --delete  after syncing a directory source, remove DEST entries
@@ -28,14 +35,32 @@
  *               --delete-confirm is also present.
  *
  *   DEST shape:
+ *     PATH        local copy, done in-process with syscalls (no RSH and
+ *                 no PATH lookups) unless -e is given, in which case the
+ *                 RSH transport runs with an empty host, as for :PATH.
  *     HOST:PATH   remote push via `RSH HOST CMD`
  *     :PATH       host omitted — invokes `RSH CMD` directly. Useful
  *                 with `-e 'sh -c'` so the "remote" command runs
  *                 locally (this is what the in-guest test uses).
  *
+ *   DEST is a directory when it already is one (following a symlink),
+ *   ends in '/', or the sources amount to more than one entry (several
+ *   surviving sources, or a recursed directory); a missing directory DEST
+ *   is created one level deep. Otherwise one file is written at DEST
+ *   itself. This is stock rsync's get_local_name() rule.
+ *
  *   Source trailing slash matches rsync's convention:
- *     SRC/        copy contents of SRC into DEST/.
+ *     SRC/        copy contents of SRC into DEST/ (also ".", "..").
  *     SRC         copy SRC itself into DEST/, creating DEST/basename(SRC).
+ *
+ *   Files are written to DIR/.NAME.XXXXXX beside the destination, given
+ *   their metadata, then renamed into place, so an interrupted copy leaves
+ *   the previous file intact and no partial file behind.
+ *
+ *   Exit status follows rsync on the push paths: 23 when some entries
+ *   failed and the rest were transferred, 3 when DEST cannot be used,
+ *   11 when DEST cannot be created or a write fails (the transfer stops
+ *   there). Usage errors return 2, as for any builtin.
  *
  *   rsync --version  Print the subset signature.
  *   rsync --help     One-line usage.
@@ -65,28 +90,29 @@
  *   cost of one ssh connect per transferred file. v2 could batch
  *   via a single multiplexed channel.
  *
- *   Probing a remote file's size + mtime uses:
+ *   Probing a remote file's size + mtime + mode uses:
  *
- *     stat -c '%s %Y' '<path>'   (GNU coreutils form; bash-os ships
- *                                 a coreutils-compatible stat via the
- *                                 sbase-box dispatch)
+ *     stat -c '%s %Y %a' '<path>'  (GNU coreutils form; bash-os ships
+ *                                   a coreutils-compatible stat via the
+ *                                   sbase-box dispatch)
  *
- *   Writing a remote file uses:
+ *   Writing a remote file is one script: create a temporary beside the
+ *   path with noclobber, `cat >` the raw bytes from stdin into it, chown/
+ *   chmod/touch it, then `mv -f` it over the path (removing it on any
+ *   failure).
  *
- *     cat > '<path>'             (raw bytes piped through stdin)
+ *   Making a remote directory (one level; a non-directory in the way is
+ *   replaced):
  *
- *   Making a remote directory:
- *
- *     mkdir -p '<path>'
+ *     [ -d '<path>' ] || mkdir '<path>'
  *
  *   Replicating a remote symlink:
  *
  *     rm -f '<path>'; ln -s '<target>' '<path>'
  *
- *   After writing a regular file (and not in dry-run mode), the
- *   remote command is followed by `touch -d @<mtime> '<path>'` when
- *   `-a` is set, so a subsequent run can detect unchanged-ness
- *   without re-transferring.
+ *   With -t the write script runs `touch -d <ISO mtime>` on the
+ *   temporary before the rename, so a subsequent run can detect
+ *   unchanged-ness without re-transferring.
  *
  *   Path single-quoting escapes embedded single quotes via the
  *   standard `'...'\\''...'` ladder so arbitrary filenames are safe.
@@ -137,6 +163,23 @@ typedef struct {
     int native;            /* --native: speak the real rsync wire protocol */
     int whole_file;        /* -W/--whole-file: force native all-literal sends */
     int lflag;             /* -l: preserve symlinks (native pull always sets) */
+    int rflag;             /* -r: recurse into directories */
+    int pflag;             /* -p: preserve permissions */
+    int tflag;             /* -t: preserve modification times */
+    int local;             /* push to a local DEST with native syscalls */
+    int explicit_rsh;      /* -e given: a plain local DEST still goes via RSH */
+    int dest_slash;        /* DEST was written with a trailing '/' */
+    int status;            /* rsync exit code so far: 0, 23, or fatal 3/11 */
+    int fatal;             /* a fatal error stopped the transfer */
+    char *pre_path;        /* one probe answered early by br_dest_kind */
+    int pre_rc;
+    long long pre_size, pre_mtime;
+    long pre_mode;
+    mode_t umask_v;
+    /* Source-to-destination roots for the complete push. Deletion must honor
+     * the union when several directory contents map onto one destination. */
+    char **source_roots, **target_roots;
+    int root_count;
     char *rsync_path;      /* remote rsync binary for --native (default "rsync") */
     long block_size;       /* --block-size N override (0 = auto sqrt) */
     char **rsh_argv;
@@ -1080,22 +1123,200 @@ br_run (const br_ctx *c, const char *cmd,
     return -1;
 }
 
-/* ----- remote operations --------------------------------------------- */
-
-/* Returns 0 on success, sets *size and *mtime. Returns 1 if remote
- * said "missing" (stat exit != 0 or empty output). Returns -1 on
- * pipeline error. */
-static int
-br_probe (const br_ctx *c, const char *rpath,
-          long long *size, long long *mtime)
+static void
+br_set_archive (br_ctx *c)
 {
+    c->aflag = c->rflag = c->lflag = c->pflag = c->tflag = 1;
+    c->oflag = c->gflag = 1;
+}
+
+/* ----- transfer status ------------------------------------------------ */
+
+/* rsync's exit codes, as the push paths report them: 23 when some entries
+ * failed and the rest went on, 3 when the destination cannot be selected,
+ * 11 when a write failed part-way (the stock receiver stops there too). */
+#define BR_RERR_SELECT   3
+#define BR_RERR_FILEIO  11
+#define BR_RERR_PARTIAL 23
+
+/* Send functions return 0, BR_PARTIAL (this entry failed, carry on) or
+ * BR_FATAL (a write failed: stop the transfer). */
+#define BR_PARTIAL (-1)
+#define BR_FATAL   (-2)
+
+static void
+br_fail (br_ctx *c, int code)
+{
+    if (code != BR_RERR_PARTIAL) { c->status = code; c->fatal = 1; }
+    else if (!c->status) c->status = code;
+}
+
+static void
+br_note (br_ctx *c, int rc)
+{
+    if (rc == BR_FATAL) br_fail (c, BR_RERR_FILEIO);
+    else if (rc < 0) br_fail (c, BR_RERR_PARTIAL);
+}
+
+/* NULL-terminated variadic append, for building the remote scripts. */
+static void
+br_appendv (char **b, size_t *l, size_t *cap, ...)
+{
+    va_list ap;
+    va_start (ap, cap);
+    for (const char *s; (s = va_arg (ap, const char *)) != NULL; )
+        br_append_s (b, l, cap, s);
+    va_end (ap);
+}
+
+/* Directory part of path ("." when there is none), malloc'd. */
+static char *
+br_dirname (const char *path)
+{
+    const char *slash = strrchr (path, '/');
+    if (!slash) return br_xstrdup (".");
+    if (slash == path) return br_xstrdup ("/");
+    char *d = (char *) br_xmalloc ((size_t) (slash - path) + 1);
+    memcpy (d, path, (size_t) (slash - path));
+    d[slash - path] = 0;
+    return d;
+}
+
+static const char *
+br_basename (const char *path)
+{
+    const char *slash = strrchr (path, '/');
+    return slash ? slash + 1 : path;
+}
+
+/* Temporary name the stock receiver uses: DIR/.BASE.XXXXXX beside path. */
+static char *
+br_tmp_template (const char *path)
+{
+    const char *base = br_basename (path);
+    size_t dl = (size_t) (base - path);
+    size_t n = dl + strlen (base) + 9;
+    char *t = (char *) br_xmalloc (n);
+    snprintf (t, n, "%.*s.%s.XXXXXX", (int) dl, path, base);
+    return t;
+}
+
+static void
+br_mtime_iso (time_t t, char *buf, size_t n)
+{
+    struct tm mtm;
+    if (gmtime_r (&t, &mtm))
+        strftime (buf, n, "%Y-%m-%dT%H:%M:%SZ", &mtm);
+    else
+        snprintf (buf, n, "1970-01-01T00:00:00Z");
+}
+
+/* The mode a transferred entry gets: the source's with -p; without it an
+ * existing file keeps its own and a new one takes the source's under the
+ * umask, as stock rsync does. */
+static mode_t
+br_target_mode (const br_ctx *c, const struct stat *lst, int existed, mode_t old)
+{
+    if (c->pflag) return lst->st_mode & 07777;
+    if (existed) return old & 07777;
+    return lst->st_mode & 0777 & ~c->umask_v;
+}
+
+/* ----- destination probes --------------------------------------------- */
+
+/* What DEST is: 0 missing (parent is a directory), 1 directory (following
+ * symlinks, like the stock receiver's stat), 2 something else, 3 missing
+ * along with its parent, 4 a path component is not a directory; -1 when
+ * the transport itself failed. Over the rsh transport, a non-NULL child
+ * (the basename of a single regular-file source) also answers br_probe for
+ * the file's target in the same remote command: DEST/child when DEST is a
+ * directory, DEST itself otherwise. */
+static int
+br_dest_kind (br_ctx *c, const char *path, const char *child)
+{
+    char *parent = br_dirname (path);
+    int kind;
+    if (c->local) {
+        struct stat st;
+        if (stat (path, &st) == 0)
+            kind = S_ISDIR (st.st_mode) ? 1 : 2;
+        else if (lstat (path, &st) == 0)
+            kind = 2;                         /* dangling symlink */
+        else if (errno != ENOENT)
+            kind = 4;
+        else if (stat (parent, &st) == 0)
+            kind = S_ISDIR (st.st_mode) ? 0 : 4;
+        else
+            kind = (errno == ENOENT) ? 3 : 4;
+        free (parent);
+        return kind;
+    }
+    char *qp = br_sq (path), *qd = br_sq (parent);
+    char *cmd = NULL; size_t cl = 0, cc = 0;
+    br_appendv (&cmd, &cl, &cc,
+                "p=", qp, "; d=", qd, "; "
+                "if [ -d \"$p\" ]; then echo 1; "
+                "elif [ -e \"$p\" ] || [ -L \"$p\" ]; then echo 2; "
+                "elif [ -d \"$d\" ]; then echo 0; "
+                "elif [ -e \"$d\" ]; then echo 4; else echo 3; fi", (char *) NULL);
+    if (child) {
+        char *qc = br_sq (child);
+        br_appendv (&cmd, &cl, &cc,
+                    "; if [ -d \"$p\" ]; then f=\"$p\"/", qc, "; else f=\"$p\"; fi; "
+                    "if [ -f \"$f\" ] && [ ! -L \"$f\" ]; then stat -c '%s %Y %a' \"$f\" 2>/dev/null; fi",
+                    (char *) NULL);
+        free (qc);
+    }
+    free (qp); free (qd); free (parent);
+    char *out = NULL; size_t olen = 0;
+    int rc = br_run (c, cmd, NULL, 0, &out, &olen);
+    free (cmd);
+    kind = (rc == 0 && olen > 0 && out[0] >= '0' && out[0] <= '4') ? out[0] - '0' : -1;
+    if (kind >= 0 && child) {
+        free (c->pre_path);
+        c->pre_path = (kind == 1) ? br_join (path, child) : br_xstrdup (path);
+        c->pre_rc = 1;
+        char *nl = strchr (out, '\n');
+        long long s = -1, t = -1;
+        long m = 0;
+        if (nl && sscanf (nl + 1, "%lld %lld %lo", &s, &t, &m) >= 2) {
+            c->pre_rc = 0;
+            c->pre_size = s; c->pre_mtime = t; c->pre_mode = m;
+        }
+    }
+    free (out);
+    return kind;
+}
+
+/* Returns 0 with size, mtime and mode set when rpath is a regular file
+ * (not a symlink to one), 1 when it is not, -1 on a transport error. */
+static int
+br_probe (br_ctx *c, const char *rpath,
+          long long *size, long long *mtime, long *mode)
+{
+    if (c->pre_path) {
+        int hit = !strcmp (c->pre_path, rpath);
+        free (c->pre_path);
+        c->pre_path = NULL;
+        if (hit) {
+            *size = c->pre_size; *mtime = c->pre_mtime; *mode = c->pre_mode;
+            return c->pre_rc;
+        }
+    }
+    if (c->local) {
+        struct stat st;
+        if (lstat (rpath, &st) < 0 || !S_ISREG (st.st_mode)) return 1;
+        *size = (long long) st.st_size;
+        *mtime = (long long) st.st_mtime;
+        *mode = (long) (st.st_mode & 07777);
+        return 0;
+    }
     char *qrp = br_sq (rpath);
     /* The redirect drops stat's stderr — "no such file" is expected. */
     char *cmd = NULL;
     size_t cl = 0, cc = 0;
-    br_append_s (&cmd, &cl, &cc, "stat -c '%s %Y' ");
-    br_append_s (&cmd, &cl, &cc, qrp);
-    br_append_s (&cmd, &cl, &cc, " 2>/dev/null");
+    br_appendv (&cmd, &cl, &cc, "[ -f ", qrp, " ] && [ ! -L ", qrp,
+                " ] && stat -c '%s %Y %a' ", qrp, " 2>/dev/null", (char *) NULL);
     free (qrp);
 
     char *out = NULL;
@@ -1107,41 +1328,221 @@ br_probe (const br_ctx *c, const char *rpath,
     if (rc != 0 || olen == 0) { free (out); return 1; }
 
     long long s = -1, t = -1;
-    if (sscanf (out, "%lld %lld", &s, &t) != 2) { free (out); return 1; }
+    long m = 0;
+    if (sscanf (out, "%lld %lld %lo", &s, &t, &m) < 2) { free (out); return 1; }
     free (out);
     *size = s;
     *mtime = t;
+    *mode = m;
     return 0;
 }
 
+/* Make the top-level destination directory (one level, like the stock
+ * receiver: a missing parent is an error, not created). */
 static int
-br_mkdir (const br_ctx *c, const char *rpath)
+br_mkdir_top (br_ctx *c, const char *rpath)
 {
     if (c->nflag) return 0;
+    if (c->local) {
+        if (mkdir (rpath, 0777) == 0 || errno == EEXIST) return 0;
+        builtin_error ("mkdir \"%s\" failed: %s", rpath, strerror (errno));
+        return -1;
+    }
     char *qrp = br_sq (rpath);
     char *cmd = NULL;
     size_t cl = 0, cc = 0;
-    br_append_s (&cmd, &cl, &cc, "mkdir -p ");
-    br_append_s (&cmd, &cl, &cc, qrp);
+    br_appendv (&cmd, &cl, &cc, "[ -d ", qrp, " ] || mkdir ", qrp, (char *) NULL);
     free (qrp);
     int rc = br_run (c, cmd, NULL, 0, NULL, NULL);
     free (cmd);
     if (rc != 0) {
-        builtin_error ("remote mkdir failed (rc=%d): %s", rc, rpath);
+        builtin_error ("mkdir \"%s\" failed (rc=%d)", rpath, rc);
         return -1;
     }
     return 0;
 }
 
+/* Make a directory inside the transfer, replacing a non-directory (or a
+ * symlink) in its way. *created reports whether it is new. With -p the
+ * owner gets rwx for the walk; the final metadata pass restores the mode. */
+static int
+br_mkdir (const br_ctx *c, const char *rpath, int *created)
+{
+    *created = 0;
+    if (c->nflag) return 0;
+    if (c->local) {
+        struct stat st;
+        if (lstat (rpath, &st) == 0) {
+            if (S_ISDIR (st.st_mode)) {
+                if (c->pflag && (st.st_mode & 0700) != 0700)
+                    chmod (rpath, (st.st_mode & 07777) | 0700);
+                return 0;
+            }
+            if (unlink (rpath) < 0) {
+                builtin_error ("delete \"%s\" failed: %s", rpath, strerror (errno));
+                return -1;
+            }
+        }
+        if (mkdir (rpath, 0700) < 0) {
+            builtin_error ("mkdir \"%s\" failed: %s", rpath, strerror (errno));
+            return -1;
+        }
+        *created = 1;
+        return 0;
+    }
+    char *qrp = br_sq (rpath);
+    char *cmd = NULL;
+    size_t cl = 0, cc = 0;
+    br_appendv (&cmd, &cl, &cc,
+                "p=", qrp, "; if [ -L \"$p\" ] || { [ -e \"$p\" ] && [ ! -d \"$p\" ]; }; "
+                "then rm -f \"$p\" || exit 1; fi; "
+                "if [ ! -d \"$p\" ]; then mkdir \"$p\" || exit 1; echo c; fi",
+                c->pflag ? "; chmod u+rwx \"$p\"" : "", (char *) NULL);
+    free (qrp);
+    char *out = NULL; size_t olen = 0;
+    int rc = br_run (c, cmd, NULL, 0, &out, &olen);
+    free (cmd);
+    if (rc != 0) {
+        free (out);
+        builtin_error ("mkdir \"%s\" failed (rc=%d)", rpath, rc);
+        return -1;
+    }
+    *created = (olen > 0 && out[0] == 'c');
+    free (out);
+    return 0;
+}
+
+/* Directory metadata, applied after the directory's contents. */
+static void
+br_dir_meta (const br_ctx *c, const char *rpath, const struct stat *lst, int created)
+{
+    if (c->nflag) return;
+    int want_mode = c->pflag || created;
+    mode_t mode = c->pflag ? (lst->st_mode & 07777) : (lst->st_mode & 0777 & ~c->umask_v);
+    if (c->local) {
+        if (c->oflag || c->gflag)
+            (void) chown (rpath, (c->oflag && geteuid () == 0) ? lst->st_uid : (uid_t) -1,
+                          c->gflag ? lst->st_gid : (gid_t) -1);
+        if (want_mode) chmod (rpath, mode);
+        if (c->tflag) {
+            struct timespec ts[2];
+            ts[0].tv_sec = 0; ts[0].tv_nsec = UTIME_OMIT;
+            ts[1] = lst->st_mtim;
+            utimensat (AT_FDCWD, rpath, ts, 0);
+        }
+        return;
+    }
+    if (!want_mode && !c->tflag && !c->oflag && !c->gflag) return;
+    char *qrp = br_sq (rpath);
+    char *cmd = NULL; size_t cl = 0, cc = 0;
+    char buf[64];
+    br_append_s (&cmd, &cl, &cc, ":");
+    if (c->oflag || c->gflag) {
+        if (c->oflag && c->gflag)
+            snprintf (buf, sizeof buf, "%u:%u", (unsigned) lst->st_uid, (unsigned) lst->st_gid);
+        else if (c->oflag)
+            snprintf (buf, sizeof buf, "%u", (unsigned) lst->st_uid);
+        else
+            snprintf (buf, sizeof buf, ":%u", (unsigned) lst->st_gid);
+        br_appendv (&cmd, &cl, &cc, "; chown ", buf, " ", qrp, " 2>/dev/null", (char *) NULL);
+    }
+    if (want_mode) {
+        snprintf (buf, sizeof buf, "%o", (unsigned) mode);
+        br_appendv (&cmd, &cl, &cc, "; chmod ", buf, " ", qrp, (char *) NULL);
+    }
+    if (c->tflag) {
+        br_mtime_iso (lst->st_mtime, buf, sizeof buf);
+        br_appendv (&cmd, &cl, &cc, "; touch -d ", buf, " ", qrp, (char *) NULL);
+    }
+    free (qrp);
+    int rc = br_run (c, cmd, NULL, 0, NULL, NULL);
+    free (cmd);
+    if (rc != 0 && c->vflag)
+        fprintf (stderr, "rsync: warn: meta-preserve rc=%d: %s\n", rc, rpath);
+}
+
+/* ----- regular files ---------------------------------------------------- */
+
+/* Native local copy: stream into DIR/.BASE.XXXXXX, set metadata on the
+ * descriptor, rename over rpath. Nothing but a complete file ever appears
+ * at rpath; a failed copy removes its temporary. */
+static int
+br_local_send_file (const br_ctx *c, const char *lpath, const char *rpath,
+                    const struct stat *lst, int existed, mode_t old_mode)
+{
+    int in = open (lpath, O_RDONLY | O_NOCTTY);
+    if (in < 0) {
+        builtin_error ("send_files failed to open \"%s\": %s", lpath, strerror (errno));
+        return BR_PARTIAL;
+    }
+    char *tmp = br_tmp_template (rpath);
+    int out = mkstemp (tmp);
+    if (out < 0) {
+        builtin_error ("mkstemp \"%s\" failed: %s", tmp, strerror (errno));
+        close (in); free (tmp);
+        return BR_PARTIAL;
+    }
+    int rc = 0;
+    static char cbuf[1 << 18];
+#if defined (__linux__)
+    /* In-kernel copy first; whatever it leaves (unsupported filesystem,
+     * short copy, an error) continues through read/write at the current
+     * offsets, which also reports a failing write. */
+    while (copy_file_range (in, NULL, out, NULL, (size_t) 1 << 30, 0) > 0)
+        ;
+#endif
+    for (;;) {
+        ssize_t r = read (in, cbuf, sizeof cbuf);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            builtin_error ("read errors mapping \"%s\": %s", lpath, strerror (errno));
+            rc = BR_PARTIAL;
+            break;
+        }
+        if (r == 0) break;
+        if (br_write_all (out, cbuf, (size_t) r) < 0) {
+            builtin_error ("write failed on \"%s\": %s", rpath, strerror (errno));
+            rc = BR_FATAL;
+            break;
+        }
+    }
+    close (in);
+    if (rc == 0) {
+        if (c->oflag || c->gflag)
+            (void) fchown (out, (c->oflag && geteuid () == 0) ? lst->st_uid : (uid_t) -1,
+                           c->gflag ? lst->st_gid : (gid_t) -1);
+        fchmod (out, br_target_mode (c, lst, existed, old_mode));
+        if (c->tflag) {
+            struct timespec ts[2];
+            ts[0].tv_sec = 0; ts[0].tv_nsec = UTIME_OMIT;
+            ts[1] = lst->st_mtim;
+            futimens (out, ts);
+        }
+    }
+    if (close (out) < 0 && rc == 0) {
+        builtin_error ("write failed on \"%s\": %s", rpath, strerror (errno));
+        rc = BR_FATAL;
+    }
+    if (rc == 0 && rename (tmp, rpath) < 0) {
+        builtin_error ("rename \"%s\" -> \"%s\": %s", tmp, rpath, strerror (errno));
+        rc = BR_PARTIAL;
+    }
+    if (rc != 0) unlink (tmp);
+    free (tmp);
+    return rc;
+}
+
 static int
 br_send_file (const br_ctx *c, const char *lpath, const char *rpath,
-              const struct stat *lst)
+              const struct stat *lst, int existed, mode_t old_mode)
 {
     if (c->nflag) return 0;
+    if (c->local)
+        return br_local_send_file (c, lpath, rpath, lst, existed, old_mode);
     int fd = open (lpath, O_RDONLY);
     if (fd < 0) {
-        builtin_error ("open %s: %s", lpath, strerror (errno));
-        return -1;
+        builtin_error ("send_files failed to open \"%s\": %s", lpath, strerror (errno));
+        return BR_PARTIAL;
     }
     /* slurp file into memory — v1 doesn't stream, which keeps the
      * fork+pipe orchestration simple. Files larger than ~few MB
@@ -1157,11 +1558,12 @@ br_send_file (const br_ctx *c, const char *lpath, const char *rpath,
                 if (errno == EINTR) continue;
                 builtin_error ("read %s: %s", lpath, strerror (errno));
                 close (fd); free (buf);
-                return -1;
+                return BR_PARTIAL;
             }
             if (r == 0) break;
             off += r; left -= r;
         }
+        sz = off;
     }
     close (fd);
 
@@ -1177,62 +1579,87 @@ br_send_file (const br_ctx *c, const char *lpath, const char *rpath,
                         (size_t) (sz > 0 ? sz : 0), &cz, &czlen) != 0) {
             free (buf); free (qrp);
             builtin_error ("compress failed: %s", lpath);
-            return -1;
+            return BR_PARTIAL;
         }
         br_append_s (&cmd, &cl, &cc, "rsync --server-recvz ");
         br_append_s (&cmd, &cl, &cc, qrp);
         rc = br_run (c, cmd, cz, czlen, NULL, NULL);
         free (cz);
-    } else {
-        br_append_s (&cmd, &cl, &cc, "cat > ");
-        br_append_s (&cmd, &cl, &cc, qrp);
-        rc = br_run (c, cmd, buf, (size_t) (sz > 0 ? sz : 0), NULL, NULL);
-    }
-    free (cmd);
-    free (buf);
-    if (rc != 0) {
+        free (cmd);
+        free (buf);
         free (qrp);
-        builtin_error ("remote write failed (rc=%d): %s", rc, rpath);
-        return -1;
+        if (rc != 0) {
+            builtin_error ("remote write failed (rc=%d): %s", rc, rpath);
+            return BR_PARTIAL;
+        }
+        br_preserve_meta (c, rpath, lst);
+        return 0;
     }
 
+    /* One remote script per file: write a temporary beside rpath, give it
+     * its metadata, rename it into place. A failed write removes the
+     * temporary, so rpath keeps its previous contents. Exit 3: no
+     * temporary could be created; 4: the write failed; 5: the rename. */
+    char *tmpl = br_tmp_template (rpath);
+    tmpl[strlen (tmpl) - 6] = 0;                 /* the remote's $$ names it */
+    char *qtmp = br_sq (tmpl);
+    free (tmpl);
+    char buf2[64];
+    br_appendv (&cmd, &cl, &cc, "t=", qtmp, "$$; p=", qrp, "; "
+                "set -C; command : 2>/dev/null > \"$t\" || exit 3; set +C; "
+                "cat > \"$t\" || { rm -f \"$t\"; exit 4; }", (char *) NULL);
+    if (c->oflag || c->gflag) {
+        if (c->oflag && c->gflag)
+            snprintf (buf2, sizeof buf2, "%u:%u", (unsigned) lst->st_uid, (unsigned) lst->st_gid);
+        else if (c->oflag)
+            snprintf (buf2, sizeof buf2, "%u", (unsigned) lst->st_uid);
+        else
+            snprintf (buf2, sizeof buf2, ":%u", (unsigned) lst->st_gid);
+        br_appendv (&cmd, &cl, &cc, "; chown ", buf2, " \"$t\" 2>/dev/null", (char *) NULL);
+    }
+    snprintf (buf2, sizeof buf2, "%o", (unsigned) br_target_mode (c, lst, existed, old_mode));
+    br_appendv (&cmd, &cl, &cc, "; chmod ", buf2, " \"$t\"", (char *) NULL);
+    if (c->tflag) {
+        br_mtime_iso (lst->st_mtime, buf2, sizeof buf2);
+        br_appendv (&cmd, &cl, &cc, "; touch -d ", buf2, " \"$t\"", (char *) NULL);
+    }
+    br_appendv (&cmd, &cl, &cc,
+                "; if [ -d \"$p\" ]; then if [ -L \"$p\" ]; then rm -f \"$p\"; "
+                "else rm -f \"$t\"; exit 5; fi; fi; "
+                "mv -f \"$t\" \"$p\" || { rm -f \"$t\"; exit 5; }", (char *) NULL);
+    free (qtmp);
+    rc = br_run (c, cmd, buf, (size_t) (sz > 0 ? sz : 0), NULL, NULL);
+    free (cmd);
+    free (buf);
     free (qrp);
-    br_preserve_meta (c, rpath, lst);
+    if (rc == 4) {
+        builtin_error ("write failed on \"%s\"", rpath);
+        return BR_FATAL;
+    }
+    if (rc == 3) {
+        builtin_error ("mkstemp in the directory of \"%s\" failed", rpath);
+        return BR_PARTIAL;
+    }
+    if (rc != 0) {
+        builtin_error ("remote write failed (rc=%d): %s", rc, rpath);
+        return BR_PARTIAL;
+    }
     return 0;
 }
 
-/* Best-effort metadata preservation: mode+mtime for -a (chmod/touch), and
+/* Best-effort metadata for the rsync-to-rsync paths (-z, --delta), whose
+ * remote side writes the file itself: mode with -p, mtime with -t, and
  * owner/group for -o/-g (chown, numeric — needs root on the remote to take
- * effect, so failures are warned-not-fatal). Shared by all the send paths. */
+ * effect, so failures are warned-not-fatal). */
 static void
 br_preserve_meta (const br_ctx *c, const char *rpath, const struct stat *lst)
 {
-    if (!c->aflag && !c->oflag && !c->gflag) return;
+    if (!c->pflag && !c->tflag && !c->oflag && !c->gflag) return;
     char *qrp = br_sq (rpath);
     char *cmd = NULL; size_t cl = 0, cc = 0;
-    int joined = 0;
+    char buf[64];
 
-    if (c->aflag) {
-        char modebuf[32];
-        snprintf (modebuf, sizeof modebuf, "%o", lst->st_mode & 07777);
-        char mtbuf[32];
-        struct tm mtm;
-        if (gmtime_r (&lst->st_mtime, &mtm))
-            strftime (mtbuf, sizeof mtbuf, "%Y-%m-%dT%H:%M:%SZ", &mtm);
-        else
-            snprintf (mtbuf, sizeof mtbuf, "1970-01-01T00:00:00Z");
-        char *qmt = br_sq (mtbuf);
-        br_append_s (&cmd, &cl, &cc, "chmod ");
-        br_append_s (&cmd, &cl, &cc, modebuf);
-        br_append_s (&cmd, &cl, &cc, " ");
-        br_append_s (&cmd, &cl, &cc, qrp);
-        br_append_s (&cmd, &cl, &cc, " && touch -d ");
-        br_append_s (&cmd, &cl, &cc, qmt);
-        br_append_s (&cmd, &cl, &cc, " ");
-        br_append_s (&cmd, &cl, &cc, qrp);
-        free (qmt);
-        joined = 1;
-    }
+    br_append_s (&cmd, &cl, &cc, ":");
     if (c->oflag || c->gflag) {
         char own[48];
         if (c->oflag && c->gflag)
@@ -1241,11 +1668,15 @@ br_preserve_meta (const br_ctx *c, const char *rpath, const struct stat *lst)
             snprintf (own, sizeof own, "%u", (unsigned) lst->st_uid);
         else
             snprintf (own, sizeof own, ":%u", (unsigned) lst->st_gid);
-        if (joined) br_append_s (&cmd, &cl, &cc, " && ");
-        br_append_s (&cmd, &cl, &cc, "chown ");
-        br_append_s (&cmd, &cl, &cc, own);
-        br_append_s (&cmd, &cl, &cc, " ");
-        br_append_s (&cmd, &cl, &cc, qrp);
+        br_appendv (&cmd, &cl, &cc, "; chown ", own, " ", qrp, (char *) NULL);
+    }
+    if (c->pflag) {
+        snprintf (buf, sizeof buf, "%o", lst->st_mode & 07777);
+        br_appendv (&cmd, &cl, &cc, "; chmod ", buf, " ", qrp, (char *) NULL);
+    }
+    if (c->tflag) {
+        br_mtime_iso (lst->st_mtime, buf, sizeof buf);
+        br_appendv (&cmd, &cl, &cc, "; touch -d ", buf, " ", qrp, (char *) NULL);
     }
     int rc = br_run (c, cmd, NULL, 0, NULL, NULL);
     free (cmd); free (qrp);
@@ -1323,33 +1754,74 @@ br_send_file_delta (const br_ctx *c, const char *lpath, const char *rpath,
     return 0;
 }
 
+/* ----- symlinks --------------------------------------------------------- */
+
 static int
-br_send_symlink (const br_ctx *c, const char *lpath, const char *rpath)
+br_send_symlink (const br_ctx *c, const char *lpath, const char *rpath,
+                 const struct stat *lst)
 {
     if (c->nflag) return 0;
     char tbuf[4096];
     ssize_t n = readlink (lpath, tbuf, sizeof tbuf - 1);
     if (n < 0) {
-        builtin_error ("readlink %s: %s", lpath, strerror (errno));
-        return -1;
+        builtin_error ("readlink \"%s\" failed: %s", lpath, strerror (errno));
+        return BR_PARTIAL;
     }
     tbuf[n] = 0;
+    if (c->local) {
+        char cur[4096];
+        ssize_t m = readlink (rpath, cur, sizeof cur - 1);
+        if (m < 0 || m != n || memcmp (cur, tbuf, (size_t) n) != 0) {
+            /* A fresh link under a temporary name, renamed over rpath. */
+            char *tmp = br_tmp_template (rpath);
+            size_t tl = strlen (tmp);
+            int made = -1;
+            for (unsigned k = 0; k < 100 && made < 0; k++) {
+                snprintf (tmp + tl - 6, 7, "%06u",
+                          (unsigned) ((getpid () * 31u + k * 7919u + (unsigned) time (NULL)) % 1000000u));
+                made = symlink (tbuf, tmp);
+                if (made < 0 && errno != EEXIST) break;
+            }
+            if (made < 0) {
+                builtin_error ("symlink \"%s\" -> \"%s\" failed: %s", rpath, tbuf, strerror (errno));
+                free (tmp);
+                return BR_PARTIAL;
+            }
+            if (rename (tmp, rpath) < 0) {
+                builtin_error ("rename \"%s\" -> \"%s\": %s", tmp, rpath, strerror (errno));
+                unlink (tmp); free (tmp);
+                return BR_PARTIAL;
+            }
+            free (tmp);
+        }
+        if (c->oflag || c->gflag)
+            (void) lchown (rpath, (c->oflag && geteuid () == 0) ? lst->st_uid : (uid_t) -1,
+                           c->gflag ? lst->st_gid : (gid_t) -1);
+        if (c->tflag) {
+            struct timespec ts[2];
+            ts[0].tv_sec = 0; ts[0].tv_nsec = UTIME_OMIT;
+            ts[1] = lst->st_mtim;
+            utimensat (AT_FDCWD, rpath, ts, AT_SYMLINK_NOFOLLOW);
+        }
+        return 0;
+    }
     char *qtg = br_sq (tbuf);
     char *qrp = br_sq (rpath);
     char *cmd = NULL;
     size_t cl = 0, cc = 0;
-    br_append_s (&cmd, &cl, &cc, "rm -f ");
-    br_append_s (&cmd, &cl, &cc, qrp);
-    br_append_s (&cmd, &cl, &cc, " && ln -s ");
-    br_append_s (&cmd, &cl, &cc, qtg);
-    br_append_s (&cmd, &cl, &cc, " ");
-    br_append_s (&cmd, &cl, &cc, qrp);
+    char buf[64];
+    br_appendv (&cmd, &cl, &cc, "rm -f ", qrp, " && ln -s ", qtg, " ", qrp, (char *) NULL);
+    if (c->tflag) {
+        br_mtime_iso (lst->st_mtime, buf, sizeof buf);
+        br_appendv (&cmd, &cl, &cc, " && { touch -h -d ", buf, " ", qrp, " 2>/dev/null || :; }",
+                    (char *) NULL);
+    }
     free (qtg); free (qrp);
     int rc = br_run (c, cmd, NULL, 0, NULL, NULL);
     free (cmd);
     if (rc != 0) {
         builtin_error ("remote ln -s failed (rc=%d): %s", rc, rpath);
-        return -1;
+        return BR_PARTIAL;
     }
     return 0;
 }
@@ -1359,52 +1831,83 @@ br_send_symlink (const br_ctx *c, const char *lpath, const char *rpath)
 static int br_walk (br_ctx *c, const char *lpath, const char *rpath);
 static int br_delete_extra (br_ctx *c, const char *lpath, const char *rpath);
 
-/* lstat lpath, then dispatch. rpath is the corresponding remote path. */
-static int
+/* A directory's contents, then --delete, then its own metadata (unless
+ * lst is NULL: the caller applies it later). */
+static void
+br_handle_dir (br_ctx *c, const char *lpath, const char *rpath,
+               const struct stat *lst, int created)
+{
+    if (br_walk (c, lpath, rpath) == 0 && !c->fatal
+        && br_delete_extra (c, lpath, rpath) < 0)
+        br_fail (c, BR_RERR_PARTIAL);
+    if (lst) br_dir_meta (c, rpath, lst, created);
+}
+
+/* lstat lpath, then dispatch. rpath is the corresponding destination path.
+ * Failures are recorded in c->status. */
+static void
 br_handle (br_ctx *c, const char *lpath, const char *rpath)
 {
+    if (c->fatal) return;
     struct stat lst;
     if (lstat (lpath, &lst) < 0) {
-        builtin_error ("lstat %s: %s", lpath, strerror (errno));
-        return -1;
+        builtin_error ("link_stat \"%s\" failed: %s", lpath, strerror (errno));
+        br_fail (c, BR_RERR_PARTIAL);
+        return;
     }
 
     if (S_ISDIR (lst.st_mode)) {
-        if (br_mkdir (c, rpath) < 0) return -1;
-        int rc = br_walk (c, lpath, rpath);
-        if (rc == 0 && br_delete_extra (c, lpath, rpath) < 0) rc = -1;
-        return rc;
+        if (!c->rflag) {
+            printf ("skipping directory %s\n", lpath);
+            return;
+        }
+        int created = 0;
+        if (br_mkdir (c, rpath, &created) < 0) {
+            builtin_error ("*** Skipping any contents from this failed directory ***");
+            br_fail (c, BR_RERR_PARTIAL);
+            return;
+        }
+        br_handle_dir (c, lpath, rpath, &lst, created);
+        return;
     }
 
     if (S_ISLNK (lst.st_mode)) {
+        if (!c->lflag) {
+            printf ("skipping non-regular file \"%s\"\n", lpath);
+            return;
+        }
         if (c->vflag) fprintf (stderr, "%s (symlink)\n", rpath);
-        return br_send_symlink (c, lpath, rpath);
+        br_note (c, br_send_symlink (c, lpath, rpath, &lst));
+        return;
     }
 
     if (S_ISREG (lst.st_mode)) {
         long long rsz = -1, rmt = -1;
-        int prc = br_probe (c, rpath, &rsz, &rmt);
+        long rmode = 0;
+        int prc = br_probe (c, rpath, &rsz, &rmt, &rmode);
+        if (prc < 0) { br_fail (c, BR_RERR_PARTIAL); return; }
         if (prc == 0
             && rsz == (long long) lst.st_size
             && rmt == (long long) lst.st_mtime) {
-            /* Match — skip. */
-            return 0;
+            /* Unchanged contents: only -p's mode can still be out of date. */
+            if (c->pflag && !c->nflag && (mode_t) rmode != (lst.st_mode & 07777)) {
+                if (c->local) chmod (rpath, lst.st_mode & 07777);
+                else br_preserve_meta (c, rpath, &lst);
+            }
+            return;
         }
         if (c->vflag) fprintf (stderr, "%s\n", rpath);
         /* Delta transfer when enabled and a remote basis exists; otherwise
          * (and on any delta decline) whole-file send. */
-        if (c->delta_flag && prc == 0) {
-            if (br_send_file_delta (c, lpath, rpath, &lst) == 0) return 0;
+        if (c->delta_flag && prc == 0 && !c->local) {
+            if (br_send_file_delta (c, lpath, rpath, &lst) == 0) return;
         }
-        return br_send_file (c, lpath, rpath, &lst);
+        br_note (c, br_send_file (c, lpath, rpath, &lst, prc == 0, (mode_t) rmode));
+        return;
     }
 
-    /* Other types (fifo, socket, block/char dev) — silently skip
-     * with a verbose-only diagnostic so we don't crash the walk. */
-    if (c->vflag) {
-        fprintf (stderr, "rsync: skip non-regular: %s\n", lpath);
-    }
-    return 0;
+    /* Other types (fifo, socket, block/char dev) are outside this subset. */
+    printf ("skipping non-regular file \"%s\"\n", lpath);
 }
 
 /* Walk a local directory `lpath`, sending each entry to `rpath/entry`. */
@@ -1413,59 +1916,88 @@ br_walk (br_ctx *c, const char *lpath, const char *rpath)
 {
     DIR *d = opendir (lpath);
     if (!d) {
-        builtin_error ("opendir %s: %s", lpath, strerror (errno));
+        builtin_error ("opendir \"%s\" failed: %s", lpath, strerror (errno));
+        br_fail (c, BR_RERR_PARTIAL);
         return -1;
     }
-    int rc = 0;
     struct dirent *de;
-    while ((de = readdir (d)) != NULL) {
+    while (!c->fatal && (de = readdir (d)) != NULL) {
         if (de->d_name[0] == '.'
             && (de->d_name[1] == 0
                 || (de->d_name[1] == '.' && de->d_name[2] == 0)))
             continue;
         char *lnext = br_join (lpath, de->d_name);
         char *rnext = br_join (rpath, de->d_name);
-        if (br_handle (c, lnext, rnext) < 0) rc = -1;
+        br_handle (c, lnext, rnext);
         free (lnext); free (rnext);
     }
     closedir (d);
+    return 0;
+}
+
+/* Native recursive removal for --delete. */
+static int
+br_local_rmtree (const char *path)
+{
+    struct stat st;
+    if (lstat (path, &st) < 0) return errno == ENOENT ? 0 : -1;
+    if (!S_ISDIR (st.st_mode)) return unlink (path);
+    DIR *d = opendir (path);
+    if (!d) return -1;
+    int rc = 0;
+    struct dirent *de;
+    while ((de = readdir (d)) != NULL) {
+        if (!strcmp (de->d_name, ".") || !strcmp (de->d_name, "..")) continue;
+        char *next = br_join (path, de->d_name);
+        if (br_local_rmtree (next) < 0) rc = -1;
+        free (next);
+    }
+    closedir (d);
+    if (rmdir (path) < 0) rc = -1;
     return rc;
 }
 
-/* Remove remote entries directly under rpath that are absent from the
- * corresponding local directory lpath. Newline-bearing names are out of
- * scope for this v1 shell-command transport, matching the rest of the
- * line-oriented remote probing surface. */
+/* Remove destination entries directly under rpath that are absent from the
+ * corresponding local directory lpath. Over the rsh transport the listing
+ * is line-oriented, so newline-bearing names are out of scope there; the
+ * native local path reads the directory itself. */
 static int
 br_delete_extra (br_ctx *c, const char *lpath, const char *rpath)
 {
     if (!c->delete_flag) return 0;
     if (c->nflag) return 0;
 
-    char *qrp = br_sq (rpath);
-    char *cmd = NULL;
-    size_t cl = 0, cc = 0;
-    br_append_s (&cmd, &cl, &cc, "for f in ");
-    br_append_s (&cmd, &cl, &cc, qrp);
-    br_append_s (&cmd, &cl, &cc, "/* ");
-    br_append_s (&cmd, &cl, &cc, qrp);
-    br_append_s (&cmd, &cl, &cc, "/.[!.]* ");
-    br_append_s (&cmd, &cl, &cc, qrp);
-    br_append_s (&cmd, &cl, &cc, "/..?*; do [ -e \"$f\" ] || [ -L \"$f\" ] || continue; printf '%s\\n' \"${f##*/}\"; done");
-    free (qrp);
-
     char *out = NULL;
     size_t olen = 0;
-    int rc = br_run (c, cmd, NULL, 0, &out, &olen);
-    free (cmd);
-    if (rc < 0) { free (out); return -1; }
-    if (rc != 0) { free (out); return 0; }
+    if (c->local) {
+        DIR *d = opendir (rpath);
+        if (!d) return 0;
+        size_t cap = 0;
+        struct dirent *de;
+        while ((de = readdir (d)) != NULL) {
+            if (!strcmp (de->d_name, ".") || !strcmp (de->d_name, "..")) continue;
+            br_append_s (&out, &olen, &cap, de->d_name);
+            br_append (&out, &olen, &cap, "", 1);   /* NUL-separated */
+        }
+        closedir (d);
+    } else {
+        char *qrp = br_sq (rpath);
+        char *cmd = NULL;
+        size_t cl = 0, cc = 0;
+        br_appendv (&cmd, &cl, &cc, "for f in ", qrp, "/* ", qrp, "/.[!.]* ", qrp,
+                    "/..?*; do [ -e \"$f\" ] || [ -L \"$f\" ] || continue; "
+                    "printf '%s\\n' \"${f##*/}\"; done", (char *) NULL);
+        free (qrp);
+        int rc = br_run (c, cmd, NULL, 0, &out, &olen);
+        free (cmd);
+        if (rc < 0) { free (out); return -1; }
+        if (rc != 0) { free (out); return 0; }
+        for (size_t i = 0; i < olen; i++) if (out[i] == '\n') out[i] = 0;
+    }
 
     int ret = 0;
-    char *save = NULL;
-    for (char *name = strtok_r (out, "\n", &save);
-         name;
-         name = strtok_r (NULL, "\n", &save)) {
+    for (size_t off = 0; off < olen; off += strlen (out + off) + 1) {
+        const char *name = out + off;
         if (!name[0] || !strcmp (name, ".") || !strcmp (name, ".."))
             continue;
         char *lnext = br_join (lpath, name);
@@ -1475,17 +2007,33 @@ br_delete_extra (br_ctx *c, const char *lpath, const char *rpath)
         if (!missing) continue;
 
         char *rnext = br_join (rpath, name);
+        for (int i = 0; i < c->root_count && missing; i++) {
+            size_t prefix = strlen (c->target_roots[i]);
+            if (strncmp (rnext, c->target_roots[i], prefix) != 0
+                || (rnext[prefix] && rnext[prefix] != '/')) continue;
+            const char *suffix = rnext + prefix;
+            if (*suffix == '/') suffix++;
+            char *source = *suffix ? br_join (c->source_roots[i], suffix)
+                                   : br_xstrdup (c->source_roots[i]);
+            if (lstat (source, &sb) == 0 || errno != ENOENT) missing = 0;
+            free (source);
+        }
+        if (!missing) { free (rnext); continue; }
         if (c->vflag) fprintf (stderr, "%s (delete)\n", rnext);
-        char *qrn = br_sq (rnext);
-        char *dcmd = NULL;
-        size_t dl = 0, dc = 0;
-        br_append_s (&dcmd, &dl, &dc, "rm -rf -- ");
-        br_append_s (&dcmd, &dl, &dc, qrn);
-        free (qrn);
-        int drc = br_run (c, dcmd, NULL, 0, NULL, NULL);
-        free (dcmd);
+        int drc;
+        if (c->local) {
+            drc = br_local_rmtree (rnext);
+        } else {
+            char *qrn = br_sq (rnext);
+            char *dcmd = NULL;
+            size_t dl = 0, dc = 0;
+            br_appendv (&dcmd, &dl, &dc, "rm -rf -- ", qrn, (char *) NULL);
+            free (qrn);
+            drc = br_run (c, dcmd, NULL, 0, NULL, NULL);
+            free (dcmd);
+        }
         if (drc != 0) {
-            builtin_error ("remote delete failed (rc=%d): %s", drc, rnext);
+            builtin_error ("delete failed (rc=%d): %s", drc, rnext);
             ret = -1;
         }
         free (rnext);
@@ -1509,9 +2057,9 @@ br_is_remote (const char *s)
 static int
 br_parse_dest (br_ctx *c, const char *dest)
 {
-    /* Split on first ':'. If absent, treat as local-local copy with
-     * empty host (caller decides whether that's an error). */
-    const char *colon = strchr (dest, ':');
+    /* A ':' before any '/' names a host (possibly empty: the rsh command
+     * runs the "remote" commands directly). Anything else is a local path. */
+    const char *colon = br_is_remote (dest) ? strchr (dest, ':') : NULL;
     if (!colon) {
         c->host = br_xstrdup ("");
         c->rdir = br_xstrdup (dest);
@@ -1522,63 +2070,123 @@ br_parse_dest (br_ctx *c, const char *dest)
         c->host[hl] = 0;
         c->rdir = br_xstrdup (colon + 1);
     }
-    /* Strip trailing slash from rdir (canonical). Leave "/" alone. */
+    /* Strip trailing slash from rdir (canonical), remembering it: a
+     * trailing slash makes DEST a directory. Leave "/" alone. */
     size_t rl = strlen (c->rdir);
+    c->dest_slash = (rl > 0 && c->rdir[rl - 1] == '/');
     while (rl > 1 && c->rdir[rl - 1] == '/') {
         c->rdir[--rl] = 0;
     }
     if (rl == 0) {
         free (c->rdir);
         c->rdir = br_xstrdup (".");
+        c->dest_slash = 1;
     }
     return 0;
 }
 
-static int
-br_one_src (br_ctx *c, const char *src)
+/* Push SRC... to DEST. DEST names a directory when it already is one, ends
+ * in '/', or the sources amount to more than one entry (several sources,
+ * or a recursed directory); otherwise a single file is written at DEST
+ * itself — stock rsync's get_local_name() rule. */
+static void
+br_push (br_ctx *c, char **srcs, int nsrc)
 {
-    /* Trailing slash semantics: SRC/ → copy contents into DEST/;
-     * SRC → copy SRC itself into DEST/. */
-    size_t sl = strlen (src);
-    int trailing = (sl > 0 && src[sl - 1] == '/') ? 1 : 0;
-    char *lroot = br_xstrdup (src);
-    /* Strip any number of trailing slashes for the lstat probe. */
-    while (sl > 1 && lroot[sl - 1] == '/') lroot[--sl] = 0;
+    char **roots = (char **) br_xmalloc (sizeof (char *) * (size_t) (nsrc + 1));
+    int *contents = (int *) br_xmalloc (sizeof (int) * (size_t) (nsrc + 1));
+    struct stat *sts = (struct stat *) br_xmalloc (sizeof (struct stat) * (size_t) (nsrc + 1));
+    int count = 0, any_dir = 0;
 
-    struct stat lst;
-    if (lstat (lroot, &lst) < 0) {
-        builtin_error ("lstat %s: %s", src, strerror (errno));
-        free (lroot);
-        return -1;
+    for (int i = 0; i < nsrc; i++) {
+        const char *src = srcs[i];
+        size_t sl = strlen (src);
+        int trailing = (sl > 0 && src[sl - 1] == '/');
+        char *root = br_xstrdup (src);
+        while (sl > 1 && root[sl - 1] == '/') root[--sl] = 0;
+        struct stat st;
+        if (lstat (root, &st) < 0) {
+            builtin_error ("link_stat \"%s\" failed: %s", src, strerror (errno));
+            br_fail (c, BR_RERR_PARTIAL);
+            free (root);
+            continue;
+        }
+        if (S_ISDIR (st.st_mode) && !c->rflag) {
+            printf ("skipping directory %s\n", trailing ? "." : root);
+            free (root);
+            continue;
+        }
+        const char *bn = br_basename (root);
+        /* "SRC/", ".", ".." and "/" all mean the directory's contents. */
+        contents[count] = S_ISDIR (st.st_mode)
+            && (trailing || !strcmp (bn, ".") || !strcmp (bn, "..") || !strcmp (root, "/"));
+        if (S_ISDIR (st.st_mode)) any_dir = 1;
+        roots[count] = root;
+        sts[count] = st;
+        count++;
     }
 
-    int rc = 0;
-    if (S_ISDIR (lst.st_mode) && trailing) {
-        /* Pour SRC contents into c->rdir. */
-        if (br_mkdir (c, c->rdir) < 0) { free (lroot); return -1; }
-        rc = br_walk (c, lroot, c->rdir);
-        if (rc == 0 && br_delete_extra (c, lroot, c->rdir) < 0) rc = -1;
-    } else if (S_ISDIR (lst.st_mode)) {
-        /* Create c->rdir/basename(src) then walk into it. */
-        const char *bn = strrchr (lroot, '/');
-        bn = bn ? bn + 1 : lroot;
-        char *target = br_join (c->rdir, bn);
-        if (br_mkdir (c, c->rdir) < 0) { free (lroot); free (target); return -1; }
-        if (br_mkdir (c, target) < 0) { free (lroot); free (target); return -1; }
-        rc = br_walk (c, lroot, target);
-        if (rc == 0 && br_delete_extra (c, lroot, target) < 0) rc = -1;
-        free (target);
-    } else {
-        /* Single file/symlink → DEST/basename(SRC). */
-        const char *bn = strrchr (lroot, '/');
-        bn = bn ? bn + 1 : lroot;
-        char *target = br_join (c->rdir, bn);
-        if (br_mkdir (c, c->rdir) < 0) { free (lroot); free (target); return -1; }
-        rc = br_handle (c, lroot, target);
-        free (target);
+    if (count > 0) {
+        int dest_dir = c->dest_slash || count > 1 || any_dir;
+        /* A lone regular file: let the DEST probe answer its probe too. */
+        const char *child = (!c->local && count == 1 && S_ISREG (sts[0].st_mode))
+            ? br_basename (roots[0]) : NULL;
+        int kind = br_dest_kind (c, c->rdir, child);
+        if (kind < 0) {
+            builtin_error ("cannot probe destination \"%s\"", c->rdir);
+            br_fail (c, BR_RERR_SELECT);
+        } else if (kind == 1) {
+            dest_dir = 1;
+        } else if (kind == 2 || kind == 4) {
+            if (kind == 4 || c->dest_slash) {
+                builtin_error ("ERROR: cannot stat destination \"%s%s\": Not a directory",
+                               c->rdir, c->dest_slash ? "/" : "");
+                br_fail (c, BR_RERR_SELECT);
+            } else if (dest_dir) {
+                builtin_error ("ERROR: destination must be a directory when copying more than 1 file");
+                br_fail (c, BR_RERR_SELECT);
+            }
+        } else if (dest_dir) {
+            if (kind == 3 && !c->nflag) {
+                builtin_error ("mkdir \"%s\" failed: No such file or directory", c->rdir);
+                br_fail (c, BR_RERR_FILEIO);
+            } else if (br_mkdir_top (c, c->rdir) < 0) {
+                br_fail (c, BR_RERR_FILEIO);
+            }
+        } else if (kind == 3) {
+            builtin_error ("change_dir \"%s\" failed: No such file or directory", c->rdir);
+            br_fail (c, BR_RERR_SELECT);
+        }
+
+        c->source_roots = roots;
+        c->root_count = count;
+        c->target_roots = br_xmalloc (sizeof (char *) * (size_t) count);
+        for (int i = 0; i < count; i++)
+            c->target_roots[i] = (!dest_dir || contents[i])
+                ? br_xstrdup (c->rdir) : br_join (c->rdir, br_basename (roots[i]));
+        int top_meta = -1;
+        for (int i = 0; i < count && !c->fatal; i++) {
+            if (!dest_dir) {
+                br_handle (c, roots[i], c->rdir);
+            } else if (contents[i]) {
+                /* The source directory itself maps onto DEST; its metadata
+                 * waits until every source has written into DEST. */
+                br_handle_dir (c, roots[i], c->rdir, NULL, 0);
+                if (top_meta < 0) top_meta = i;
+            } else {
+                char *target = br_join (c->rdir, br_basename (roots[i]));
+                br_handle (c, roots[i], target);
+                free (target);
+            }
+        }
+        if (top_meta >= 0 && !c->fatal)
+            br_dir_meta (c, c->rdir, &sts[top_meta], 0);
+        for (int i = 0; i < count; i++) free (c->target_roots[i]);
+        free (c->target_roots);
+        c->target_roots = c->source_roots = NULL;
+        c->root_count = 0;
     }
-    free (lroot);
-    return rc;
+    for (int i = 0; i < count; i++) free (roots[i]);
+    free (roots); free (contents); free (sts);
 }
 
 static void
@@ -1591,6 +2199,7 @@ br_free_ctx (br_ctx *c)
     free (c->host);
     free (c->rdir);
     free (c->rsync_path);
+    free (c->pre_path);
     memset (c, 0, sizeof *c);
 }
 
@@ -2773,9 +3382,10 @@ rsync_builtin (WORD_LIST *list)
             return EXECUTION_SUCCESS;
         }
         if (!strcmp (w, "--help") || !strcmp (w, "-h")) {
-            printf ("rsync [-a] [-v] [-n] [-z] [-o] [-g] [-W] [--delta] [--block-size N]\n");
+            printf ("rsync [-a] [-rlptog] [-v] [-n] [-z] [-W] [--delta] [--block-size N]\n");
             printf ("          [--delete [--delete-confirm]] [-e RSH] SRC [SRC...] DEST\n");
             printf ("Push, pull and rsync-daemon transfers:\n");
+            printf ("  local: SRC [SRC...] DEST                 (in-process copy; DEST is a file unless a dir, '/' or many)\n");
             printf ("  push : SRC [SRC...] [HOST]:DEST          (ssh+tar subset; --delta for rolling-checksum delta)\n");
             printf ("  pull : [HOST]:SRC DEST                   (with --native, speaks stock rsync proto-27)\n");
             printf ("  daemon: rsync://HOST[:PORT]/MODULE/PATH  (or HOST::MODULE/PATH) as SRC or DEST\n");
@@ -2802,7 +3412,11 @@ rsync_builtin (WORD_LIST *list)
             if (c.block_size < 1) { builtin_error ("--block-size must be >= 1"); br_free_ctx (&c); return EX_USAGE; }
             p = p->next; continue;
         }
-        if (!strcmp (w, "-a")) { c.aflag = 1; c.oflag = 1; c.gflag = 1; p = p->next; continue; }
+        if (!strcmp (w, "-a") || !strcmp (w, "--archive")) { br_set_archive (&c); p = p->next; continue; }
+        if (!strcmp (w, "-r") || !strcmp (w, "--recursive")) { c.rflag = 1; p = p->next; continue; }
+        if (!strcmp (w, "-l") || !strcmp (w, "--links")) { c.lflag = 1; p = p->next; continue; }
+        if (!strcmp (w, "-p") || !strcmp (w, "--perms")) { c.pflag = 1; p = p->next; continue; }
+        if (!strcmp (w, "-t") || !strcmp (w, "--times")) { c.tflag = 1; p = p->next; continue; }
         if (!strcmp (w, "-o") || !strcmp (w, "--owner")) { c.oflag = 1; p = p->next; continue; }
         if (!strcmp (w, "-g") || !strcmp (w, "--group")) { c.gflag = 1; p = p->next; continue; }
         if (!strcmp (w, "-z") || !strcmp (w, "--compress")) { c.zflag = 1; p = p->next; continue; }
@@ -2818,6 +3432,7 @@ rsync_builtin (WORD_LIST *list)
             p = p->next;
             if (!p) { builtin_error ("-e requires an argument"); br_free_ctx (&c); return EX_USAGE; }
             rsh_str = p->word->word;
+            c.explicit_rsh = 1;
             p = p->next; continue;
         }
         if (!strcmp (w, "--")) { p = p->next; break; }
@@ -2826,7 +3441,12 @@ rsync_builtin (WORD_LIST *list)
             int ok = 1;
             for (const char *cp = w + 1; *cp; cp++) {
                 switch (*cp) {
-                    case 'a': c.aflag = 1; c.oflag = 1; c.gflag = 1; break;
+                    case 'a': br_set_archive (&c); break;
+                    case 'r': c.rflag = 1; break;
+                    case 'l': c.lflag = 1; break;
+                    case 'p': c.pflag = 1; break;
+                    case 't': c.tflag = 1; break;
+                    case 'D': break;     /* devices/specials: skipped */
                     case 'v': c.vflag++; break;
                     case 'n': c.nflag = 1; break;
                     case 'o': c.oflag = 1; break;
@@ -2878,6 +3498,12 @@ rsync_builtin (WORD_LIST *list)
     }
 
     const char *dest = pos[posn - 1];
+    if (!dest[0]) {
+        builtin_error ("Empty destination arg specified (use \".\")");
+        free (pos);
+        br_free_ctx (&c);
+        return EX_USAGE;
+    }
 
     /* DAEMON mode (rsync://host/module/path or host::module/path) — always
      * speaks the real rsync protocol over a TCP socket; checked before the
@@ -2949,13 +3575,18 @@ rsync_builtin (WORD_LIST *list)
         return EX_USAGE;
     }
 
-    int rc = 0;
-    for (int i = 0; i < posn - 1; i++) {
-        if (br_one_src (&c, pos[i]) < 0) rc = -1;
-    }
+    /* A plain local DEST is a local copy, done here with syscalls, unless
+     * -e asked for the RSH transport with an empty host. */
+    c.local = !dest_remote && !c.explicit_rsh;
+    c.umask_v = umask (022);
+    umask (c.umask_v);
+    fflush (stdout);
+    br_push (&c, pos, posn - 1);
+    fflush (stdout);
+    int status = c.status;
     free (pos);
     br_free_ctx (&c);
-    return rc < 0 ? EXECUTION_FAILURE : EXECUTION_SUCCESS;
+    return status;
 }
 
 char *rsync_doc[] = {
@@ -2966,13 +3597,16 @@ char *rsync_doc[] = {
     "    rsync [-a] [-v] [-n] [-z] [-o] [-g] [-W] \\",
     "             [--delta] [--block-size N] \\",
     "             [--delete [--delete-confirm]] [-e RSH] SRC [SRC...] DEST",
-    "        DEST = [HOST]:PATH, or use [HOST]:SRC DEST for pull mode.",
+    "        DEST = PATH (local copy) or [HOST]:PATH; [HOST]:SRC DEST pulls.",
+    "        DEST is a directory when it is one, ends in '/', or gets several",
+    "        entries; otherwise a single file is written at DEST.",
     "        --native / --rsync-protocol interoperates with stock rsync --server;",
     "        rsync://HOST/MODULE/PATH and HOST::MODULE/PATH use daemon mode.",
     "    rsync --version    rsync --help",
     "",
     "Flags:",
-    "    -a   archive: preserve mode + mtime on transferred files",
+    "    -a   archive: -rlptog (recurse, symlinks, mode, mtime, owner, group)",
+    "    -r -l -p -t  recurse / copy symlinks / preserve mode / preserve mtime",
     "    -v   verbose: print one line per transferred entry (-vv: delta stats)",
     "    -n   dry-run: walk + probe, never write",
     "    -z   compress rsync-to-rsync payloads",

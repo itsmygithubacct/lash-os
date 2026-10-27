@@ -118,62 +118,88 @@ bwc_count_fast (FILE *f, bwc_counts *c)
     return 0;
 }
 
-/* Count from an open FILE *. POSIX "word" = run of non-whitespace bytes.
- * The decoding path: needed only for -m (characters) and -L (display
- * width); everything else goes through bwc_count_fast. */
+/* Count an ASCII run without alignment/aliasing assumptions or reading past
+   the block. In a multibyte locale these bytes each encode one character.
+   memcpy of a machine word is inlined by optimizing compilers. */
+static const unsigned char *
+bwc_ascii_end (const unsigned char *p, const unsigned char *end)
+{
+    const size_t high_bits = (size_t) -1 / 255 * 128;
+    while ((size_t) (end - p) >= sizeof (size_t)) {
+        size_t word;
+        memcpy (&word, p, sizeof word);
+        if (word & high_bits) break;
+        p += sizeof word;
+    }
+    while (p < end && *p < 0x80) p++;
+    return p;
+}
+
+/* Decode directly from each input block. Only an incomplete final sequence
+   is moved to the next block; invalid bytes remain word characters, but do
+   not contribute to the character count or display width. Keep classification
+   out of the character-only path and use ASCII directly in the combined path. */
 static int
-bwc_count_stream (FILE *f, bwc_counts *c)
+bwc_count_stream (FILE *f, bwc_counts *c, int lflag, int wflag, int Lflag)
 {
     long long L = 0, W = 0, B = 0, M = 0, cur = 0, maxl = 0;
     int in_word = 0, nbsp = bwc_nbsp_ok (), mb = MB_CUR_MAX > 1;
-    static unsigned char buf[65536];
-    unsigned char pend[MB_LEN_MAX + 1];     /* bytes read but not yet decoded */
-    size_t plen = 0, n;
+    unsigned char buf[65536 + MB_LEN_MAX];
+    size_t off = 0, n;
 #define BWC_WORDCHAR() do { if (!in_word) { in_word = 1; W++; } } while (0)
     for (;;) {
-        n = fread (buf, 1, sizeof buf, f);
+        n = fread (buf + off, 1, 65536, f);
         int eof = (n == 0);
         B += (long long) n;
-        if (!mb) {
-            /* unibyte locale: every byte is a character; a printable one is
-               one column; 0xA0 separates words as GNU's isnbspace does */
-            for (size_t i = 0; i < n; i++) {
-                unsigned char b = buf[i];
-                M++;
-                if (b == '\n') { L++; if (cur > maxl) maxl = cur; cur = 0; }
-                else if (b == '\t') cur += 8 - (cur % 8);
-                else if (b == '\r' || b == '\f') { if (cur > maxl) maxl = cur; cur = 0; }   /* GNU: CR and FF end the line's length */
-                else if (isprint (b)) cur++;
-                if (isspace (b) || (nbsp && b == 0xA0)) in_word = 0; else BWC_WORDCHAR ();
+        const unsigned char *p = buf, *end = buf + off + n;
+        while (p < end) {
+            wchar_t wc;
+            if (mb && !wflag && !Lflag) {
+                const unsigned char *next = bwc_ascii_end (p, end);
+                M += (long long) (next - p);
+                if (lflag) {
+                    const unsigned char *q = p;
+                    while ((q = memchr (q, '\n', (size_t) (next - q))) != NULL) { L++; q++; }
+                }
+                p = next;
+                if (p == end) break;
             }
-            if (eof) break;
-            continue;
-        }
-        /* multibyte locale: decode through a small pending buffer so that a
-           sequence cut by the block edge is completed, and one that fails is
-           handled as GNU does — the bad lead byte is a word character but not
-           a character and has no width, and decoding resumes at the next byte;
-           an incomplete sequence at end of file is dropped the same way. */
-        size_t i = 0;
-        while (i < n || (eof && plen)) {
-            while (plen < MB_LEN_MAX && i < n) pend[plen++] = buf[i++];
-            mbstate_t st; wchar_t wc; size_t used;
-            memset (&st, 0, sizeof st);
-            size_t r = mbrtowc (&wc, (const char *) pend, plen, &st);
-            if (r == (size_t) -2 && !eof && plen < MB_LEN_MAX) break;      /* needs the next block */
-            if (r == (size_t) -2 || r == (size_t) -1) { BWC_WORDCHAR (); used = 1; }
-            else {
-                used = r ? r : 1;                                         /* r == 0: a NUL character */
-                M++;
-                if (wc == L'\n') { L++; if (cur > maxl) maxl = cur; cur = 0; }
-                else if (wc == L'\t') cur += 8 - (cur % 8);
-                else if (wc == L'\r' || wc == L'\f') { if (cur > maxl) maxl = cur; cur = 0; }
+            if (!mb || *p < 0x80) {
+                wc = *p++;
+            } else {
+                mbstate_t st;
+                memset (&st, 0, sizeof st);
+                size_t r = mbrtowc (&wc, (const char *) p, (size_t) (end - p), &st);
+                if (r == (size_t) -2 && !eof && (size_t) (end - p) < MB_LEN_MAX)
+                    break;
+                if (r == (size_t) -2 || r == (size_t) -1) {
+                    if (wflag) BWC_WORDCHAR ();
+                    p++;
+                    continue;
+                }
+                p += r ? r : 1;
+            }
+            M++;
+            if (wc == L'\n') L++;
+            if (Lflag) {
+                if (wc == L'\n' || wc == L'\r' || wc == L'\f') {
+                    if (cur > maxl) maxl = cur;
+                    cur = 0;
+                } else if (wc == L'\t') cur += 8 - (cur % 8);
+                else if (wc < 0x80) { if (wc >= 0x20 && wc < 0x7f) cur++; }
+                else if (!mb) { if (isprint ((unsigned char) wc)) cur++; }
                 else if (iswprint (wc)) { int w = wcwidth (wc); if (w > 0) cur += w; }
-                if (iswspace (wc) || (nbsp && bwc_is_nbspace (wc))) in_word = 0; else BWC_WORDCHAR ();
             }
-            memmove (pend, pend + used, plen - used); plen -= used;
+            if (wflag) {
+                int space = (!mb || wc < 0x80)
+                    ? isspace ((unsigned char) wc) : iswspace (wc);
+                if (space || (nbsp && bwc_is_nbspace (wc))) in_word = 0;
+                else BWC_WORDCHAR ();
+            }
         }
         if (eof) break;
+        off = (size_t) (end - p);
+        memmove (buf, p, off);
     }
 #undef BWC_WORDCHAR
     if (cur > maxl) maxl = cur;
@@ -190,6 +216,62 @@ bwc_digits (unsigned long long v)
     for (; v >= 10; v /= 10)
         width++;
     return width;
+}
+
+/* Byte counts and single-byte character counts do not require word or
+   display-width classification. Count only the requested fields, keeping
+   the existing decoding path for multibyte characters and display widths.
+   Reading the stream (rather than using a cached file size) also preserves
+   its current position and works for pipes and changing pseudo-files. */
+static int
+bwc_count_selected (FILE *f, bwc_counts *c, int lflag, int wflag,
+                    int cflag, int mflag, int Lflag)
+{
+    if ((lflag || cflag || mflag) && !wflag && !Lflag &&
+        (!mflag || MB_CUR_MAX == 1)) {
+        unsigned char buf[65536];
+        size_t n;
+        while ((n = fread (buf, 1, sizeof buf, f)) != 0) {
+            c->bytes += (long long) n;
+            c->chars += (long long) n;
+            if (lflag) {
+                const unsigned char *p = buf, *end = buf + n;
+                while ((p = memchr (p, '\n', (size_t) (end - p))) != NULL) {
+                    c->lines++;
+                    p++;
+                }
+            }
+        }
+        return 0;
+    }
+    if (Lflag && !wflag && MB_CUR_MAX == 1) {
+        unsigned char buf[65536];
+        long long width = 0;
+        size_t n;
+        while ((n = fread (buf, 1, sizeof buf, f)) != 0) {
+            c->bytes += (long long) n;
+            c->chars += (long long) n;
+            const unsigned char *p = buf, *end = buf + n;
+            while (p < end) {
+                /* Printable ASCII runs need only their byte length. Keep
+                   the locale classification for other single-byte values. */
+                const unsigned char *start = p;
+                while (p < end && *p >= 0x20 && *p < 0x7f) p++;
+                width += (long long) (p - start);
+                if (p == end) break;
+                unsigned char b = *p++;
+                if (b == '\n' || b == '\r' || b == '\f') {
+                    if (width > c->max_line) c->max_line = width;
+                    width = 0;
+                    if (b == '\n') c->lines++;
+                } else if (b == '\t') width += 8 - width % 8;
+                else if (isprint (b)) width++;
+            }
+        }
+        if (width > c->max_line) c->max_line = width;
+        return 0;
+    }
+    return (mflag || Lflag) ? bwc_count_stream (f, c, lflag, wflag, Lflag) : bwc_count_fast (f, c);
 }
 
 /* Print one row of counts according to enabled flags, right-aligning each
@@ -228,7 +310,7 @@ bwc_slurp (const char *file, size_t *lenp)
     while ((ch = fgetc (f)) != EOF) {
         if (len >= cap) {
             size_t ncap = cap ? cap * 2 : 256;
-            char *nb = realloc (buf, ncap);
+            char *nb = realloc (buf, ncap + 1);
             if (!nb) {
                 free (buf);
                 if (f != stdin) fclose (f);
@@ -239,8 +321,16 @@ bwc_slurp (const char *file, size_t *lenp)
         }
         buf[len++] = (char) ch;
     }
-    if (f != stdin)
-        fclose (f);
+    if (ferror (f)) {
+        builtin_error ("%s: read error: %s", file, strerror (errno ? errno : EIO));
+        free (buf);
+        if (f != stdin) fclose (f);
+        return NULL;
+    }
+    if (f != stdin) fclose (f);
+    if (!buf) buf = malloc (1);
+    if (!buf) return NULL;
+    buf[len] = '\0';
     *lenp = len;
     return buf;
 }
@@ -288,6 +378,9 @@ bwc_number_width (char **files, int nfiles, int ncols)
 int
 wc_builtin (WORD_LIST *list)
 {
+    /* The shell owns these streams across invocations and redirections. */
+    clearerr (stdin);
+    clearerr (stdout);
     int lflag = 0, wflag = 0, cflag = 0, mflag = 0, Lflag = 0;
     const char *files_from = NULL;
     while (list && list->word->word[0] == '-' && list->word->word[1]) {
@@ -307,7 +400,7 @@ wc_builtin (WORD_LIST *list)
         if (!strcmp (w, "--chars")) { mflag = 1; list = list->next; continue; }
         if (!strcmp (w, "--max-line-length")) { Lflag = 1; list = list->next; continue; }
         if (!strcmp (w, "--files0-from")) {
-            if (!list->next) { builtin_error ("%s needs FILE", w); return EX_USAGE; }
+            if (!list->next) { builtin_error ("%s needs FILE", w); return EXECUTION_FAILURE; }
             list = list->next;
             files_from = list->word->word;
             list = list->next;
@@ -321,7 +414,7 @@ wc_builtin (WORD_LIST *list)
         if (!strncmp (w, "--", 2)) {
             builtin_error ("unknown flag: %s", w);
             builtin_usage ();
-            return EX_USAGE;
+            return EXECUTION_FAILURE;
         }
         for (const char *p = w + 1; *p; p++) {
             switch (*p) {
@@ -330,15 +423,17 @@ wc_builtin (WORD_LIST *list)
                 case 'c': cflag = 1; break;
                 case 'm': mflag = 1; break;
                 case 'L': Lflag = 1; break;
-                default: builtin_error ("unknown flag: -%c", *p); builtin_usage (); return EX_USAGE;
+                default: builtin_error ("unknown flag: -%c", *p); builtin_usage (); return EXECUTION_FAILURE;
             }
         }
         list = list->next;
     }
 
     int ncols = lflag + wflag + cflag + mflag + Lflag;
-    if (ncols == 0)
+    if (ncols == 0) {
+        lflag = wflag = cflag = 1;
         ncols = 3;   /* default -lwc */
+    }
 
     bwc_counts total = {0};
     int rc = EXECUTION_SUCCESS;
@@ -349,7 +444,7 @@ wc_builtin (WORD_LIST *list)
     if (files_from) {
         if (list) {
             builtin_error ("file operands cannot be combined with --files0-from");
-            return EX_USAGE;
+            return EXECUTION_FAILURE;
         }
         size_t blen = 0;
         char *blob = bwc_slurp (files_from, &blen);
@@ -422,7 +517,11 @@ wc_builtin (WORD_LIST *list)
                 }
             }
             bwc_counts c = {0};
-            ((mflag || Lflag) ? bwc_count_stream : bwc_count_fast) (f, &c);
+            bwc_count_selected (f, &c, lflag, wflag, cflag, mflag, Lflag);
+            if (ferror (f)) {
+                builtin_error ("read error: %s", strerror (errno ? errno : EIO));
+                rc = EXECUTION_FAILURE;
+            }
             if (!from_stdin)
                 fclose (f);
             bwc_print (&c, lflag, wflag, cflag, mflag, Lflag, width, names[k]);
@@ -447,7 +546,11 @@ wc_builtin (WORD_LIST *list)
     if (!list) {
         int width = bwc_number_width ((char *[]){ (char *) "-" }, 1, ncols);
         bwc_counts c = {0};
-        ((mflag || Lflag) ? bwc_count_stream : bwc_count_fast) (stdin, &c);
+        bwc_count_selected (stdin, &c, lflag, wflag, cflag, mflag, Lflag);
+        if (ferror (stdin)) {
+            builtin_error ("read error: %s", strerror (errno ? errno : EIO));
+            rc = EXECUTION_FAILURE;
+        }
         bwc_print (&c, lflag, wflag, cflag, mflag, Lflag, width, NULL);
     } else {
         int n_files = 0;
@@ -481,7 +584,11 @@ wc_builtin (WORD_LIST *list)
                 }
             }
             bwc_counts c = {0};
-            ((mflag || Lflag) ? bwc_count_stream : bwc_count_fast) (f, &c);
+            bwc_count_selected (f, &c, lflag, wflag, cflag, mflag, Lflag);
+            if (ferror (f)) {
+                builtin_error ("read error: %s", strerror (errno ? errno : EIO));
+                rc = EXECUTION_FAILURE;
+            }
             if (!from_stdin)
                 fclose (f);
             bwc_print (&c, lflag, wflag, cflag, mflag, Lflag, width, p->word->word);

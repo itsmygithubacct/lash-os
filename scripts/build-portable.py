@@ -15,6 +15,7 @@ import tempfile
 from elf_dependencies import require_static, require_arch
 
 from workspace import ROOT, BUILD, prepare_cmake, source_state
+from release_version import release_metadata
 
 
 def digest(path):
@@ -37,6 +38,7 @@ def main():
     parser.add_argument("--arch", choices=["x86_64", "aarch64", "riscv64"],
                         default=os.environ.get("LASHOS_TARGET_ARCH", os.uname().machine))
     args = parser.parse_args()
+    release = release_metadata(ROOT)
     compiler = os.environ.get("PORTABLE_CC")
     sdk = os.environ.get("CAPSULE_SDK")
     if not compiler or not sdk:
@@ -81,6 +83,7 @@ def main():
         "architecture": args.arch + "-linux", "libc": "musl", "compiler_target": target,
         "loader_sha256": digest(binary), "bpf_sha256": hashlib.sha256(embedded).hexdigest(),
         "bytes": binary.stat().st_size, "elf": dependencies,
+        "bash_os": release["bash_os"],
         # Release packaging compares this with the published source revision.
         "build_source": source_state(),
     }

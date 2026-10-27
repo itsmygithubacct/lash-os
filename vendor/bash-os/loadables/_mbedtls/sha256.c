@@ -1,13 +1,14 @@
 /* _mbedtls/sha256.c — SHA-256 implementation (Stage 19 hash demo).
  *
- * FIPS 180-4 algorithm extracted verbatim from upstream
+ * FIPS 180-4 algorithm based on upstream
  * vendor/mbedtls/tf-psa-crypto/drivers/builtin/src/sha256.c. The C-only
  * path (mbedtls_internal_sha256_process_c + the wrappers around it).
  * Stripped: ARMv8-A SIMD path, A64 crypto path,
  * MBEDTLS_SHA256_SMALLER variant, PSA error mappings, mbedtls_platform_
  * zeroize indirection (replaced with explicit-volatile memset).
  *
- * Algorithm bytes are upstream-faithful. The wrapper code (init/free/
+ * The compression schedule uses a sixteen-word ring and explicit rounds.
+ * The wrapper code (init/free/
  * starts/update/finish/sha256) is also upstream with PSA error returns
  * collapsed to MBEDTLS_ERR_SHA256_BAD_INPUT_DATA / 0.
  *
@@ -20,13 +21,44 @@
 
 #define SHA256_BLOCK_SIZE 64
 
-/* Big-endian 32-bit accessors (replace upstream macros from
-   tf_psa_crypto_common.h's alignment.h). */
+/* Keep the default CPU requirement unchanged. On x86 compilers with CPU
+   feature detection, a separate copy of the same C body may use BMI2's
+   non-destructive rotates; dispatch only after checking the running CPU.
+   Other targets and older compilers retain the portable compression path. */
+#if (defined (__x86_64__) || defined (__i386__)) && \
+    ((defined (__GNUC__) && !defined (__clang__) && __GNUC__ >= 5) || \
+     (defined (__clang__) && __clang_major__ >= 5))
+#define SHA256_HAVE_BMI2 1
+#define SHA256_INLINE static inline __attribute__ ((always_inline))
+#else
+#define SHA256_INLINE static inline
+#endif
+
+/* memcpy permits unaligned words without aliasing assumptions. Describing
+   the byte swap on whole words also avoids an expensive byte-lane shuffle
+   when a compiler vectorizes the sixteen input loads. */
+#if defined (__BYTE_ORDER__) && defined (__GNUC__)
+static inline uint32_t sha256_load_be (const unsigned char *p)
+{
+    uint32_t value;
+    memcpy (&value, p, sizeof value);
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    return __builtin_bswap32 (value);
+#elif __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+    return value;
+#else
+    return ((uint32_t) p[0] << 24) | ((uint32_t) p[1] << 16) |
+           ((uint32_t) p[2] << 8) | (uint32_t) p[3];
+#endif
+}
+#define MBEDTLS_GET_UINT32_BE(data, offset) sha256_load_be ((data) + (offset))
+#else
 #define MBEDTLS_GET_UINT32_BE(data, offset)                          \
     (((uint32_t) (data)[(offset) + 0] << 24) |                       \
      ((uint32_t) (data)[(offset) + 1] << 16) |                       \
      ((uint32_t) (data)[(offset) + 2] <<  8) |                       \
      ((uint32_t) (data)[(offset) + 3]))
+#endif
 
 #define MBEDTLS_PUT_UINT32_BE(n, data, offset) do {                  \
     (data)[(offset) + 0] = (unsigned char) ((n) >> 24);              \
@@ -120,9 +152,11 @@ static const uint32_t K[64] = {
 #define F0(x, y, z) (((x) & (y)) | ((z) & ((x) | (y))))
 #define F1(x, y, z) ((z) ^ ((x) & ((y) ^ (z))))
 
-#define R(t)                                                          \
-    (local.W[t] = S1(local.W[(t) -  2]) + local.W[(t) -  7] +         \
-                  S0(local.W[(t) - 15]) + local.W[(t) - 16])
+/* The message schedule depends on the preceding sixteen words. A ring
+   keeps those words live without retaining the complete 64-word schedule. */
+#define W(t) local.W[(t) & 15]
+#define R(t) (W(t) = S1(W((t) - 2)) + W((t) - 7) + \
+                      S0(W((t) - 15)) + W(t))
 
 #define P(a, b, c, d, e, f, g, h, x, K) do {                          \
     local.temp1 = (h) + S3(e) + F1((e), (f), (g)) + (K) + (x);        \
@@ -130,59 +164,129 @@ static const uint32_t K[64] = {
     (d) += local.temp1; (h) = local.temp1 + local.temp2;              \
 } while (0)
 
-static int sha256_process_block(mbedtls_sha256_context *ctx,
-                                const unsigned char data[SHA256_BLOCK_SIZE])
+/* Reuse the round workspace for contiguous input blocks, then erase all
+   schedule/state scratch before returning from the compression call. */
+SHA256_INLINE int sha256_process_blocks_c(mbedtls_sha256_context *ctx,
+                                         const unsigned char *data, size_t blocks)
 {
     struct {
-        uint32_t temp1, temp2, W[64];
+        uint32_t temp1, temp2, W[16];
         uint32_t A[8];
     } local;
     unsigned int i;
 
-    for (i = 0; i < 8; i++) local.A[i] = ctx->state[i];
+    while (blocks--) {
+        for (i = 0; i < 8; i++) local.A[i] = ctx->state[i];
 
-    for (i = 0; i < 16; i++) local.W[i] = MBEDTLS_GET_UINT32_BE(data, 4 * i);
+        for (i = 0; i < 16; i++) local.W[i] = MBEDTLS_GET_UINT32_BE(data, 4 * i);
 
-    for (i = 0; i < 16; i += 8) {
-        P(local.A[0], local.A[1], local.A[2], local.A[3], local.A[4],
-          local.A[5], local.A[6], local.A[7], local.W[i+0], K[i+0]);
-        P(local.A[7], local.A[0], local.A[1], local.A[2], local.A[3],
-          local.A[4], local.A[5], local.A[6], local.W[i+1], K[i+1]);
-        P(local.A[6], local.A[7], local.A[0], local.A[1], local.A[2],
-          local.A[3], local.A[4], local.A[5], local.W[i+2], K[i+2]);
-        P(local.A[5], local.A[6], local.A[7], local.A[0], local.A[1],
-          local.A[2], local.A[3], local.A[4], local.W[i+3], K[i+3]);
-        P(local.A[4], local.A[5], local.A[6], local.A[7], local.A[0],
-          local.A[1], local.A[2], local.A[3], local.W[i+4], K[i+4]);
-        P(local.A[3], local.A[4], local.A[5], local.A[6], local.A[7],
-          local.A[0], local.A[1], local.A[2], local.W[i+5], K[i+5]);
-        P(local.A[2], local.A[3], local.A[4], local.A[5], local.A[6],
-          local.A[7], local.A[0], local.A[1], local.W[i+6], K[i+6]);
-        P(local.A[1], local.A[2], local.A[3], local.A[4], local.A[5],
-          local.A[6], local.A[7], local.A[0], local.W[i+7], K[i+7]);
+        /* Constant round indices let the compiler schedule rotations,
+           loads and additions without the dynamic schedule-index loop. */
+        P(local.A[0], local.A[1], local.A[2], local.A[3], local.A[4], local.A[5], local.A[6], local.A[7], W(0), K[0]);
+        P(local.A[7], local.A[0], local.A[1], local.A[2], local.A[3], local.A[4], local.A[5], local.A[6], W(1), K[1]);
+        P(local.A[6], local.A[7], local.A[0], local.A[1], local.A[2], local.A[3], local.A[4], local.A[5], W(2), K[2]);
+        P(local.A[5], local.A[6], local.A[7], local.A[0], local.A[1], local.A[2], local.A[3], local.A[4], W(3), K[3]);
+        P(local.A[4], local.A[5], local.A[6], local.A[7], local.A[0], local.A[1], local.A[2], local.A[3], W(4), K[4]);
+        P(local.A[3], local.A[4], local.A[5], local.A[6], local.A[7], local.A[0], local.A[1], local.A[2], W(5), K[5]);
+        P(local.A[2], local.A[3], local.A[4], local.A[5], local.A[6], local.A[7], local.A[0], local.A[1], W(6), K[6]);
+        P(local.A[1], local.A[2], local.A[3], local.A[4], local.A[5], local.A[6], local.A[7], local.A[0], W(7), K[7]);
+
+        P(local.A[0], local.A[1], local.A[2], local.A[3], local.A[4], local.A[5], local.A[6], local.A[7], W(8), K[8]);
+        P(local.A[7], local.A[0], local.A[1], local.A[2], local.A[3], local.A[4], local.A[5], local.A[6], W(9), K[9]);
+        P(local.A[6], local.A[7], local.A[0], local.A[1], local.A[2], local.A[3], local.A[4], local.A[5], W(10), K[10]);
+        P(local.A[5], local.A[6], local.A[7], local.A[0], local.A[1], local.A[2], local.A[3], local.A[4], W(11), K[11]);
+        P(local.A[4], local.A[5], local.A[6], local.A[7], local.A[0], local.A[1], local.A[2], local.A[3], W(12), K[12]);
+        P(local.A[3], local.A[4], local.A[5], local.A[6], local.A[7], local.A[0], local.A[1], local.A[2], W(13), K[13]);
+        P(local.A[2], local.A[3], local.A[4], local.A[5], local.A[6], local.A[7], local.A[0], local.A[1], W(14), K[14]);
+        P(local.A[1], local.A[2], local.A[3], local.A[4], local.A[5], local.A[6], local.A[7], local.A[0], W(15), K[15]);
+
+        P(local.A[0], local.A[1], local.A[2], local.A[3], local.A[4], local.A[5], local.A[6], local.A[7], R(16), K[16]);
+        P(local.A[7], local.A[0], local.A[1], local.A[2], local.A[3], local.A[4], local.A[5], local.A[6], R(17), K[17]);
+        P(local.A[6], local.A[7], local.A[0], local.A[1], local.A[2], local.A[3], local.A[4], local.A[5], R(18), K[18]);
+        P(local.A[5], local.A[6], local.A[7], local.A[0], local.A[1], local.A[2], local.A[3], local.A[4], R(19), K[19]);
+        P(local.A[4], local.A[5], local.A[6], local.A[7], local.A[0], local.A[1], local.A[2], local.A[3], R(20), K[20]);
+        P(local.A[3], local.A[4], local.A[5], local.A[6], local.A[7], local.A[0], local.A[1], local.A[2], R(21), K[21]);
+        P(local.A[2], local.A[3], local.A[4], local.A[5], local.A[6], local.A[7], local.A[0], local.A[1], R(22), K[22]);
+        P(local.A[1], local.A[2], local.A[3], local.A[4], local.A[5], local.A[6], local.A[7], local.A[0], R(23), K[23]);
+
+        P(local.A[0], local.A[1], local.A[2], local.A[3], local.A[4], local.A[5], local.A[6], local.A[7], R(24), K[24]);
+        P(local.A[7], local.A[0], local.A[1], local.A[2], local.A[3], local.A[4], local.A[5], local.A[6], R(25), K[25]);
+        P(local.A[6], local.A[7], local.A[0], local.A[1], local.A[2], local.A[3], local.A[4], local.A[5], R(26), K[26]);
+        P(local.A[5], local.A[6], local.A[7], local.A[0], local.A[1], local.A[2], local.A[3], local.A[4], R(27), K[27]);
+        P(local.A[4], local.A[5], local.A[6], local.A[7], local.A[0], local.A[1], local.A[2], local.A[3], R(28), K[28]);
+        P(local.A[3], local.A[4], local.A[5], local.A[6], local.A[7], local.A[0], local.A[1], local.A[2], R(29), K[29]);
+        P(local.A[2], local.A[3], local.A[4], local.A[5], local.A[6], local.A[7], local.A[0], local.A[1], R(30), K[30]);
+        P(local.A[1], local.A[2], local.A[3], local.A[4], local.A[5], local.A[6], local.A[7], local.A[0], R(31), K[31]);
+
+        P(local.A[0], local.A[1], local.A[2], local.A[3], local.A[4], local.A[5], local.A[6], local.A[7], R(32), K[32]);
+        P(local.A[7], local.A[0], local.A[1], local.A[2], local.A[3], local.A[4], local.A[5], local.A[6], R(33), K[33]);
+        P(local.A[6], local.A[7], local.A[0], local.A[1], local.A[2], local.A[3], local.A[4], local.A[5], R(34), K[34]);
+        P(local.A[5], local.A[6], local.A[7], local.A[0], local.A[1], local.A[2], local.A[3], local.A[4], R(35), K[35]);
+        P(local.A[4], local.A[5], local.A[6], local.A[7], local.A[0], local.A[1], local.A[2], local.A[3], R(36), K[36]);
+        P(local.A[3], local.A[4], local.A[5], local.A[6], local.A[7], local.A[0], local.A[1], local.A[2], R(37), K[37]);
+        P(local.A[2], local.A[3], local.A[4], local.A[5], local.A[6], local.A[7], local.A[0], local.A[1], R(38), K[38]);
+        P(local.A[1], local.A[2], local.A[3], local.A[4], local.A[5], local.A[6], local.A[7], local.A[0], R(39), K[39]);
+
+        P(local.A[0], local.A[1], local.A[2], local.A[3], local.A[4], local.A[5], local.A[6], local.A[7], R(40), K[40]);
+        P(local.A[7], local.A[0], local.A[1], local.A[2], local.A[3], local.A[4], local.A[5], local.A[6], R(41), K[41]);
+        P(local.A[6], local.A[7], local.A[0], local.A[1], local.A[2], local.A[3], local.A[4], local.A[5], R(42), K[42]);
+        P(local.A[5], local.A[6], local.A[7], local.A[0], local.A[1], local.A[2], local.A[3], local.A[4], R(43), K[43]);
+        P(local.A[4], local.A[5], local.A[6], local.A[7], local.A[0], local.A[1], local.A[2], local.A[3], R(44), K[44]);
+        P(local.A[3], local.A[4], local.A[5], local.A[6], local.A[7], local.A[0], local.A[1], local.A[2], R(45), K[45]);
+        P(local.A[2], local.A[3], local.A[4], local.A[5], local.A[6], local.A[7], local.A[0], local.A[1], R(46), K[46]);
+        P(local.A[1], local.A[2], local.A[3], local.A[4], local.A[5], local.A[6], local.A[7], local.A[0], R(47), K[47]);
+
+        P(local.A[0], local.A[1], local.A[2], local.A[3], local.A[4], local.A[5], local.A[6], local.A[7], R(48), K[48]);
+        P(local.A[7], local.A[0], local.A[1], local.A[2], local.A[3], local.A[4], local.A[5], local.A[6], R(49), K[49]);
+        P(local.A[6], local.A[7], local.A[0], local.A[1], local.A[2], local.A[3], local.A[4], local.A[5], R(50), K[50]);
+        P(local.A[5], local.A[6], local.A[7], local.A[0], local.A[1], local.A[2], local.A[3], local.A[4], R(51), K[51]);
+        P(local.A[4], local.A[5], local.A[6], local.A[7], local.A[0], local.A[1], local.A[2], local.A[3], R(52), K[52]);
+        P(local.A[3], local.A[4], local.A[5], local.A[6], local.A[7], local.A[0], local.A[1], local.A[2], R(53), K[53]);
+        P(local.A[2], local.A[3], local.A[4], local.A[5], local.A[6], local.A[7], local.A[0], local.A[1], R(54), K[54]);
+        P(local.A[1], local.A[2], local.A[3], local.A[4], local.A[5], local.A[6], local.A[7], local.A[0], R(55), K[55]);
+
+        P(local.A[0], local.A[1], local.A[2], local.A[3], local.A[4], local.A[5], local.A[6], local.A[7], R(56), K[56]);
+        P(local.A[7], local.A[0], local.A[1], local.A[2], local.A[3], local.A[4], local.A[5], local.A[6], R(57), K[57]);
+        P(local.A[6], local.A[7], local.A[0], local.A[1], local.A[2], local.A[3], local.A[4], local.A[5], R(58), K[58]);
+        P(local.A[5], local.A[6], local.A[7], local.A[0], local.A[1], local.A[2], local.A[3], local.A[4], R(59), K[59]);
+        P(local.A[4], local.A[5], local.A[6], local.A[7], local.A[0], local.A[1], local.A[2], local.A[3], R(60), K[60]);
+        P(local.A[3], local.A[4], local.A[5], local.A[6], local.A[7], local.A[0], local.A[1], local.A[2], R(61), K[61]);
+        P(local.A[2], local.A[3], local.A[4], local.A[5], local.A[6], local.A[7], local.A[0], local.A[1], R(62), K[62]);
+        P(local.A[1], local.A[2], local.A[3], local.A[4], local.A[5], local.A[6], local.A[7], local.A[0], R(63), K[63]);
+        for (i = 0; i < 8; i++) ctx->state[i] += local.A[i];
+        data += SHA256_BLOCK_SIZE;
     }
-    for (i = 16; i < 64; i += 8) {
-        P(local.A[0], local.A[1], local.A[2], local.A[3], local.A[4],
-          local.A[5], local.A[6], local.A[7], R(i+0), K[i+0]);
-        P(local.A[7], local.A[0], local.A[1], local.A[2], local.A[3],
-          local.A[4], local.A[5], local.A[6], R(i+1), K[i+1]);
-        P(local.A[6], local.A[7], local.A[0], local.A[1], local.A[2],
-          local.A[3], local.A[4], local.A[5], R(i+2), K[i+2]);
-        P(local.A[5], local.A[6], local.A[7], local.A[0], local.A[1],
-          local.A[2], local.A[3], local.A[4], R(i+3), K[i+3]);
-        P(local.A[4], local.A[5], local.A[6], local.A[7], local.A[0],
-          local.A[1], local.A[2], local.A[3], R(i+4), K[i+4]);
-        P(local.A[3], local.A[4], local.A[5], local.A[6], local.A[7],
-          local.A[0], local.A[1], local.A[2], R(i+5), K[i+5]);
-        P(local.A[2], local.A[3], local.A[4], local.A[5], local.A[6],
-          local.A[7], local.A[0], local.A[1], R(i+6), K[i+6]);
-        P(local.A[1], local.A[2], local.A[3], local.A[4], local.A[5],
-          local.A[6], local.A[7], local.A[0], R(i+7), K[i+7]);
-    }
-
-    for (i = 0; i < 8; i++) ctx->state[i] += local.A[i];
     mb_zeroize(&local, sizeof(local));
     return 0;
+}
+
+#if defined (SHA256_HAVE_BMI2)
+/* The explicit target boundary prevents BMI2 instructions from entering
+   the generic path, while always-inlining gives both copies the identical
+   schedule, arithmetic, and volatile workspace erasure. */
+__attribute__ ((target ("bmi2"), noinline))
+static int sha256_process_blocks_bmi2(mbedtls_sha256_context *ctx,
+                                     const unsigned char *data, size_t blocks)
+{
+    return sha256_process_blocks_c(ctx, data, blocks);
+}
+#endif
+
+static int sha256_process_blocks(mbedtls_sha256_context *ctx,
+                                 const unsigned char *data, size_t blocks)
+{
+#if defined (SHA256_HAVE_BMI2)
+    /* The compiler's CPU-feature data is initialized once at startup. */
+    if (__builtin_cpu_supports("bmi2"))
+        return sha256_process_blocks_bmi2(ctx, data, blocks);
+#endif
+    return sha256_process_blocks_c(ctx, data, blocks);
+}
+
+static int sha256_process_block(mbedtls_sha256_context *ctx,
+                                const unsigned char data[SHA256_BLOCK_SIZE])
+{
+    return sha256_process_blocks(ctx, data, 1);
 }
 
 int mbedtls_sha256_update(mbedtls_sha256_context *ctx,
@@ -206,9 +310,11 @@ int mbedtls_sha256_update(mbedtls_sha256_context *ctx,
         if ((ret = sha256_process_block(ctx, ctx->buffer)) != 0) return ret;
         input += fill; ilen -= fill; left = 0;
     }
-    while (ilen >= SHA256_BLOCK_SIZE) {
-        if ((ret = sha256_process_block(ctx, input)) != 0) return ret;
-        input += SHA256_BLOCK_SIZE; ilen -= SHA256_BLOCK_SIZE;
+    if (ilen >= SHA256_BLOCK_SIZE) {
+        size_t blocks = ilen / SHA256_BLOCK_SIZE;
+        if ((ret = sha256_process_blocks(ctx, input, blocks)) != 0) return ret;
+        input += blocks * SHA256_BLOCK_SIZE;
+        ilen -= blocks * SHA256_BLOCK_SIZE;
     }
     if (ilen > 0) memcpy(ctx->buffer + left, input, ilen);
     return 0;

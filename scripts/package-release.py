@@ -15,6 +15,7 @@ sys.dont_write_bytecode = True
 from elf_dependencies import require_arch, require_static
 from runtime import ARCHES, KERNEL_PATCHES, digest
 from workspace import ROOT, BUILD, OUT, source_differences
+from release_version import release_metadata, require_latest_release
 
 
 def publish(source, destination):
@@ -48,8 +49,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--with-sources", action="store_true",
                         help="Require and include both corresponding-source archives and release notes")
+    parser.add_argument("--check-latest", action="store_true",
+                        help="Require the latest published bash-os release before publishing candidates")
     args = parser.parse_args()
-    version = (ROOT / "VERSION").read_text().strip()
+    release_identity = release_metadata(ROOT)
+    if args.check_latest:
+        require_latest_release(release_identity)
+    version = release_identity["version"]
     destination = OUT / "releases" / version
     destination.mkdir(parents=True, exist_ok=True)
     assets, sums, manifests = [], [], {}
@@ -58,6 +64,8 @@ def main():
         binary = OUT / profile / "linux-bash-os"
         inventory = OUT / profile / "portable.json"
         manifest = json.loads(inventory.read_text())
+        if manifest.get("bash_os") != release_identity["bash_os"]:
+            raise ValueError(f"The {arch} executable was built from a different bash-os release")
         sha256 = digest(binary)
         require_arch(binary, arch)
         require_static(binary)
@@ -83,7 +91,7 @@ def main():
         raise ValueError("The architecture builds do not contain the same BPF image")
     revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
     dirty = bool(subprocess.check_output(["git", "status", "--porcelain"], cwd=ROOT))
-    release = {"version": version, "source_revision": revision, "source_dirty": dirty, "assets": assets}
+    release = {**release_identity, "source_revision": revision, "source_dirty": dirty, "assets": assets}
     if args.with_sources:
         if dirty:
             raise ValueError("Commit source changes before collecting the complete public release")

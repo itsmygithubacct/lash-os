@@ -21,11 +21,11 @@ chgrp_builtin (WORD_LIST *list)
   while ((opt = internal_getopt (list, "h")) != -1)
     {
       if (opt == 'h') deref = 0;
-      else { builtin_usage (); return (EX_USAGE); }
+      else { builtin_usage (); return (EXECUTION_FAILURE); }
     }
   list = loptend;
   if (list == 0 || list->next == 0)
-    { builtin_usage (); return (EX_USAGE); }
+    { builtin_usage (); return (EXECUTION_FAILURE); }
 
   gr = getgrnam (list->word->word);
   if (gr)

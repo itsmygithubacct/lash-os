@@ -22,23 +22,29 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <ctype.h>
+#include <limits.h>
+#include <sys/stat.h>
 
 #include "loadables.h"
 
 static long long
-bs_parsesize (const char *s)
+bs_parsenumber (const char *s, int suffix)
 {
     char *end;
+    errno = 0;
     long long n = strtoll (s, &end, 10);
-    if (end == s || n <= 0) return -1;
+    if (errno == ERANGE || end == s || n <= 0) return -1;
+    if (*end == '\0') return n;
+    if (!suffix || end[1]) return -1;
+    long long factor;
     switch (*end) {
-        case '\0':              return n;
-        case 'c':               return n;
-        case 'k': case 'K':     return n * 1024;
-        case 'm': case 'M':     return n * 1024 * 1024;
-        case 'g': case 'G':     return n * 1024LL * 1024LL * 1024LL;
+        case 'c':               factor = 1; break;
+        case 'k': case 'K':     factor = 1024; break;
+        case 'm': case 'M':     factor = 1024LL * 1024; break;
+        case 'g': case 'G':     factor = 1024LL * 1024 * 1024; break;
         default:                return -1;
     }
+    return n > LLONG_MAX / factor ? -1 : n * factor;
 }
 
 /* Compose PREFIX + suffix-of-length-suflen from `index`. Suffix is all
@@ -75,6 +81,50 @@ bs_open_stdin (void)
     return in;
 }
 
+/* Open without truncation until we know this is not the input, including
+   a hard link or a symlink to it. fdopen("w") does not truncate the fd. */
+static FILE *
+bs_open_output (const char *name, const struct stat *input)
+{
+    int fd = open (name, O_WRONLY | O_CREAT, 0666);
+    if (fd < 0) {
+        builtin_error ("create %s: %s", name, strerror (errno));
+        return NULL;
+    }
+    struct stat output;
+    if (fstat (fd, &output) < 0) {
+        builtin_error ("stat %s: %s", name, strerror (errno));
+        close (fd);
+        return NULL;
+    }
+    if (output.st_dev == input->st_dev && output.st_ino == input->st_ino) {
+        builtin_error ("%s would overwrite the input", name);
+        close (fd);
+        return NULL;
+    }
+    if (S_ISREG (output.st_mode) && ftruncate (fd, 0) < 0) {
+        builtin_error ("truncate %s: %s", name, strerror (errno));
+        close (fd);
+        return NULL;
+    }
+    FILE *out = fdopen (fd, "w");
+    if (!out) {
+        builtin_error ("open %s: %s", name, strerror (errno));
+        close (fd);
+    }
+    return out;
+}
+
+static int
+bs_close_output (FILE *out, const char *name)
+{
+    if (fclose (out) == EOF) {
+        builtin_error ("write %s: %s", name, strerror (errno ? errno : EIO));
+        return -1;
+    }
+    return 0;
+}
+
 int
 split_builtin (WORD_LIST *list)
 {
@@ -89,36 +139,42 @@ split_builtin (WORD_LIST *list)
         if (!strcmp (w, "--")) { list = list->next; break; }
         if (!strcmp (w, "-l") || !strncmp (w, "-l", 2)) {
             const char *v = w[2] ? w + 2 : (list = list->next, list ? list->word->word : NULL);
-            if (!v) { builtin_error ("-l needs N"); builtin_usage (); return EX_USAGE; }
-            line_chunk = atol (v);
+            if (!v) { builtin_error ("-l needs N"); builtin_usage (); return EXECUTION_FAILURE; }
+            long long value = bs_parsenumber (v, 0);
+            if (value <= 0 || value > LONG_MAX) {
+                builtin_error ("-l: invalid line count: %s", v);
+                builtin_usage ();
+                return EXECUTION_FAILURE;
+            }
+            line_chunk = (long) value;
             byte_chunk = 0;
-            if (line_chunk <= 0) { builtin_error ("-l N must be > 0"); builtin_usage (); return EX_USAGE; }
             list = list->next;
             continue;
         }
         if (!strcmp (w, "-b") || !strncmp (w, "-b", 2)) {
             const char *v = w[2] ? w + 2 : (list = list->next, list ? list->word->word : NULL);
-            if (!v) { builtin_error ("-b needs SIZE"); builtin_usage (); return EX_USAGE; }
-            byte_chunk = bs_parsesize (v);
-            if (byte_chunk <= 0) { builtin_error ("-b: bad SIZE: %s", v); builtin_usage (); return EX_USAGE; }
+            if (!v) { builtin_error ("-b needs SIZE"); builtin_usage (); return EXECUTION_FAILURE; }
+            byte_chunk = bs_parsenumber (v, 1);
+            if (byte_chunk <= 0) { builtin_error ("-b: bad SIZE: %s", v); builtin_usage (); return EXECUTION_FAILURE; }
             list = list->next;
             continue;
         }
         if (!strcmp (w, "-a") || !strncmp (w, "-a", 2)) {
             const char *v = w[2] ? w + 2 : (list = list->next, list ? list->word->word : NULL);
-            if (!v) { builtin_error ("-a needs SUFLEN"); builtin_usage (); return EX_USAGE; }
-            suflen = atoi (v);
-            if (suflen < 1 || suflen > 6) { builtin_error ("-a: SUFLEN must be in 1..6"); builtin_usage (); return EX_USAGE; }
+            if (!v) { builtin_error ("-a needs SUFLEN"); builtin_usage (); return EXECUTION_FAILURE; }
+            long long value = bs_parsenumber (v, 0);
+            if (value < 1 || value > 6) { builtin_error ("-a: SUFLEN must be in 1..6"); builtin_usage (); return EXECUTION_FAILURE; }
+            suflen = (int) value;
             list = list->next;
             continue;
         }
         builtin_error ("unknown flag: %s", w);
         builtin_usage ();
-        return EX_USAGE;
+        return EXECUTION_FAILURE;
     }
     if (list) { input = list->word->word; list = list->next; }
     if (list) { prefix = list->word->word; list = list->next; }
-    if (list) { builtin_error ("split: extra argument: %s", list->word->word); builtin_usage (); return EX_USAGE; }
+    if (list) { builtin_error ("split: extra argument: %s", list->word->word); builtin_usage (); return EXECUTION_FAILURE; }
 
     int from_stdin = !input || !strcmp (input, "-");
     FILE *fin = from_stdin ? bs_open_stdin () : fopen (input, "r");
@@ -127,7 +183,19 @@ split_builtin (WORD_LIST *list)
         return EXECUTION_FAILURE;
     }
 
-    char namebuf[256];
+    struct stat input_stat;
+    if (fstat (fileno (fin), &input_stat) < 0) {
+        builtin_error ("stat input: %s", strerror (errno));
+        fclose (fin);
+        return EXECUTION_FAILURE;
+    }
+    size_t namecap = strlen (prefix) + (size_t) suflen + 1;
+    char *namebuf = malloc (namecap);
+    if (!namebuf) {
+        builtin_error ("out of memory");
+        fclose (fin);
+        return EXECUTION_FAILURE;
+    }
     long idx = 0;
     int rc = EXECUTION_SUCCESS;
 
@@ -147,14 +215,13 @@ split_builtin (WORD_LIST *list)
             size_t r = fread (buf, 1, want, fin);
             if (r == 0) break;
             if (fout == NULL) {
-                if (bs_make_name (namebuf, sizeof namebuf, prefix, suflen, idx) < 0) {
+                if (bs_make_name (namebuf, namecap, prefix, suflen, idx) < 0) {
                     builtin_error ("split: suffix exhausted (try larger -a)");
                     rc = EXECUTION_FAILURE;
                     break;
                 }
-                fout = fopen (namebuf, "wb");
+                fout = bs_open_output (namebuf, &input_stat);
                 if (!fout) {
-                    builtin_error ("create %s: %s", namebuf, strerror (errno));
                     rc = EXECUTION_FAILURE;
                     break;
                 }
@@ -167,12 +234,13 @@ split_builtin (WORD_LIST *list)
             }
             left_in_chunk -= (long long) r;
             if (left_in_chunk == 0) {
-                fclose (fout);
+                int failed = bs_close_output (fout, namebuf);
                 fout = NULL;
+                if (failed) { rc = EXECUTION_FAILURE; break; }
                 idx++;
             }
         }
-        if (fout) { fclose (fout); }
+        if (fout && bs_close_output (fout, namebuf) < 0) rc = EXECUTION_FAILURE;
     } else {
         /* Line-based splitting. */
         char *line = NULL;
@@ -182,31 +250,44 @@ split_builtin (WORD_LIST *list)
         FILE *fout = NULL;
         while ((n = getline (&line, &cap, fin)) != -1) {
             if (lines_in_chunk == 0) {
-                if (bs_make_name (namebuf, sizeof namebuf, prefix, suflen, idx) < 0) {
+                if (bs_make_name (namebuf, namecap, prefix, suflen, idx) < 0) {
                     builtin_error ("split: suffix exhausted (try larger -a)");
                     rc = EXECUTION_FAILURE;
                     break;
                 }
-                fout = fopen (namebuf, "w");
+                fout = bs_open_output (namebuf, &input_stat);
                 if (!fout) {
-                    builtin_error ("create %s: %s", namebuf, strerror (errno));
                     rc = EXECUTION_FAILURE;
                     break;
                 }
             }
-            fwrite (line, 1, (size_t) n, fout);
+            if (fwrite (line, 1, (size_t) n, fout) != (size_t) n) {
+                builtin_error ("write %s: %s", namebuf, strerror (errno ? errno : EIO));
+                rc = EXECUTION_FAILURE;
+                break;
+            }
             lines_in_chunk++;
             if (lines_in_chunk >= line_chunk) {
-                fclose (fout); fout = NULL;
+                int failed = bs_close_output (fout, namebuf);
+                fout = NULL;
+                if (failed) { rc = EXECUTION_FAILURE; break; }
                 lines_in_chunk = 0;
                 idx++;
             }
         }
-        if (fout) fclose (fout);
+        if (fout && bs_close_output (fout, namebuf) < 0) rc = EXECUTION_FAILURE;
         free (line);
     }
 
-    fclose (fin);
+    if (ferror (fin)) {
+        builtin_error ("read %s: %s", input ? input : "stdin", strerror (errno ? errno : EIO));
+        rc = EXECUTION_FAILURE;
+    }
+    if (fclose (fin) == EOF) {
+        builtin_error ("close input: %s", strerror (errno));
+        rc = EXECUTION_FAILURE;
+    }
+    free (namebuf);
     return rc;
 }
 

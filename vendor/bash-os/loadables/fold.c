@@ -2,11 +2,12 @@
  *
  * Phase T of bash-os POSIX gap-fillers.
  *
- *   bashfold [-bs] [-w WIDTH] [FILE...]
+ *   bashfold [-bcs] [-w WIDTH] [FILE...]
  *
  *   -w WIDTH   wrap at WIDTH columns (default 80)
  *   -b         count bytes, not display columns (treat each byte as 1)
- *   -s         break at last whitespace ≤ WIDTH (word-wrap), if any
+ *   -c         count UTF-8 scalars (invalid bytes count one each)
+ *   -s         break at last space/tab ≤ WIDTH (word-wrap), if any
  *
  * No FILE or "-" reads stdin. Default mode counts display columns,
  * with TAB advancing to next multiple of 8, BS rewinding by one,
@@ -35,18 +36,11 @@
 
 typedef struct { int width; int bflag; int sflag; int cflag; } bf_opts;
 
-/* Decode one logical unit from BYTES[0..avail-1] into *cp, returning its
- * byte length (1..4). Mirrors the three counting modes of GNU coreutils
- * fold (which reads whole characters via mbbuf/mcel):
- *
- *   -b (COUNT_BYTES):   the unit is a single byte — fold may split a
- *                       multibyte sequence at a byte boundary.
- *   else (CHARACTERS / COLUMNS): the unit is a whole UTF-8 character, so
- *                       a wrap never falls inside a multibyte sequence.
- *
- * An incomplete or malformed sequence decodes as its lead byte alone
- * (length 1), which the width logic then treats as a width-1 character —
- * matching fold's "default to width 1 on an invalid character". */
+/* Decode one strict UTF-8 scalar, independently of LC_CTYPE. Invalid bytes
+ * remain separate width-one units (sentinel above Unicode's scalar range).
+ * Return zero only for a prefix that can still become a valid scalar; the
+ * caller then fetches continuations, or falls back one byte at EOF. */
+#define BF_INVALID 0x110000U
 static int
 bf_decode (const unsigned char *bytes, size_t avail, const bf_opts *o,
            unsigned int *cp)
@@ -55,21 +49,26 @@ bf_decode (const unsigned char *bytes, size_t avail, const bf_opts *o,
     *cp = c;
     if (o->bflag || c < 0x80)
         return 1;
-    int need;
+    *cp = BF_INVALID;
+    int length;
     unsigned int code;
-    if (c >= 0xC0 && c < 0xE0)      { need = 1; code = c & 0x1F; }
-    else if (c >= 0xE0 && c < 0xF0) { need = 2; code = c & 0x0F; }
-    else if (c >= 0xF0 && c < 0xF8) { need = 3; code = c & 0x07; }
-    else                            return 1;   /* stray continuation / 5+ byte */
-    if (avail < (size_t) need + 1)
-        return 1;                               /* truncated: lead byte alone */
-    for (int k = 1; k <= need; k++) {
-        if ((bytes[k] & 0xC0) != 0x80)
-            return 1;                           /* not a continuation */
-        code = (code << 6) | (bytes[k] & 0x3F);
+    if (c >= 0xC2 && c <= 0xDF)      { length = 2; code = c & 0x1F; }
+    else if (c >= 0xE0 && c <= 0xEF) { length = 3; code = c & 0x0F; }
+    else if (c >= 0xF0 && c <= 0xF4) { length = 4; code = c & 0x07; }
+    else return 1;
+    for (int k = 1; k < length; k++) {
+        if ((size_t) k >= avail) return 0;
+        unsigned int next = bytes[k];
+        if ((next & 0xC0) != 0x80) return 1;
+        if (k == 1 && ((c == 0xE0 && next < 0xA0) ||
+                       (c == 0xED && next >= 0xA0) ||
+                       (c == 0xF0 && next < 0x90) ||
+                       (c == 0xF4 && next >= 0x90)))
+            return 1; /* overlong, surrogate, or above U+10FFFF */
+        code = (code << 6) | (next & 0x3F);
     }
     *cp = code;
-    return need + 1;
+    return length;
 }
 
 /* Column reached after consuming the unit (codepoint CP, byte length LEN)
@@ -92,7 +91,8 @@ bf_advance (int64_t col, unsigned int cp, int len, int *last_w, const bf_opts *o
         return col + 1;
     }
     /* Printable ASCII has width one in every supported locale. */
-    int w = cp >= 0x20 && cp < 0x7f ? 1 : wcwidth ((wchar_t) cp);
+    int w = cp == BF_INVALID || (cp >= 0x20 && cp < 0x7f)
+        ? 1 : wcwidth ((wchar_t) cp);
     if (w < 0)
         w = 1;                                  /* invalid char defaults to 1 */
     *last_w = w;
@@ -159,13 +159,14 @@ bf_reserve (char **buf, size_t *cap, size_t len, size_t extra)
     return 1;
 }
 
-/* Own stdin's stdio state for this invocation. In particular, stopping on
-   a write error must not leave read-ahead bytes in Bash's persistent FILE
-   for the next redirected builtin. Repeated '-' operands share this stream. */
+/* Own stdin's descriptor for this invocation. The FILE is used only for
+   ownership, never buffered input, so a write failure cannot leave read-ahead
+   bytes in Bash's persistent FILE. Repeated '-' operands share this stream. */
 static FILE *
 bf_open_stdin (void)
 {
-    int fd = dup (STDIN_FILENO);
+    /* A closed standard descriptor must not become an alias of stdin. */
+    int fd = fcntl (STDIN_FILENO, F_DUPFD_CLOEXEC, 3);
     FILE *in = fd < 0 ? NULL : fdopen (fd, "r");
     if (!in) {
         int error = errno;
@@ -201,28 +202,49 @@ bf_fold_stream (FILE *in, const bf_opts *o, const char *name, bl_output *out)
     int eof = 0;
     int read_error = 0;
 
+    int need_more = 0;
     while (!out->error) {
-        /* Keep >=4 bytes available so a full UTF-8 unit is decodable. */
-        if (!eof && iend - ipos < 4) {
-            if (ipos > 0) { memmove (ib, ib + ipos, iend - ipos); iend -= ipos; ipos = 0; }
-            size_t got = fread (ib + iend, 1, sizeof ib - iend, in);
-            if (got == 0) eof = 1;
-            if (ferror (in)) { read_error = errno ? errno : EIO; eof = 1; }
-            iend += got;
+        /* read(), unlike fread(), returns a short available pipe/terminal
+           chunk without trying to fill 8 KiB. Refill only when exhausted or
+           when decoding a genuinely incomplete UTF-8 prefix. */
+        if (!eof && (ipos == iend || need_more)) {
+            bl_output_flush (out); /* deliver completed lines before blocking */
+            if (out->error) break;
+            if (ipos > 0) {
+                memmove (ib, ib + ipos, iend - ipos);
+                iend -= ipos; ipos = 0;
+            }
+            ssize_t got;
+            do got = read (fileno (in), ib + iend, sizeof ib - iend);
+            while (got < 0 && errno == EINTR);
+            if (got <= 0) {
+                eof = 1;
+                if (got < 0) read_error = errno;
+            } else iend += (size_t) got;
+            need_more = 0;
         }
         if (ipos >= iend) break;
 
-        /* All three modes count printable ASCII identically. Copy a span
-           that fits without wrapping; controls, UTF-8 and the next wrap
-           still take the general path below (including -s rescanning). */
-        if (col < o->width && ib[ipos] >= 0x20 && ib[ipos] < 0x7f) {
+        /* Copy a span that fits without wrapping. In byte mode all bytes
+           except newline count one, including non-ASCII and controls. Other
+           modes take only printable ASCII here; UTF-8 and controls still
+           need decoding/column adjustment below (including -s rescanning). */
+        if (col < o->width && (o->bflag ? ib[ipos] != '\n'
+                              : ib[ipos] >= 0x20 && ib[ipos] < 0x7f)) {
             size_t limit = iend - ipos;
             if (limit > (size_t) (o->width - col))
                 limit = (size_t) (o->width - col);
             size_t n = 0, space = 0;
-            while (n < limit && ib[ipos + n] >= 0x20 && ib[ipos + n] < 0x7f) {
-                if (ib[ipos + n] == ' ') space = n + 1;
-                n++;
+            if (o->bflag) {
+                while (n < limit && ib[ipos + n] != '\n') {
+                    if (ib[ipos + n] == ' ' || ib[ipos + n] == '\t') space = n + 1;
+                    n++;
+                }
+            } else {
+                while (n < limit && ib[ipos + n] >= 0x20 && ib[ipos + n] < 0x7f) {
+                    if (ib[ipos + n] == ' ') space = n + 1;
+                    n++;
+                }
             }
             if (!bf_reserve (&buf, &cap, len, n)) {
                 free (buf); return EXECUTION_FAILURE;
@@ -235,6 +257,10 @@ bf_fold_stream (FILE *in, const bf_opts *o, const char *name, bl_output *out)
 
         unsigned int cp;
         int clen = bf_decode (ib + ipos, iend - ipos, o, &cp);
+        if (clen == 0) {
+            if (!eof) { need_more = 1; continue; }
+            clen = 1; /* truncated at EOF: preserve each byte, width one */
+        }
 
         if (cp == '\n' && clen == 1) {
             bl_output_write (out, buf, len);
@@ -268,6 +294,7 @@ bf_fold_stream (FILE *in, const bf_opts *o, const char *name, bl_output *out)
             for (size_t i = 0; i < len; ) {
                 unsigned int cp2;
                 int l2 = bf_decode ((unsigned char *) buf + i, len - i, o, &cp2);
+                if (l2 == 0) l2 = 1; /* incomplete bytes already rejected at EOF */
                 col = bf_advance (col, cp2, l2, &last_w, o);
                 if (cp2 == ' ' || cp2 == '\t') last_space = i + 1;
                 i += (size_t) l2;
@@ -327,13 +354,13 @@ fold_builtin (WORD_LIST *list)
                 builtin_error ("--width needs WIDTH");
                 builtin_usage ();
                 free (files.v);
-                return EX_USAGE;
+                return EXECUTION_FAILURE;
             }
             if (!bf_parse_width (p->next->word->word, &o.width)) {
                 builtin_error ("invalid width: %s", p->next->word->word);
                 builtin_usage ();
                 free (files.v);
-                return EX_USAGE;
+                return EXECUTION_FAILURE;
             }
             p = p->next;
             continue;
@@ -343,7 +370,7 @@ fold_builtin (WORD_LIST *list)
                 builtin_error ("invalid width: %s", w + 8);
                 builtin_usage ();
                 free (files.v);
-                return EX_USAGE;
+                return EXECUTION_FAILURE;
             }
             continue;
         }
@@ -365,7 +392,7 @@ fold_builtin (WORD_LIST *list)
                 builtin_error ("invalid width: %s", w);
                 builtin_usage ();
                 free (files.v);
-                return EX_USAGE;
+                return EXECUTION_FAILURE;
             }
             continue;
         }
@@ -375,7 +402,7 @@ fold_builtin (WORD_LIST *list)
                 builtin_error ("unknown flag: %s", w);
                 builtin_usage ();
                 free (files.v);
-                return EX_USAGE;
+                return EXECUTION_FAILURE;
             }
             for (int i = 1; w[i]; i++) {
                 switch (w[i]) {
@@ -388,7 +415,7 @@ fold_builtin (WORD_LIST *list)
                         builtin_error ("invalid width: %s", w + i);
                         builtin_usage ();
                         free (files.v);
-                        return EX_USAGE;
+                        return EXECUTION_FAILURE;
                     }
                     i = (int) strlen (w) - 1;
                     break;
@@ -398,20 +425,20 @@ fold_builtin (WORD_LIST *list)
                             builtin_error ("invalid width: %s", w + i + 1);
                             builtin_usage ();
                             free (files.v);
-                            return EX_USAGE;
+                            return EXECUTION_FAILURE;
                         }
                     } else {
                         if (!p->next) {
                             builtin_error ("-w needs WIDTH");
                             builtin_usage ();
                             free (files.v);
-                            return EX_USAGE;
+                            return EXECUTION_FAILURE;
                         }
                         if (!bf_parse_width (p->next->word->word, &o.width)) {
                             builtin_error ("invalid width: %s", p->next->word->word);
                             builtin_usage ();
                             free (files.v);
-                            return EX_USAGE;
+                            return EXECUTION_FAILURE;
                         }
                         p = p->next;
                     }
@@ -421,7 +448,7 @@ fold_builtin (WORD_LIST *list)
                     builtin_error ("unknown flag: -%c", w[i]);
                     builtin_usage ();
                     free (files.v);
-                    return EX_USAGE;
+                    return EXECUTION_FAILURE;
                 }
             }
         } else {
@@ -475,14 +502,15 @@ char *fold_doc[] = {
     "",
     "    -w WIDTH   wrap at WIDTH columns (default 80)",
     "    -b         count bytes, not display columns",
-    "    -c         count characters: a UTF-8 char is one unit and a",
+    "    -c         count characters: a UTF-8 scalar is one unit and a",
     "               wrap never splits a multibyte sequence",
-    "    -s         break at last whitespace ≤ WIDTH (word-wrap)",
+    "    -s         break at last space/tab ≤ WIDTH (word-wrap)",
     "    --help | --version",
     "               show usage or version",
     "",
     "TAB → next multiple of 8; BS rewinds; CR resets column to 0",
     "(unless -b is set). -b and -c are mutually exclusive (last wins).",
+    "Malformed UTF-8 bytes are preserved and each counts as one.",
     "No FILE or '-' reads stdin.",
     (char *)NULL
 };

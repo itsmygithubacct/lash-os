@@ -1,5 +1,7 @@
 #pragma once
 #include_next <unistd.h>
+extern char **environ;
+ssize_t copy_file_range(int, off_t *, int, off_t *, size_t, unsigned);
 int getresuid(uid_t *, uid_t *, uid_t *);
 int getresgid(gid_t *, gid_t *, gid_t *);
 int setresuid(uid_t, uid_t, uid_t);

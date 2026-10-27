@@ -9,6 +9,7 @@
 #include <errno.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <sys/types.h>
 #include <pwd.h>
 #include <grp.h>
@@ -28,7 +29,11 @@ parse_owner (char *spec, uid_t *uid, gid_t *gid)
   *gid = (gid_t) -1;
   colon = strchr (spec, ':');
   if (colon == 0)
-    colon = strchr (spec, '.');		/* legacy owner.group */
+    {
+      colon = strchr (spec, '.');		/* legacy owner.group */
+      if (colon)
+        builtin_warning ("use ':' instead of '.' in owner/group specification: %s", spec);
+    }
   if (colon)
     { *colon = '\0'; o = spec; g = colon + 1; }
   else
@@ -41,8 +46,11 @@ parse_owner (char *spec, uid_t *uid, gid_t *gid)
 	*uid = pw->pw_uid;
       else
 	{
+	  errno = 0;
 	  long v = strtol (o, &end, 10);
-	  if (*end) { builtin_error ("invalid user: %s", o); return -1; }
+	  if (errno || end == o || *end || v < 0 ||
+              (uintmax_t) (uid_t) v != (uintmax_t) v || (uid_t) v == (uid_t) -1)
+            { builtin_error ("invalid user: %s", o); return -1; }
 	  *uid = (uid_t) v;
 	}
     }
@@ -53,8 +61,11 @@ parse_owner (char *spec, uid_t *uid, gid_t *gid)
 	*gid = gr->gr_gid;
       else
 	{
+	  errno = 0;
 	  long v = strtol (g, &end, 10);
-	  if (*end) { builtin_error ("invalid group: %s", g); return -1; }
+	  if (errno || end == g || *end || v < 0 ||
+              (uintmax_t) (gid_t) v != (uintmax_t) v || (gid_t) v == (gid_t) -1)
+            { builtin_error ("invalid group: %s", g); return -1; }
 	  *gid = (gid_t) v;
 	}
     }
@@ -72,11 +83,11 @@ chown_builtin (WORD_LIST *list)
   while ((opt = internal_getopt (list, "h")) != -1)
     {
       if (opt == 'h') deref = 0;	/* operate on the link itself */
-      else { builtin_usage (); return (EX_USAGE); }
+      else { builtin_usage (); return (EXECUTION_FAILURE); }
     }
   list = loptend;
   if (list == 0 || list->next == 0)
-    { builtin_usage (); return (EX_USAGE); }
+    { builtin_usage (); return (EXECUTION_FAILURE); }
 
   if (parse_owner (list->word->word, &uid, &gid) < 0)
     return (EXECUTION_FAILURE);

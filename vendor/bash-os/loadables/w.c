@@ -99,12 +99,14 @@ bw_parse_stat_buf (const char *buf, bw_proc *p)
 static int
 bw_read_stat (int pid, bw_proc *p)
 {
-  char path[64];
+  char path[1024];
   char buf[1024];
   int fd;
   ssize_t n;
 
-  snprintf (path, sizeof path, "/proc/%d/stat", pid);
+  if (snprintf (path, sizeof path, "%s/%d/stat",
+                bw_env ("BASHW_PROC_DIR", "/proc"), pid) >= sizeof path)
+    return -1;
   fd = open (path, O_RDONLY | O_CLOEXEC);
   if (fd < 0)
     return -1;
@@ -122,7 +124,7 @@ bw_read_stat (int pid, bw_proc *p)
 static void
 bw_read_cmdline (int pid, char *out, size_t cap)
 {
-  char path[64];
+  char path[1024];
   int fd;
   ssize_t n;
 
@@ -130,7 +132,9 @@ bw_read_cmdline (int pid, char *out, size_t cap)
     return;
   out[0] = '\0';
 
-  snprintf (path, sizeof path, "/proc/%d/cmdline", pid);
+  if (snprintf (path, sizeof path, "%s/%d/cmdline",
+                bw_env ("BASHW_PROC_DIR", "/proc"), pid) >= sizeof path)
+    { snprintf (out, cap, "-"); return; }
   fd = open (path, O_RDONLY | O_CLOEXEC);
   if (fd >= 0)
     {
@@ -150,7 +154,9 @@ bw_read_cmdline (int pid, char *out, size_t cap)
         }
     }
 
-  snprintf (path, sizeof path, "/proc/%d/comm", pid);
+  if (snprintf (path, sizeof path, "%s/%d/comm",
+                bw_env ("BASHW_PROC_DIR", "/proc"), pid) >= sizeof path)
+    { snprintf (out, cap, "-"); return; }
   fd = open (path, O_RDONLY | O_CLOEXEC);
   if (fd >= 0)
     {
@@ -267,7 +273,7 @@ bw_proc_totals (const bw_proc *leader, unsigned long long *jcpu_ticks,
       return;
     }
 
-  d = opendir ("/proc");
+  d = opendir (bw_env ("BASHW_PROC_DIR", "/proc"));
   if (d == 0)
     {
       *jcpu_ticks = leader->utime + leader->stime;
@@ -293,28 +299,65 @@ bw_proc_totals (const bw_proc *leader, unsigned long long *jcpu_ticks,
   closedir (d);
 }
 
+/* Assemble records across short reads and retry interrupted reads. */
+static ssize_t
+bw_read_record (int fd, struct utmp *u)
+{
+  size_t used = 0;
+  while (used < sizeof *u)
+    {
+      ssize_t n = read (fd, (char *) u + used, sizeof *u - used);
+      if (n < 0 && errno == EINTR)
+        continue;
+      if (n < 0)
+        return -1;
+      if (n == 0)
+        break;
+      used += (size_t) n;
+    }
+  return (ssize_t) used;
+}
+
 int
 w_builtin (WORD_LIST *list)
 {
   int no_header = 0;
   const char *path = BW_PATH;
+  const char *selected_user = NULL;
 
   while (list && list->word->word[0] == '-' && list->word->word[1])
     {
       const char *w = list->word->word;
       if (!strcmp (w, "--"))
         { list = list->next; break; }
-      if (!strcmp (w, "-h") || !strcmp (w, "--help"))
+      if (!strcmp (w, "--help"))
         {
-          builtin_usage ();
-          return EXECUTION_SUCCESS;
+          puts ("Usage: w [-h|-H|--no-header] [--file FILE] [USER]\n"
+                "List logged-in users with w(1)-shape output.\n\n"
+                "  -h, -H, --no-header  suppress the column header\n"
+                "  --file FILE         read an explicit utmp file\n"
+                "  USER                show only this user (never a filename)\n"
+                "  --help              show this help\n"
+                "  --version           show the bash-loadable version\n\n"
+                "BASHW_PROC_DIR and BASHW_DEV_DIR select process and tty roots.\n"
+                "Defaults: /var/run/utmp, /proc, /dev.");
+          return sh_chkwrite (EXECUTION_SUCCESS);
         }
       if (!strcmp (w, "--version"))
         {
           puts ("w 1.0 (bash-loadable)");
-          return EXECUTION_SUCCESS;
+          return sh_chkwrite (EXECUTION_SUCCESS);
         }
-      if (!strcmp (w, "-H") || !strcmp (w, "--no-header"))
+      if (!strcmp (w, "--file"))
+        {
+          list = list->next;
+          if (!list || !list->word->word[0])
+            { builtin_error ("--file requires a path"); return EXECUTION_FAILURE; }
+          path = list->word->word;
+          list = list->next;
+          continue;
+        }
+      if (!strcmp (w, "-h") || !strcmp (w, "-H") || !strcmp (w, "--no-header"))
         {
           no_header = 1;
           list = list->next;
@@ -322,16 +365,16 @@ w_builtin (WORD_LIST *list)
         }
       builtin_error ("unknown flag: %s", w);
       builtin_usage ();
-      return EX_USAGE;
+      return EXECUTION_FAILURE;
     }
 
   if (list)
     {
-      path = list->word->word;
+      selected_user = list->word->word;
       if (list->next)
         {
           builtin_error ("too many operands");
-          return EX_USAGE;
+          return EXECUTION_FAILURE;
         }
     }
 
@@ -352,7 +395,7 @@ w_builtin (WORD_LIST *list)
 
   struct utmp u;
   ssize_t n;
-  while ((n = read (fd, &u, sizeof u)) == (ssize_t) sizeof u)
+  while ((n = bw_read_record (fd, &u)) == (ssize_t) sizeof u)
     {
       char user[UT_NAMESIZE + 1];
       char line[UT_LINESIZE + 1];
@@ -371,6 +414,8 @@ w_builtin (WORD_LIST *list)
         continue;
 
       bw_copy_field (user, sizeof user, u.ut_user, UT_NAMESIZE);
+      if (selected_user && strcmp (selected_user, user))
+        continue;
       bw_copy_field (line, sizeof line, u.ut_line, UT_LINESIZE);
       bw_copy_field (host, sizeof host, u.ut_host, UT_HOSTSIZE);
       if (host[0] == '\0')
@@ -401,17 +446,29 @@ w_builtin (WORD_LIST *list)
               cmd);
     }
 
+  if (n != 0)
+    {
+      builtin_error ("%s: %s", path, n < 0 ? strerror (errno) : "incomplete utmp record");
+      close (fd);
+      return sh_chkwrite (EXECUTION_FAILURE);
+    }
   close (fd);
-  return EXECUTION_SUCCESS;
+  return sh_chkwrite (EXECUTION_SUCCESS);
 }
 
 char *w_doc[] = {
   "List logged-in users with w(1)-shape output.",
   "",
-  "    w [-H|--no-header] [--help|--version] [FILE]",
+  "    w [-h|-H|--no-header] [--file FILE] [USER]",
   "",
-  "    -H, --no-header  suppress the column header",
-  "    FILE             alternate utmp path (default /var/run/utmp)",
+  "    -h, -H, --no-header  suppress the column header",
+  "    --file FILE         alternate utmp path (default /var/run/utmp)",
+  "",
+  "    USER                exact user selector; never interpreted as a path",
+  "    --help, --version   show help or implementation version on stdout",
+  "",
+  "Private fixtures must use --file FILE; legacy positional FILE is retired.",
+  "BASHW_PROC_DIR and BASHW_DEV_DIR override /proc and /dev respectively.",
   "",
   "Columns: USER TTY FROM LOGIN@ IDLE JCPU PCPU WHAT. IDLE is approximated",
   "from the terminal device access time; JCPU/PCPU/WHAT are approximated",
@@ -424,6 +481,6 @@ struct builtin w_struct = {
   w_builtin,
   BUILTIN_ENABLED,
   w_doc,
-  "w [-H|--no-header] [--help|--version] [FILE]",
+  "w [-h|-H|--no-header] [--file FILE] [USER]",
   0
 };

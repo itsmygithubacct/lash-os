@@ -32,6 +32,7 @@
 #include <stdint.h>
 #include <inttypes.h>
 #include <limits.h>
+#include <sys/stat.h>
 
 #include "loadables.h"
 
@@ -45,7 +46,8 @@ bcm_parse_skip (const char *s, uint64_t *out)
         return -1;
     errno = 0;
     v = strtoull (s, &end, 0);
-    if (errno == ERANGE || !end || end == s || *end)
+    if (errno == ERANGE || !end || end == s || *end ||
+        (off_t) v < 0 || (uintmax_t) (off_t) v != (uintmax_t) v)
         return -1;
     *out = (uint64_t) v;
     return 0;
@@ -67,15 +69,18 @@ bcm_open (const char *path, int *out_fd)
 static int
 bcm_skip (int fd, uint64_t n, const char *name)
 {
-    /* Try lseek; on pipe/stdin, fall back to read+discard. */
-    if (lseek (fd, (off_t) n, SEEK_SET) >= 0) return 0;
+    /* A borrowed stdin can already be partway through a regular file. */
+    off_t offset = (off_t) n;
+    if (offset >= 0 && (uint64_t) offset == n &&
+        lseek (fd, offset, SEEK_CUR) >= 0) return 0;
     char buf[4096];
     while (n > 0) {
         size_t want = (n > sizeof buf) ? sizeof buf : (size_t) n;
         ssize_t r = read (fd, buf, want);
-        if (r <= 0) {
-            builtin_error ("skip in %s: %s", name,
-                           r < 0 ? strerror (errno) : "premature EOF");
+        if (r < 0 && errno == EINTR) continue;
+        if (r == 0) return 0;
+        if (r < 0) {
+            builtin_error ("skip in %s: %s", name, strerror (errno));
             return -1;
         }
         n -= (uint64_t) r;
@@ -112,6 +117,10 @@ cmp_builtin (WORD_LIST *list)
                         return EX_USAGE;
                     }
                     nskip++;
+                } else {
+                    builtin_error ("too many arguments");
+                    builtin_usage ();
+                    return EX_USAGE;
                 }
             }
             break;
@@ -172,92 +181,111 @@ cmp_builtin (WORD_LIST *list)
     }
 
     int fd[2];
-    if (bcm_open (paths[0], &fd[0]) < 0) return 2;
-    if (bcm_open (paths[1], &fd[1]) < 0) { close (fd[0]); return 2; }
-
-    if (skip[0] && bcm_skip (fd[0], skip[0], paths[0]) < 0) {
-        if (fd[0] != STDIN_FILENO) close (fd[0]);
-        if (fd[1] != STDIN_FILENO) close (fd[1]);
+    int owned[2] = { strcmp (paths[0], "-") != 0, strcmp (paths[1], "-") != 0 };
+    /* Check before opening operands: an owned file may reuse descriptor 0. */
+    if ((!owned[0] || !owned[1]) && fcntl (STDIN_FILENO, F_GETFD) < 0) {
+        builtin_error ("standard input: %s", strerror (errno));
         return 2;
     }
-    if (skip[1] && bcm_skip (fd[1], skip[1], paths[1]) < 0) {
-        if (fd[0] != STDIN_FILENO) close (fd[0]);
-        if (fd[1] != STDIN_FILENO) close (fd[1]);
+    if (bcm_open (paths[0], &fd[0]) < 0) return 2;
+    if (bcm_open (paths[1], &fd[1]) < 0) {
+        if (owned[0]) close (fd[0]);
         return 2;
     }
 
     unsigned char buf[2][8192];
+    size_t used[2] = { 0, 0 }, available[2] = { 0, 0 };
     uint64_t off = 1, line = 1;
     int rc = 0;
+    int offset_width = 1;
     int eof[2] = { 0, 0 };
+    if ((skip[0] && bcm_skip (fd[0], skip[0], paths[0]) < 0) ||
+        (skip[1] && bcm_skip (fd[1], skip[1], paths[1]) < 0)) {
+        rc = 2;
+        goto done;
+    }
+    if (lflag) {
+        uint64_t remaining = UINT64_MAX;
+        for (int j = 0; j < 2; j++) {
+            struct stat st;
+            off_t position;
+            if (fstat (fd[j], &st) == 0 && S_ISREG (st.st_mode)
+                && (position = lseek (fd[j], 0, SEEK_CUR)) >= 0) {
+                uint64_t count = position < st.st_size
+                    ? (uint64_t) (st.st_size - position) : 0;
+                if (count < remaining) remaining = count;
+            }
+        }
+        /* Unknown-length streams use the signed file-offset range, as GNU
+           cmp does. Known regular inputs narrow that bound. */
+        if (remaining == UINT64_MAX)
+            remaining = ((uint64_t) 1 << (sizeof (off_t) * CHAR_BIT - 1)) - 1;
+        while (remaining >= 10) {
+            offset_width++;
+            remaining /= 10;
+        }
+    }
     for (;;) {
-        ssize_t n0 = eof[0] ? 0 : read (fd[0], buf[0], sizeof buf[0]);
-        ssize_t n1 = eof[1] ? 0 : read (fd[1], buf[1], sizeof buf[1]);
-        if (n0 < 0) { builtin_error ("read %s: %s", paths[0], strerror (errno)); rc = 2; break; }
-        if (n1 < 0) { builtin_error ("read %s: %s", paths[1], strerror (errno)); rc = 2; break; }
-        if (n0 == 0) eof[0] = 1;
-        if (n1 == 0) eof[1] = 1;
-
-        ssize_t lim = (n0 < n1 ? n0 : n1);
-        for (ssize_t i = 0; i < lim; i++) {
-            if (buf[0][i] != buf[1][i]) {
+        /* Short reads are normal for pipes. Retain each unmatched suffix
+           until the other input supplies bytes, and only read(2) == 0 is EOF. */
+        for (int j = 0; j < 2; j++) {
+            if (used[j] == available[j] && !eof[j]) {
+                ssize_t n;
+                do { n = read (fd[j], buf[j], sizeof buf[j]); }
+                while (n < 0 && errno == EINTR);
+                if (n < 0) {
+                    builtin_error ("read %s: %s", paths[j], strerror (errno));
+                    rc = 2;
+                    goto done;
+                }
+                used[j] = 0;
+                available[j] = (size_t) n;
+                eof[j] = n == 0;
+            }
+        }
+        if (eof[0] || eof[1]) {
+            if (eof[0] != eof[1]) {
+                if (!sflag)
+                    fprintf (stderr,
+                             "cmp: EOF on %s after byte %" PRIu64 ", in line %" PRIu64 "\n",
+                             eof[0] ? paths[0] : paths[1], off - 1, line);
+                rc = 1;
+            }
+            break;
+        }
+        size_t n0 = available[0] - used[0], n1 = available[1] - used[1];
+        size_t lim = n0 < n1 ? n0 : n1;
+        for (size_t i = 0; i < lim; i++) {
+            unsigned char a = buf[0][used[0] + i], b = buf[1][used[1] + i];
+            if (a != b) {
                 if (lflag) {
-                    printf ("%" PRIu64 " %o %o\n",
-                            off + (uint64_t) i,
-                            (unsigned) buf[0][i],
-                            (unsigned) buf[1][i]);
-                } else if (!sflag) {
-                    printf ("%s %s differ: char %" PRIu64 ", line %" PRIu64 "\n",
-                            paths[0], paths[1],
-                            off + (uint64_t) i, line);
-                    if (fd[0] != STDIN_FILENO) close (fd[0]);
-                    if (fd[1] != STDIN_FILENO) close (fd[1]);
-                    return 1;
+                    printf ("%*" PRIu64 " %3o %3o\n",
+                            offset_width, off + (uint64_t) i,
+                            (unsigned) a, (unsigned) b);
+                } else {
+                    if (!sflag)
+                        printf ("%s %s differ: char %" PRIu64 ", line %" PRIu64 "\n",
+                                paths[0], paths[1], off + (uint64_t) i, line);
+                    rc = 1;
+                    goto done;
                 }
                 rc = 1;
             }
-            if (buf[0][i] == '\n') line++;
+            if (a == '\n') line++;
         }
         off += (uint64_t) lim;
-
-        /* Same-read length mismatch: the matched prefix is equal but this
-           chunk returned fewer bytes for one file, i.e. the shorter file hit
-           EOF first (final/short read on a regular file). Without this, two
-           files that each fit in a single read but differ in length set both
-           eof flags together below and the diagnostic was skipped. */
-        if (rc != 2 && n0 != n1) {
-            if (!sflag) {
-                fprintf (stderr,
-                         "cmp: EOF on %s after byte %" PRIu64 ", in line %" PRIu64 "\n",
-                         (n0 < n1) ? paths[0] : paths[1], off - 1, line);
-            }
-            rc = (rc == 2) ? 2 : 1;
-            break;
-        }
-
-        /* Length mismatch: shorter file reaches EOF first. */
-        if (eof[0] != eof[1] || (eof[0] && eof[1])) {
-            if (eof[0] != eof[1]) {
-                if (!sflag) {
-                    /* GNU cmp keeps the "cmp:" program prefix here (the
-                       differ line above is unprefixed, matching GNU) and
-                       appends the line number. */
-                    fprintf (stderr,
-                             "cmp: EOF on %s after byte %" PRIu64 ", in line %" PRIu64 "\n",
-                             eof[0] ? paths[0] : paths[1],
-                             off - 1, line);
-                }
-                rc = (rc == 2) ? 2 : 1;
-            }
-            break;
-        }
-        /* Buffers can also be unequal length within a chunk if one
-           read returned fewer bytes — handle by detecting eof above. */
-        if (n0 < (ssize_t) sizeof buf[0]) eof[0] = 1;
-        if (n1 < (ssize_t) sizeof buf[1]) eof[1] = 1;
+        used[0] += lim;
+        used[1] += lim;
+        if (ferror (stdout)) break;
     }
-    if (fd[0] != STDIN_FILENO) close (fd[0]);
-    if (fd[1] != STDIN_FILENO) close (fd[1]);
+done:
+    if (owned[0]) close (fd[0]);
+    if (owned[1]) close (fd[1]);
+    if (fflush (stdout) == EOF || ferror (stdout)) {
+        builtin_error ("write error: %s", strerror (errno ? errno : EIO));
+        clearerr (stdout);
+        rc = 2;
+    }
     return rc;
 }
 

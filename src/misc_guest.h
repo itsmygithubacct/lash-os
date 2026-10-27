@@ -1,4 +1,48 @@
+sem_t *sem_open(const char *name, int flags, ...) {
+    mode_t mode = 0;
+    unsigned value = 0;
+    if (flags & O_CREAT) {
+        va_list ap;
+        va_start(ap, flags);
+        mode = va_arg(ap, unsigned int);
+        value = va_arg(ap, unsigned int);
+        va_end(ap);
+    }
+    int64_t handle = posix_bridge(PX_SEM_OPEN, (uintptr_t)name, pack_flags(flags), mode, value, 0, 0);
+    return handle < 0 ? SEM_FAILED : (sem_t *)(uintptr_t)handle;
+}
+int sem_close(sem_t *semaphore) {
+    return posix_bridge(PX_SEM_CLOSE, (uintptr_t)semaphore, 0, 0, 0, 0, 0);
+}
+int sem_unlink(const char *name) {
+    return posix_bridge(PX_SEM_UNLINK, (uintptr_t)name, 0, 0, 0, 0, 0);
+}
+size_t linux_bash_strftime(char *out, size_t size, const char *format,
+                          const struct linux_bash_tm *value) {
+    struct bridge_calendar calendar = {value->tm_sec, value->tm_min, value->tm_hour,
+        value->tm_mday, value->tm_mon, value->tm_year, value->tm_wday, value->tm_yday,
+        value->tm_isdst, 0, value->tm_gmtoff, (uintptr_t)value->tm_zone};
+    int64_t result = posix_bridge(PX_GIT_STRFTIME, (uintptr_t)out, size, (uintptr_t)format,
+                                  (uintptr_t)&calendar, 0, 0);
+    return result < 0 ? 0 : (size_t)result;
+}
 #include <stddef.h>
+mqd_t mq_open(const char *name, int flags, ...) {
+    mode_t mode = 0;
+    struct mq_attr *attributes = NULL;
+    if (flags & O_CREAT) {
+        va_list ap;
+        va_start(ap, flags);
+        mode = va_arg(ap, unsigned int);
+        attributes = va_arg(ap, struct mq_attr *);
+        va_end(ap);
+    }
+    return posix_bridge(PX_MQ_OPEN, (uintptr_t)name, pack_flags(flags), mode,
+                        (uintptr_t)attributes, 0, 0);
+}
+int mq_close(mqd_t descriptor) {
+    return close(descriptor);
+}
 BRIDGE_RAW_LAYOUTS(BRIDGE_CHECK_LAYOUT)
 _Static_assert(sizeof(struct semid_ds) == sizeof(struct bridge_semid_ds) &&
                    offsetof(struct semid_ds, sem_ctime) ==

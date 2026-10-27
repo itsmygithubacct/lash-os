@@ -90,7 +90,8 @@ char *hl_doc[] = {
     "",
     "Reads FILE or stdin, runs the curated tree-sitter highlight query",
     "for LANG, and emits source with inline SGR escapes. With -S, emits",
-    "span records: START-END SGR CAPTURE.",
+    "resolved nonoverlapping spans: START-END SGR CAPTURE, one maximal",
+    "run per winning capture id. For raw captures use ts highlight -A.",
     "Languages are the compiled-in ts languages.",
     (char *) NULL
 };

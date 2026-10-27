@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 /* file.c — file(1)-style magic-byte file-type detection.
  *
- *   file [--help|--version] FILE [FILE...]
+ *   file [-bE] [--help|--version] FILE [FILE...]
  *
  * Reads up to the first 512 bytes of each FILE and matches against a
  * curated table of magic-byte signatures. Output mirrors file(1):
@@ -910,15 +910,33 @@ bf_is_iso9660 (int fd)
            memcmp (magic, "CD001", sizeof magic) == 0;
 }
 
-/* file(1) prints "LABEL: DESC", or just "DESC" with -b/--brief. */
+/* Width comes from operand spellings (including the literal "-"), not from
+   the substituted stdin label. Brief output also suppresses error labels. */
+static void
+bf_prefix (const char *label, int brief, size_t width)
+{
+    if (brief) return;
+    printf ("%s:", label);
+    for (size_t i = strlen (label); i < width; i++) putchar (' ');
+    putchar (' ');
+}
+
 #define BF_EMIT(label, desc) \
-    do { if (brief) printf ("%s\n", (desc)); \
-         else        printf ("%s: %s\n", (label), (desc)); } while (0)
+    do { bf_prefix ((label), brief, width); puts (desc); } while (0)
+
+static void
+bf_error (const char *path, int brief, size_t width, int error_mode,
+          const char *operation, int error_number)
+{
+    bf_prefix (path, brief, width);
+    printf ("%s%s `%s' (%s)\n", error_mode ? "ERROR: " : "",
+            operation, path, strerror (error_number));
+}
 
 int
 file_builtin (WORD_LIST *list)
 {
-    int brief = 0;
+    int brief = 0, error_mode = 0;
 
     /* Leading options (file(1) subset). */
     while (list && list->word->word[0] == '-' && list->word->word[1]) {
@@ -929,17 +947,34 @@ file_builtin (WORD_LIST *list)
             puts ("file 1.0 (bash-loadable)");
             return EXECUTION_SUCCESS;
         }
-        if (strcmp (w, "-b") == 0 || strcmp (w, "--brief") == 0) {
+        if (strcmp (w, "--brief") == 0) {
             brief = 1; list = list->next; continue;
+        }
+        if (w[1] != '-') {
+            const char *option = w + 1;
+            while (*option == 'b' || *option == 'E') option++;
+            if (!*option) {
+                for (option = w + 1; *option; option++) {
+                    if (*option == 'b') brief = 1;
+                    else error_mode = 1;
+                }
+                list = list->next; continue;
+            }
         }
         builtin_error ("unknown flag: %s", w);
         builtin_usage ();
-        return EX_USAGE;
+        return EXECUTION_FAILURE;
     }
 
     if (!list) {
-        builtin_error ("usage: file [-b] FILE [FILE...]");
-        return EX_USAGE;
+        builtin_error ("usage: file [-bE] FILE [FILE...]");
+        return EXECUTION_FAILURE;
+    }
+
+    size_t width = 0;
+    for (WORD_LIST *p = list; p; p = p->next) {
+        size_t len = strlen (p->word->word);
+        if (len > width) width = len;
     }
 
     int rc = EXECUTION_SUCCESS;
@@ -957,8 +992,9 @@ file_builtin (WORD_LIST *list)
 
         struct stat st;
         if (lstat (path, &st) < 0) {
-            printf ("%s: cannot stat (%s)\n", path, strerror (errno));
-            rc = EXECUTION_FAILURE;
+            bf_error (path, brief, width, error_mode,
+                      error_mode ? "cannot stat" : "cannot open", errno);
+            if (error_mode) rc = EXECUTION_FAILURE;
             continue;
         }
         if (S_ISDIR (st.st_mode))  { BF_EMIT (path, "directory");         continue; }
@@ -970,16 +1006,17 @@ file_builtin (WORD_LIST *list)
         if (!S_ISREG (st.st_mode)) { BF_EMIT (path, "special file");      continue; }
         int fd = open (path, O_RDONLY | O_CLOEXEC);
         if (fd < 0) {
-            printf ("%s: cannot open (%s)\n", path, strerror (errno));
-            rc = EXECUTION_FAILURE;
+            bf_error (path, brief, width, error_mode, "cannot open", errno);
+            if (error_mode) rc = EXECUTION_FAILURE;
             continue;
         }
         unsigned char probe[BF_PROBE_LEN];
         ssize_t n = read (fd, probe, sizeof probe);
         if (n < 0) {
+            int saved_errno = errno;
             close (fd);
-            printf ("%s: read error (%s)\n", path, strerror (errno));
-            rc = EXECUTION_FAILURE;
+            bf_error (path, brief, width, error_mode, "read error", saved_errno);
+            if (error_mode) rc = EXECUTION_FAILURE;
             continue;
         }
         const char *desc = bf_classify (probe, (size_t) n);
@@ -994,9 +1031,10 @@ file_builtin (WORD_LIST *list)
 char *file_doc[] = {
     "Identify file types via magic-byte signatures.",
     "",
-    "    file [-b] [--help|--version] FILE [FILE...]",
+    "    file [-bE] [--help|--version] FILE [FILE...]",
     "",
     "    -b, --brief    do not prepend `FILE: ' (print the type only)",
+    "    -E             report filesystem errors with failure status",
     "    --help         show this help",
     "    -v, --version  show version",
     "",
@@ -1010,7 +1048,8 @@ char *file_doc[] = {
     "WOFF/WOFF2/TrueType/TrueType-collection (ttcf)/OpenType fonts, icns, AppleSingle/AppleDouble, age encrypted file, OpenSSH private key, PEM certificate, CBOR data, DjVu document, Erlang BEAM, Python bytecode,",
     "ISO9660, PDF, PostScript, RTF, vCard, iCalendar, UTF BOM text, SQLite, Microsoft Access, GDBM, FITS, HDF5, Parquet, Avro, ORC, XML, HTML, JSON, plus an ASCII / UTF-8 / ISO-8859 / data fallback.",
     "",
-    "Output: `FILE: TYPE-DESCRIPTION` (one line per FILE).",
+    "Output: `FILE: TYPE-DESCRIPTION` (aligned across operands).",
+    "Filesystem errors are printed on stdout; by default they do not fail.",
     (char *)NULL
 };
 
@@ -1019,6 +1058,6 @@ struct builtin file_struct = {
     file_builtin,
     BUILTIN_ENABLED,
     file_doc,
-    "file [--help|--version] FILE [FILE...]",
+    "file [-bE] [--help|--version] FILE [FILE...]",
     0
 };

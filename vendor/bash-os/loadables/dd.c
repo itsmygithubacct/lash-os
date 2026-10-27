@@ -263,12 +263,9 @@ dd_block_stream (const unsigned char *in, size_t len,
    the held spaces, then itself; at record boundary (col == cbs) any held
    trailing spaces are dropped and a newline is emitted. With len==0 this
    flushes a final short record (held spaces dropped, newline appended) —
-   but only if the record had any bytes at all. Worst case the output adds
-   at most one newline per cbs bytes plus held spaces, so out sized to
-   len + 1 (per call, with the EOF flush emitting <= cbs+1) is sufficient
-   when the caller buffers held spaces in state; here held spaces are not
-   yet emitted, so out >= len + 1 suffices for the streaming calls and the
-   final flush needs >= 1. Caller sizes out to len + 1. */
+   but only if the record had any bytes at all. A call can emit its input,
+   one newline per input byte (cbs=1), and up to cbs-1 spaces carried from
+   earlier calls. The caller reserves 2*len+cbs bytes; EOF needs one byte. */
 static size_t
 dd_unblock_stream (const unsigned char *in, size_t len,
                    unsigned char *out, dd_block_state *st)
@@ -524,9 +521,35 @@ dd_builtin (WORD_LIST *list)
        GNU dd, so only treat the reblocking as active when cbs > 0. */
     int reblock = (conv & (DDC_BLOCK | DDC_UNBLOCK)) && cbs > 0;
 
+    /* Reject impossible offsets before opening (and possibly truncating)
+       the destination. Keep the arithmetic wide until it is checked. */
+    long long skip_bytes = skip, seek_bytes = seek;
+    if (!(iflag & DDI_SKIP_BYTES)) {
+        if (skip != 0 && ibs > LLONG_MAX / skip) {
+            builtin_error ("skip offset overflow");
+            return EXECUTION_FAILURE;
+        }
+        skip_bytes = ibs * skip;
+    }
+    if (!(oflag & DDO_SEEK_BYTES)) {
+        if (seek != 0 && obs > LLONG_MAX / seek) {
+            builtin_error ("seek offset overflow");
+            return EXECUTION_FAILURE;
+        }
+        seek_bytes = obs * seek;
+    }
+    if ((off_t) skip_bytes < 0 || (uintmax_t) (off_t) skip_bytes != (uintmax_t) skip_bytes ||
+        (off_t) seek_bytes < 0 || (uintmax_t) (off_t) seek_bytes != (uintmax_t) seek_bytes ||
+        (uintmax_t) ibs > SIZE_MAX - 1 || (uintmax_t) cbs > SIZE_MAX - 1) {
+        builtin_error ("size or offset exceeds the platform limit");
+        return EXECUTION_FAILURE;
+    }
+
     /* Open input. "-" means stdin. */
+    int input_owned = strcmp (iname, "-") != 0;
+    int output_owned = strcmp (oname, "-") != 0;
     int ifd;
-    if (!strcmp (iname, "-")) {
+    if (!input_owned) {
         ifd = STDIN_FILENO;
     } else {
         ifd = open (iname, O_RDONLY | O_CLOEXEC);
@@ -539,54 +562,47 @@ dd_builtin (WORD_LIST *list)
     /* Open output. "-" means stdout. conv=notrunc inhibits O_TRUNC so
        in-place writes keep data outside the written range. */
     int ofd;
-    if (!strcmp (oname, "-")) {
+    if (!output_owned) {
         ofd = STDOUT_FILENO;
     } else {
         int flags = O_WRONLY | O_CREAT;
         if (conv & DDC_NOCREAT) flags &= ~O_CREAT;
         if (conv & DDC_EXCL) flags |= O_EXCL;
-        if (!(conv & DDC_NOTRUNC)) flags |= O_TRUNC;
+        /* Preserve skipped output blocks, then truncate at the seek position.
+           Like GNU dd, seek_bytes below one obs block still opens truncated. */
+        if (!(conv & DDC_NOTRUNC) && seek_bytes / obs == 0) flags |= O_TRUNC;
         if (oflag & DDO_APPEND) flags |= O_APPEND;
-        ofd = open (oname, flags | O_CLOEXEC, 0644);
+        ofd = open (oname, flags | O_CLOEXEC, 0666);
         if (ofd < 0) {
             builtin_error ("of=%s: %s", oname, strerror (errno));
-            if (ifd != STDIN_FILENO) close (ifd);
+            if (input_owned) close (ifd);
             return EXECUTION_FAILURE;
         }
     }
 
     /* Apply skip / seek. */
-    long long skip_bytes = skip;
-    if (!(iflag & DDI_SKIP_BYTES)) {
-        if (skip != 0 && ibs > LLONG_MAX / skip) {
-            builtin_error ("skip offset overflow");
-            if (ifd != STDIN_FILENO)  close (ifd);
-            if (ofd != STDOUT_FILENO) close (ofd);
-            return EXECUTION_FAILURE;
-        }
-        skip_bytes = ibs * skip;
-    }
     if (skip > 0 && dd_skip_bytes (ifd, skip_bytes) < 0) {
-        if (ifd != STDIN_FILENO)  close (ifd);
-        if (ofd != STDOUT_FILENO) close (ofd);
+        if (input_owned) close (ifd);
+        if (output_owned) close (ofd);
         return EXECUTION_FAILURE;
     }
     if (seek > 0) {
-        long long seek_bytes = seek;
-        if (!(oflag & DDO_SEEK_BYTES)) {
-            if (obs > LLONG_MAX / seek) {
-                builtin_error ("seek offset overflow");
-                if (ifd != STDIN_FILENO)  close (ifd);
-                if (ofd != STDOUT_FILENO) close (ofd);
+        off_t position = lseek (ofd, (off_t) seek_bytes, SEEK_CUR);
+        if (position < 0) {
+            builtin_error ("seek lseek: %s", strerror (errno));
+            if (input_owned) close (ifd);
+            if (output_owned) close (ofd);
+            return EXECUTION_FAILURE;
+        }
+        if (output_owned && !(conv & DDC_NOTRUNC)) {
+            struct stat st;
+            if (fstat (ofd, &st) < 0 ||
+                (S_ISREG (st.st_mode) && ftruncate (ofd, position) < 0)) {
+                builtin_error ("truncate %s: %s", oname, strerror (errno));
+                if (input_owned) close (ifd);
+                close (ofd);
                 return EXECUTION_FAILURE;
             }
-            seek_bytes = obs * seek;
-        }
-        if (lseek (ofd, (off_t) seek_bytes, SEEK_CUR) < 0) {
-            builtin_error ("seek lseek: %s", strerror (errno));
-            if (ifd != STDIN_FILENO)  close (ifd);
-            if (ofd != STDOUT_FILENO) close (ofd);
-            return EXECUTION_FAILURE;
         }
     }
 
@@ -621,8 +637,8 @@ dd_builtin (WORD_LIST *list)
 
     /* conv=block/unblock reblocking buffer + carried record state. block
        can expand (empty records emit cbs spaces each), so size to
-       ibs*cbs+1; unblock can only add one newline per cbs bytes, so ibs+1
-       is plenty. The conversion is stateful across read blocks. */
+       ibs*cbs+1. Unblock can add one newline per input byte and also flush
+       spaces carried from earlier blocks, requiring 2*ibs+cbs bytes. */
     unsigned char *rebuf = NULL;
     dd_block_state rbstate;
     memset (&rbstate, 0, sizeof rbstate);
@@ -636,13 +652,21 @@ dd_builtin (WORD_LIST *list)
                 builtin_error ("cbs reblock buffer overflow");
                 free (ibuf); free (swbuf);
                 if (have_usr1) sigaction (SIGUSR1, &old_usr1, NULL);
-                if (ifd != STDIN_FILENO)  close (ifd);
-                if (ofd != STDOUT_FILENO) close (ofd);
+                if (input_owned) close (ifd);
+                if (output_owned) close (ofd);
                 return EXECUTION_FAILURE;
             }
-            rbsz = (size_t) (ibs * cbs) + 1;
+            rbsz = (size_t) ibs * (size_t) cbs + 1;
         } else {
-            rbsz = (size_t) ibs + 1;
+            if ((size_t) ibs > (SIZE_MAX - (size_t) cbs) / 2) {
+                builtin_error ("cbs reblock buffer overflow");
+                free (ibuf); free (swbuf);
+                if (have_usr1) sigaction (SIGUSR1, &old_usr1, NULL);
+                if (input_owned) close (ifd);
+                if (output_owned) close (ofd);
+                return EXECUTION_FAILURE;
+            }
+            rbsz = 2 * (size_t) ibs + (size_t) cbs;
         }
         rebuf = malloc (rbsz);
     }
@@ -653,8 +677,8 @@ dd_builtin (WORD_LIST *list)
         free (swbuf);
         free (rebuf);
         if (have_usr1) sigaction (SIGUSR1, &old_usr1, NULL);
-        if (ifd != STDIN_FILENO)  close (ifd);
-        if (ofd != STDOUT_FILENO) close (ofd);
+        if (input_owned) close (ifd);
+        if (output_owned) close (ofd);
         return EXECUTION_FAILURE;
     }
 
@@ -792,7 +816,7 @@ done:
     free (rebuf);
     free (swbuf);
     free (ibuf);
-    if (rc == EXECUTION_SUCCESS && ofd != STDOUT_FILENO) {
+    if (rc == EXECUTION_SUCCESS) {
         if ((conv & DDC_FSYNC) && fsync (ofd) < 0) {
             builtin_error ("fsync: %s", strerror (errno));
             rc = EXECUTION_FAILURE;
@@ -810,8 +834,11 @@ done:
 #endif
     }
     if (have_usr1) sigaction (SIGUSR1, &old_usr1, NULL);
-    if (ifd != STDIN_FILENO)  close (ifd);
-    if (ofd != STDOUT_FILENO) close (ofd);
+    if (input_owned) close (ifd);
+    if (output_owned && close (ofd) < 0) {
+        builtin_error ("close %s: %s", oname, strerror (errno));
+        rc = EXECUTION_FAILURE;
+    }
 
     /* Summary unless status=none. */
     if (!(status & DDS_NONE)) {

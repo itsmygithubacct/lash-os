@@ -1,6 +1,6 @@
 # lash-os
 
-GNU Bash 5.3.15 and the **279 builtins in bash-os's full profile**, compiled to
+GNU Bash 5.3.15 and the **286 builtins in bash-os's full profile**, compiled to
 eBPF with BPF Capsule. Bash parsing, expansion, evaluation, builtin algorithms,
 and their linked C libraries execute through the Linux kernel JIT. A userspace
 loader handles requested operating-system calls and resumes the Bash fiber.
@@ -12,20 +12,35 @@ and uses [BPF Capsule](https://github.com/ayles/bpf-capsule). The required vendo
 bash-os sources and build recipes are included here; pinned third-party archives
 are fetched into the external workspace.
 
-## Release 0.1.2
+## Versioning
 
-Download a portable executable from the [v0.1.2 release](https://github.com/itsmygithubacct/lash-os/releases/tag/v0.1.2),
+The first three version components match the embedded bash-os release exactly.
+For example, lash-os `0.1.2` uses bash-os `0.1.2`. Changes to lash-os while
+bash-os remains at that release increment a fourth component: `0.1.2.1`,
+`0.1.2.2`, and so on. Adopting bash-os `0.1.3` starts the lash-os `0.1.3` series.
+
+Builds validate this relationship against the vendored version and release pin.
+Release packaging with `--check-latest` also verifies that the pin matches the
+latest published bash-os release and its exact commit. `make release-candidates`
+enables that check. Ordinary builds remain reproducible offline from their pin.
+
+The published lash-os `0.1.2` predates this policy and embedded bash-os `0.1.0`.
+The `0.1.2.1` correction adopts bash-os `0.1.2`; published tags stay unchanged.
+
+## Release 0.1.2.1
+
+Download a portable executable from the [v0.1.2.1 release](https://github.com/itsmygithubacct/lash-os/releases/tag/v0.1.2.1),
 verify it with the accompanying `SHA256SUMS`, then run it from the folder to share:
 
 ```sh
-chmod +x lashos-0.1.2-linux-x86_64
-cp lashos-0.1.2-linux-x86_64 /path/to/my-folder/lash-os
+chmod +x lashos-0.1.2.1-linux-x86_64
+cp lashos-0.1.2.1-linux-x86_64 /path/to/my-folder/lash-os
 cd /path/to/my-folder
 ./lash-os
 ```
 
 x86_64 is the primary tested target. **ARM64 and RISC-V64 are experimental**;
-their remaining validation gaps are listed in the [release notes](docs/releases/0.1.2.md).
+their remaining validation gaps are listed in the [release notes](docs/releases/0.1.2.1.md).
 All three hosted executables require KVM and Landlock ABI 6. The launch folder
 is writable inside the guest, and outbound networking is enabled by default.
 
@@ -167,7 +182,7 @@ cd /path/to/my-folder
 statically links the outer loader with musl, libbpf, libelf, zlib and
 zstd, and includes the VM runtime, its library closure and firmware, Linux,
 and the guest filesystem. The guest contains the same full eBPF Bash image,
-all 279 selected builtins, and BusyBox external tools. Nix, QEMU, shared-library
+all 286 selected builtins, and BusyBox external tools. Nix, QEMU, shared-library
 packages, and a host kernel with eBPF arena support are not needed at the
 destination. The host KVM, Landlock, and temporary-filesystem requirements above
 still apply. The executables target Linux.
@@ -214,8 +229,8 @@ Maintainers refresh package locks with `scripts/prepare-runtime.py --arch ARCH
 checked-in locks in [config/runtime](config/runtime).
 
 `make release-candidates` builds all three and collects versioned executables,
-inventories and `SHA256SUMS` under `$LASHOS_OUT/releases/0.1.2/`. For existing
-builds, run `scripts/dev.py python3 -B scripts/package-release.py`. This collects
+inventories and `SHA256SUMS` under `$LASHOS_OUT/releases/0.1.2.1/`. For existing
+builds, run `scripts/dev.py python3 -B scripts/package-release.py --check-latest`. This collects
 local files; publishing a tagged release is a separate step.
 
 The release also provides project and dependency source archives. The dependency
@@ -346,7 +361,7 @@ the smaller compiler regressions use 2 GiB. The VM script accepts `--memory`
 in MiB for other configurations.
 Override the kernel with `scripts/test-vm.py --kernel /path/to/bzImage`.
 
-Tests compare native and kernel output, check all 279 builtin registrations,
+Tests compare native and kernel output, check all 286 builtin registrations,
 exercise representative text, JSON, archive, compression, hashing, database,
 filesystem, process and network operations, and drive a real pseudoterminal
 through stop/background/foreground/interrupt/trap transitions. They do not use

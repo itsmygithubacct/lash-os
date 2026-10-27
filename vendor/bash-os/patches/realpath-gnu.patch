@@ -1,0 +1,187 @@
+--- builtins/realpath.c
++++ builtins/realpath.c
+@@ -63,11 +63,96 @@
+ 
+ extern char	*sh_realpath(const char *, char *);
+ 
++/* GNU's default permits a missing final component, including the target of
++   a dangling final symlink. Resolve every parent before accepting that leaf. */
++static char *
++realpath_leaf (const char *path, unsigned int links)
++{
++  char *resolved, *copy, *slash, *leaf, *parent, *joined, *target, link[PATH_MAX + 1];
++  struct stat st;
++  size_t length;
++  ssize_t count;
++  int error;
++
++  resolved = realpath (path, 0);
++  if (resolved || errno != ENOENT || *path == 0) return resolved;
++  if (links >= 40) { errno = ELOOP; return 0; }
++  copy = savestring (path);
++  length = strlen (copy);
++  while (length > 1 && copy[length - 1] == '/') copy[--length] = 0;
++  slash = strrchr (copy, '/');
++  leaf = slash ? slash + 1 : copy;
++  if (STREQ (leaf, ".") || STREQ (leaf, ".."))
++    { free (copy); errno = ENOENT; return 0; }
++  if (slash) *slash = 0;
++  parent = realpath (slash ? (slash == copy ? "/" : copy) : ".", 0);
++  if (parent == 0) { free (copy); return 0; }
++  if (stat (parent, &st) < 0 || !S_ISDIR (st.st_mode))
++    { free (parent); free (copy); errno = ENOTDIR; return 0; }
++  joined = sh_makepath (parent, leaf, 0);
++  free (copy);
++  if (lstat (joined, &st) == 0)
++    {
++      if (S_ISLNK (st.st_mode))
++        {
++          count = readlink (joined, link, sizeof link - 1);
++          error = errno;
++          if (count < 0)
++            { free (joined); free (parent); errno = error; return 0; }
++          if (count == sizeof link - 1)
++            { free (joined); free (parent); errno = ENAMETOOLONG; return 0; }
++          link[count] = 0;
++          target = make_absolute (link, parent);
++          free (joined);
++          joined = realpath_leaf (target, links + 1);
++          free (target);
++        }
++    }
++  else if (errno != ENOENT)
++    { error = errno; free (joined); joined = 0; errno = error; }
++  free (parent);
++  return joined;
++}
++
++static char *
++realpath_lexical (const char *path)
++{
++  char *cwd, *absolute, *p, *result;
++  struct stat st;
++  int error;
++
++  if (*path == 0) { errno = ENOENT; return 0; }
++  cwd = getcwd (0, 0);
++  if (cwd == 0) return 0;
++  absolute = make_absolute ((char *)path, cwd);
++  free (cwd);
++  /* A nonexistent prefix is allowed in -s mode, but an existing regular
++     file cannot serve as a directory. Keep dot-dot existence checks too. */
++  for (p = absolute + 1; *p; p++)
++    if (*p == '/' && p[-1] != '/')
++      {
++        *p = 0;
++        if (stat (absolute, &st) == 0)
++          {
++            if (!S_ISDIR (st.st_mode))
++              { free (absolute); errno = ENOTDIR; return 0; }
++          }
++        else if (errno != ENOENT)
++          { error = errno; free (absolute); errno = error; return 0; }
++        *p = '/';
++      }
++  result = sh_canonpath (absolute, PATH_CHECKDOTDOT);
++  free (absolute);
++  if (result && result[0] == '/' && result[1] == '/')
++    memmove (result, result + 1, strlen (result));
++  return result;
++}
++
+ int
+ realpath_builtin(WORD_LIST *list)
+ {
+ 	int	opt, cflag, vflag, qflag, sflag, aflag, es;
+-	char	*r, realbuf[PATH_MAX], *p, *newpath;
++	char	*r, *p;
+ 	struct stat sb;
+ #if defined (ARRAY_VARS)
+ 	arrayind_t	ind;
+@@ -77,7 +162,7 @@
+ 
+ 	if (list == 0) {
+ 		builtin_usage();
+-		return (EX_USAGE);
++		return (EXECUTION_FAILURE);
+ 	}
+ 
+ 	vflag = cflag = qflag = aflag = sflag = 0;
+@@ -87,7 +172,7 @@
+ 	ind = 0;
+ #endif
+ 	reset_internal_getopt();
+-	while ((opt = internal_getopt (list, "a:cqsv")) != -1) {
++	while ((opt = internal_getopt (list, "a:ceqsv")) != -1) {
+ 		switch (opt) {
+ #if defined (ARRAY_VARS)
+ 		case 'a':
+@@ -95,6 +180,7 @@
+ 			aname = list_optarg;
+ 			break;
+ #endif
++		case 'e':
+ 		case 'c':
+ 			cflag = 1;
+ 			break;
+@@ -110,7 +196,7 @@
+ 		CASE_HELPOPT;
+ 		default:
+ 			builtin_usage();
+-			return (EX_USAGE);
++			return (EXECUTION_FAILURE);
+ 		}
+ 	}
+ 
+@@ -118,7 +204,7 @@
+ 
+ 	if (list == 0) {
+ 		builtin_usage();
+-		return (EX_USAGE);
++		return (EXECUTION_FAILURE);
+ 	}
+ 
+ #if defined (ARRAY_VARS)
+@@ -146,13 +232,7 @@
+ 
+ 	for (es = EXECUTION_SUCCESS; list; list = list->next) {
+ 		p = list->word->word;
+-		if (sflag) {
+-			/* sh_canonpath doesn't convert to absolute pathnames */
+-			newpath = make_absolute(p, get_string_value("PWD"));
+-			r = sh_canonpath(newpath, PATH_CHECKDOTDOT|PATH_CHECKEXISTS);
+-			free(newpath);
+-		} else
+-			r = sh_realpath(p, realbuf);
++		r = sflag ? realpath_lexical (p) : realpath_leaf (p, 0);
+ 		if (r == 0) {
+ 			es = EXECUTION_FAILURE;
+ 			if (qflag == 0)
+@@ -163,6 +243,7 @@
+ 			es = EXECUTION_FAILURE;
+ 			if (qflag == 0)
+ 				builtin_error("%s: %s", p, strerror(errno));
++			free (r);
+ 			continue;
+ 		}
+ #if defined (ARRAY_VARS)
+@@ -176,8 +257,7 @@
+ 				printf ("%s -> ", p);
+ 			printf("%s\n", r);
+ 		}
+-		if (sflag)
+-			free (r);
++		free (r);
+ 	}
+ 	return es;
+ }
+@@ -189,7 +269,8 @@
+ 	"symbolic links.",
+ 	"The -a option stores each canonicalized PATHNAME argument into the indexed",
+ 	"array VARNAME.",
+-	"The -c option checks whether or not each resolved name exists.",
++	"The -c or -e option requires each resolved name to exist.",
++	"By default, a missing final pathname component is permitted.",
+ 	"The -q option produces no output; the exit status determines the",
+ 	"validity of each PATHNAME, but any array assignment is still performed.",
+ 	"If the -s option is supplied, canonicalize . and .. pathname components",

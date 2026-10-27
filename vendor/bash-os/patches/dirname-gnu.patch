@@ -1,0 +1,147 @@
+--- builtins/dirname.c
++++ builtins/dirname.c
+@@ -33,68 +33,73 @@
+ #include "bashgetopt.h"
+ 
++static void
++dirname_output (const char *path, int delimiter)
++{
++  size_t end = strlen (path);
++  if (end == 0)
++    { putchar ('.'); putchar (delimiter); return; }
++  while (end && path[end - 1] == '/') end--;
++  if (end == 0)
++    { putchar ('/'); putchar (delimiter); return; }
++  while (end && path[end - 1] != '/') end--;
++  if (end == 0)
++    { putchar ('.'); putchar (delimiter); return; }
++  while (end && path[end - 1] == '/') end--;
++  if (end) fwrite (path, 1, end, stdout);
++  else putchar ('/');
++  putchar (delimiter);
++}
++
+ int
+ dirname_builtin (WORD_LIST *list)
+ {
+-  int slen;
+-  char *string;
++  WORD_LIST *word;
++  SHELL_VAR *posix_var = find_variable ("POSIXLY_CORRECT");
++  int posix = posix_var && exported_p (posix_var);
++  int delimiter = '\n', options = 1, result = EXECUTION_SUCCESS;
++  size_t count, used = 0, i;
++  char **paths, *arg;
+ 
+-  if (no_options (list))
+-    return (EX_USAGE);
+-  list = loptend;
+-
+-  if (list == 0 || list->next)
++  for (count = 0, word = list; word; word = word->next) count++;
++  paths = xmalloc ((count + 1) * sizeof (*paths));
++  for (word = list; word; word = word->next)
+     {
+-      builtin_usage ();
+-      return (EX_USAGE);
++      arg = word->word->word;
++      if (options && strcmp (arg, "--") == 0)
++        { options = 0; continue; }
++      if (options && arg[0] == '-' && arg[1])
++        {
++          if (arg[1] == '-')
++            {
++              size_t length = strlen (arg + 2);
++              if (length <= 4 && strncmp (arg + 2, "zero", length) == 0)
++                delimiter = 0;
++              else if (length <= 4 && strncmp (arg + 2, "help", length) == 0)
++                { builtin_help (); goto done; }
++              else if (length <= 7 && strncmp (arg + 2, "version", length) == 0)
++                { printf ("dirname (bash-os builtin)\n"); goto done; }
++              else goto invalid;
++            }
++          else
++            for (i = 1; arg[i]; i++)
++              {
++                if (arg[i] != 'z') goto invalid;
++                delimiter = 0;
++              }
++          continue;
++        }
++      paths[used++] = arg;
++      if (posix) options = 0;
+     }
+-
+-  string = list->word->word;
+-  slen = strlen (string);
+-
+-  /* Strip trailing slashes */
+-  while (slen > 0 && string[slen - 1] == '/')
+-    slen--;
+-
+-  /* (2) If string consists entirely of slash characters, string shall be
+-	 set to a single slash character.  In this case, skip steps (3)
+-	 through (8). */
+-  if (slen == 0)
+-    {
+-      fputs ("/\n", stdout);
+-      return (EXECUTION_SUCCESS);
+-    }
+-
+-  /* (3) If there are any trailing slash characters in string, they
+-	 shall be removed. */
+-  string[slen] = '\0';
+-
+-  /* (4) If there are no slash characters remaining in string, string
+-	 shall be set to a single period character.  In this case, skip
+-	 steps (5) through (8).
+-
+-     (5) If there are any trailing nonslash characters in string,
+-	 they shall be removed. */
+-
+-  while (--slen >= 0)
+-    if (string[slen] == '/')
+-      break;
+-
+-  if (slen < 0)
+-    {
+-      fputs (".\n", stdout);
+-      return (EXECUTION_SUCCESS);
+-    }
+-
+-  /* (7) If there are any trailing slash characters in string, they
+-	 shall be removed. */
+-  while (--slen >= 0)
+-    if (string[slen] != '/')
+-      break;
+-  string[++slen] = '\0';
+-
+-  /* (8) If the remaining string is empty, string shall be set to a single
+-	 slash character. */
+-  printf ("%s\n", (slen == 0) ? "/" : string);
+-  return (EXECUTION_SUCCESS);
++  if (used == 0)
++    { builtin_error ("missing operand"); result = EXECUTION_FAILURE; goto done; }
++  for (i = 0; i < used; i++) dirname_output (paths[i], delimiter);
++  goto done;
++invalid:
++  builtin_error ("invalid option: %s", arg);
++  result = EXECUTION_FAILURE;
++done:
++  free (paths);
++  return sh_chkwrite (result);
+ }
+ 
+@@ -104,4 +109,5 @@
+ 	"The STRING is converted to the name of the directory containing",	
+ 	"the filename corresponding to the last pathname component in STRING.",
++	"Multiple NAME operands are accepted; -z or --zero uses NUL separators.",
+ 	(char *)NULL
+ };
+@@ -114,5 +120,5 @@
+ 	BUILTIN_ENABLED,	/* initial flags for builtin */
+ 	dirname_doc,		/* array of long documentation strings. */
+-	"dirname string",	/* usage synopsis */
++	"dirname [-z|--zero] [--] NAME...",	/* usage synopsis */
+ 	0			/* reserved for internal use */
+ };

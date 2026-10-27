@@ -11,8 +11,7 @@
  *
  * Modifiers (place before the verb):
  *   -L     operate on the symlink itself (l*xattr family)
- *   -F FD  operate on a file descriptor (f*xattr family); takes
- *          precedence over PATH (which is then ignored)
+ *   -F FD  operate on a file descriptor (f*xattr family); omit PATH.
  *
  * Notes:
  *   - Values are arbitrary byte sequences. Read returns the raw
@@ -280,13 +279,14 @@ xattr_builtin (WORD_LIST *list)
 char *xattr_doc[] = {
     "Extended attributes via {get,set,list,remove}xattr(2).",
     "",
-    "    xattr [-L|-F FD] read   PATH NAME [-V VAR]",
-    "    xattr [-L|-F FD] write  PATH NAME VALUE [-f create|replace]",
-    "    xattr [-L|-F FD] list   PATH [-V ARR]",
-    "    xattr [-L|-F FD] remove PATH NAME",
+    "    xattr [-L] read   PATH NAME [-V VAR]",
+    "    xattr [-L] write  PATH NAME VALUE [-f create|replace]",
+    "    xattr [-L] list   PATH [-V ARR]",
+    "    xattr [-L] remove PATH NAME",
     "",
-    "Modifiers: -L = symlink-no-follow, -F FD = operate on fd",
-    "(supersedes PATH).",
+    "Modifiers: -L = symlink-no-follow; -F FD replaces the PATH operand.",
+    "With -F: read NAME [-V VAR]; write NAME VALUE [-f create|replace];",
+    "list [-V ARR]; remove NAME. Do not supply a placeholder PATH.",
     "",
     "ENOTSUP (filesystem unsupported) and ENODATA (xattr unset) are",
     "distinguishable from each other in the surfaced errno. `read`",

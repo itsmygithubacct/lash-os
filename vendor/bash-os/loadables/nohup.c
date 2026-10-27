@@ -32,6 +32,7 @@
 #include <sys/wait.h>
 
 #include "loadables.h"
+#include "child-wait.h"
 #include "command-run.h"
 
 extern char *nohup_doc[];
@@ -210,27 +211,12 @@ nohup_builtin (WORD_LIST *list)
     for (WORD_LIST *p = list; p; p = p->next) argv[i++] = p->word->word;
     argv[argc] = NULL;
 
-    /* Fork so the loadable can return cleanly to the calling shell.
-       Child execs CMD; parent waits and propagates exit code.
-       Reset SIGCHLD to default first: bash installs an async SIGCHLD
-       handler for job control, and when a non-interactive bash
-       (e.g. the bl-test runner) executes us, that handler can reap
-       the child before our waitpid sees it. waitpid then returns
-       -1/ECHILD and bashnohup mis-reports the rc as EXECUTION_FAILURE
-       instead of forwarding the child's actual exit status. */
-    struct sigaction chld_dfl;
-    memset (&chld_dfl, 0, sizeof chld_dfl);
-    chld_dfl.sa_handler = SIG_DFL;
-    sigemptyset (&chld_dfl.sa_mask);
-    struct sigaction chld_save;
-    sigaction (SIGCHLD, &chld_dfl, &chld_save);
-    sigset_t chld_set, old_set;
-    sigemptyset (&chld_set);
-    sigaddset (&chld_set, SIGCHLD);
-    if (sigprocmask (SIG_BLOCK, &chld_set, &old_set) < 0) {
-        sigaction (SIGCHLD, &chld_save, NULL);
-        free (argv);
-        return EXECUTION_FAILURE;
+    /* Keep Bash's SIGCHLD handler from collecting our command child while
+       retaining pending notifications for unrelated background jobs. */
+    bos_child_wait child_wait;
+    if (bos_child_wait_begin (&child_wait) < 0) {
+        builtin_error ("SIGCHLD setup: %s", strerror (errno));
+        free (argv); return EXECUTION_FAILURE;
     }
 
     maybe_make_export_env ();
@@ -239,14 +225,13 @@ nohup_builtin (WORD_LIST *list)
     pid_t pid = fork ();
     if (pid < 0) {
         builtin_error ("fork: %s", strerror (errno));
-        sigprocmask (SIG_SETMASK, &old_set, NULL);
-        sigaction (SIGCHLD, &chld_save, NULL);
+        bos_child_wait_end (&child_wait);
         free (argv);
         return EXECUTION_FAILURE;
     }
     if (pid == 0) {
         bos_prepare_child ();
-        sigprocmask (SIG_SETMASK, &old_set, NULL);
+        bos_child_wait_child (&child_wait);
         /* Only the command child owns nohup's fd and signal changes. */
         struct sigaction sa;
         memset (&sa, 0, sizeof sa);
@@ -274,8 +259,7 @@ nohup_builtin (WORD_LIST *list)
     int wrc;
     while ((wrc = waitpid (pid, &status, 0)) < 0 && errno == EINTR)
         ;
-    sigprocmask (SIG_SETMASK, &old_set, NULL);
-    sigaction (SIGCHLD, &chld_save, NULL);
+    bos_child_wait_end (&child_wait);
     if (wrc < 0) {
         builtin_error ("waitpid: %s", strerror (errno));
         return EXECUTION_FAILURE;

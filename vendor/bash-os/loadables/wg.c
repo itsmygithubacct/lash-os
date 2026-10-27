@@ -865,21 +865,31 @@ bw_parse_aip (const char *s, struct bw_aip *out)
     if (strlen (s) >= sizeof tmp) return -1;
     strcpy (tmp, s);
     char *slash = strchr (tmp, '/');
-    int p = -1;
-    if (slash) { *slash = 0; p = atoi (slash + 1); if (p < 0 || p > 128) return -1; }
+    unsigned int p = 0;
+    if (slash) {
+        *slash = 0;
+        const unsigned char *digit = (const unsigned char *) slash + 1;
+        if (!*digit) return -1;
+        /* A prefix is an unsigned decimal width, not an atoi-style
+           partial number.  Bound each step before accepting the family. */
+        for (; *digit; digit++) {
+            if (*digit < '0' || *digit > '9') return -1;
+            p = p * 10 + (*digit - '0');
+            if (p > 128) return -1;
+        }
+    }
     struct in_addr a4; struct in6_addr a6;
     if (inet_pton (AF_INET, tmp, &a4) == 1) {
+        if (slash && p > 32) return -1;
         memcpy (out->ip, &a4, 4);
         out->family = AF_INET;
         out->mask = (unsigned char) (slash ? p : 32);
-        if (out->mask > 32) out->mask = 32;
         return 0;
     }
     if (inet_pton (AF_INET6, tmp, &a6) == 1) {
         memcpy (out->ip, &a6, 16);
         out->family = AF_INET6;
         out->mask = (unsigned char) (slash ? p : 128);
-        if (out->mask > 128) out->mask = 128;
         return 0;
     }
     return -1;

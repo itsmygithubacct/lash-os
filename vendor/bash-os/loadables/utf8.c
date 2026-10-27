@@ -345,7 +345,7 @@ bu_length_cmd (WORD_LIST *args)
         /* RFC-3629 decode via bu_decode_one so that each maximal-subpart
            of an ill-formed sequence counts as one U+FFFD replacement
            codepoint — Python bytes.decode("utf-8","replace") parity per
-           the INVALID UTF-8 POLICY in docs/bash/utf8.txt. For
+           the source's maximal-subpart policy. For
            well-formed UTF-8 this equals the old non-continuation-byte
            count, so valid-string counts are unchanged. */
         for (size_t i = 0; i < n; ) {
@@ -410,6 +410,7 @@ bu_slice_cmd (WORD_LIST *args)
         if (byte_end > n) byte_end = n;
         if (byte_start > n) byte_start = n;
     } else if (!strcmp (mode, "codepoint")) {
+        byte_start = byte_end = n;
         size_t i = 0, count = 0;
         while (i < n) {
             unsigned char b = (unsigned char) text[i];
@@ -422,6 +423,7 @@ bu_slice_cmd (WORD_LIST *args)
         }
         if ((size_t) end > count) byte_end = n;
     } else if (!strcmp (mode, "grapheme")) {
+        byte_start = byte_end = n;
         size_t pos = 0, count = 0;
         while (pos < n) {
             if (count == (size_t) start) byte_start = pos;
@@ -511,6 +513,9 @@ bu_cp_extend (bu_cpvec *vec, const uint32_t *seq, size_t n)
     return 0;
 }
 
+/* Consume one Unicode maximal subpart: a valid scalar, a valid but
+   incomplete prefix, or one byte that cannot start/continue such a prefix.
+   Keep the unexpected following byte for the next decoding step. */
 static uint32_t
 bu_decode_one (const unsigned char *s, size_t n, size_t *used)
 {
@@ -518,24 +523,26 @@ bu_decode_one (const unsigned char *s, size_t n, size_t *used)
     unsigned char b0 = s[0];
     if (b0 < 0x80) { *used = 1; return b0; }
 
-    uint32_t cp = 0;
-    size_t need = 0;
-    if ((b0 & 0xe0) == 0xc0) { cp = b0 & 0x1f; need = 2; }
-    else if ((b0 & 0xf0) == 0xe0) { cp = b0 & 0x0f; need = 3; }
-    else if ((b0 & 0xf8) == 0xf0) { cp = b0 & 0x07; need = 4; }
+    uint32_t cp;
+    size_t need;
+    if (b0 >= 0xc2 && b0 <= 0xdf) { cp = b0 & 0x1f; need = 2; }
+    else if (b0 >= 0xe0 && b0 <= 0xef) { cp = b0 & 0x0f; need = 3; }
+    else if (b0 >= 0xf0 && b0 <= 0xf4) { cp = b0 & 0x07; need = 4; }
     else { *used = 1; return 0xfffdu; }
 
-    if (n < need) { *used = 1; return 0xfffdu; }
     for (size_t i = 1; i < need; i++) {
-        if ((s[i] & 0xc0) != 0x80) { *used = 1; return 0xfffdu; }
+        unsigned low = 0x80, high = 0xbf;
+        if (i == 1) {
+            if (b0 == 0xe0) low = 0xa0;
+            else if (b0 == 0xed) high = 0x9f;
+            else if (b0 == 0xf0) low = 0x90;
+            else if (b0 == 0xf4) high = 0x8f;
+        }
+        if (i >= n || s[i] < low || s[i] > high) {
+            *used = i;
+            return 0xfffdu;
+        }
         cp = (cp << 6) | (uint32_t) (s[i] & 0x3f);
-    }
-    if ((need == 2 && cp < 0x80) ||
-        (need == 3 && cp < 0x800) ||
-        (need == 4 && cp < 0x10000) ||
-        (cp >= 0xd800 && cp <= 0xdfff) || cp > 0x10ffff) {
-        *used = 1;
-        return 0xfffdu;
     }
     *used = need;
     return cp;

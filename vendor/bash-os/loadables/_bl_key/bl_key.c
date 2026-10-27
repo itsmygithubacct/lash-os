@@ -40,6 +40,8 @@ bl_pushback (unsigned char b)
     bl_pushback_valid = 1;
 }
 
+int bl_key_pending (void) { return bl_pushback_valid; }
+
 void
 bl_key_reset (void)
 {
@@ -51,19 +53,23 @@ bl_key_reset (void)
  * success (byte stored in *out), 0 on timeout, -1 on read error.
  * Uses poll(2) so a bare ESC keypress doesn't hang the loop. */
 static int
-bl_read_byte_to (int fd, int ms, unsigned char *out)
+bl_read_byte_to (int fd, int ms, unsigned char *out, void (*check) (void))
 {
     struct pollfd p = { .fd = fd, .events = POLLIN, .revents = 0 };
+    if (check) check ();
     int r = poll (&p, 1, ms);
+    if (check) check ();
     if (r <= 0) return r;
     ssize_t n = read (fd, out, 1);
+    if (check) check ();
     return (n == 1) ? 1 : -1;
 }
 
 int
-bl_read_key (int fd)
+bl_read_key_checked (int fd, void (*check) (void))
 {
     unsigned char b;
+    if (check) check ();
 
     /* Drain pushback first (post-ESC peek/restore flow). */
     if (bl_pushback_valid) {
@@ -75,13 +81,33 @@ bl_read_key (int fd)
          * "no data yet" as "wait for poll-readable byte" rather than
          * EOF). EAGAIN/EWOULDBLOCK loops via poll so we don't busy-spin. */
         for (;;) {
+            if (check) check ();
+            /* poll is interruptible even when the embedding shell's signal
+             * handler restarts read. Do not consume a later command byte
+             * merely to get back to the caller's interrupt check. Existing
+             * callers keep their original blocking-read path. */
+            if (check) {
+                struct pollfd p = { .fd = fd, .events = POLLIN, .revents = 0 };
+                int pr = poll (&p, 1, -1);
+                int poll_errno = errno;
+                check ();
+                errno = poll_errno;
+                if (pr < 0 && errno == EINTR) continue;
+                if (pr < 0) return BL_KEY_NONE;
+            }
             ssize_t n = read (fd, &b, 1);
+            int read_errno = errno;
+            if (check) check ();
+            errno = read_errno;
             if (n == 1) break;
             if (n == 0) return BL_KEY_NONE;   /* EOF */
             if (errno == EINTR) continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 struct pollfd p = { .fd = fd, .events = POLLIN, .revents = 0 };
                 int pr = poll (&p, 1, -1);   /* block until ready */
+                int poll_errno = errno;
+                if (check) check ();
+                errno = poll_errno;
                 if (pr < 0 && errno != EINTR) return BL_KEY_NONE;
                 continue;
             }
@@ -97,7 +123,7 @@ bl_read_key (int fd)
     if (b == 0x1b) {
         /* ESC: 50 ms grace to disambiguate bare ESC from a sequence. */
         unsigned char b2;
-        if (bl_read_byte_to (fd, 50, &b2) <= 0) return BL_KEY_ESC;
+        if (bl_read_byte_to (fd, 50, &b2, check) <= 0) return BL_KEY_ESC;
 
         if (b2 == '[' || b2 == 'O') {
             /* CSI (`ESC [`) or SS3 (`ESC O`) sequence. Collect
@@ -121,7 +147,7 @@ bl_read_key (int fd)
                 unsigned char c;
                 int rem = BL_CSI_TOTAL_BUDGET_MS - (int) elapsed_ms;
                 int slice = rem < 200 ? rem : 200;
-                if (bl_read_byte_to (fd, slice, &c) <= 0) break;
+                if (bl_read_byte_to (fd, slice, &c, check) <= 0) break;
                 if (c >= 0x40 && c <= 0x7e) { fb = c; break; }
                 if (plen + 1 < sizeof param)
                     param[plen++] = (char) c;
@@ -182,4 +208,11 @@ bl_read_key (int fd)
     }
 
     return (int) b;
+}
+
+/* Existing callers retain the original retry and timeout behavior. */
+int
+bl_read_key (int fd)
+{
+    return bl_read_key_checked (fd, NULL);
 }

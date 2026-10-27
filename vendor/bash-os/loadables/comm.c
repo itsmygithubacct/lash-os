@@ -319,7 +319,7 @@ comm_builtin (WORD_LIST *list)
             if (!list->next) {
                 builtin_error ("--output-delimiter needs an argument");
                 builtin_usage ();
-                return EX_USAGE;
+                return EXECUTION_FAILURE;
             }
             const char *newsep = list->next->word->word;
             if (sep_set && strcmp (sep, newsep)) {
@@ -336,7 +336,7 @@ comm_builtin (WORD_LIST *list)
         if (w[1] == '-' && w[2] != '\0') {
             builtin_error ("unknown flag: %s", w);
             builtin_usage ();
-            return EX_USAGE;
+            return EXECUTION_FAILURE;
         }
         for (const char *c = w + 1; *c; c++) {
             switch (*c) {
@@ -347,7 +347,7 @@ comm_builtin (WORD_LIST *list)
                 default:
                     builtin_error ("unknown flag: -%c", *c);
                     builtin_usage ();
-                    return EX_USAGE;
+                    return EXECUTION_FAILURE;
             }
         }
         list = list->next;
@@ -356,17 +356,17 @@ comm_builtin (WORD_LIST *list)
     if (!list) {
         builtin_error ("missing operand");
         builtin_usage ();
-        return EX_USAGE;
+        return EXECUTION_FAILURE;
     }
     if (!list->next) {
         builtin_error ("missing operand after '%s'", list->word->word);
         builtin_usage ();
-        return EX_USAGE;
+        return EXECUTION_FAILURE;
     }
     if (list->next->next) {
         builtin_error ("extra operand '%s'", list->next->next->word->word);
         builtin_usage ();
-        return EX_USAGE;
+        return EXECUTION_FAILURE;
     }
     const char *p1 = list->word->word;
     const char *p2 = list->next->word->word;

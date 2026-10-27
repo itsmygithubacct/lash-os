@@ -1,0 +1,10 @@
+{
+  "files": [
+    {
+      "path": "loadables/common/sed-regex.h",
+      "licence": "LGPL-2.1-or-later",
+      "notice": "docs/sol-sed-regex-LGPL-2.1.txt",
+      "source": "GNU sed 4.9 (gnulib regex)"
+    }
+  ]
+}

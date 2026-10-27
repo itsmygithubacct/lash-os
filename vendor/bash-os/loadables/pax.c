@@ -8,9 +8,9 @@
  * symlinks, hardlinks), parent-dir creation, mtime preservation, ustar
  * checksum validation, and truncation detection on read; directory and
  * symlink emit on write. POSIX PAX headers ('x','g') and GNU long-name /
- * long-link headers ('L','K') are consumed on read. Device/fifo typeflags
- * are rejected with a clear diagnostic rather than being silently
- * mishandled. Sees `D04` hardening pass for the original
+ * long-link headers ('L','K') are consumed on read. FIFO metadata is
+ * supported; character/block device typeflags are rejected explicitly.
+ * Sees `D04` hardening pass for the original
  * `..` rejection (which still applies to all member names and link
  * targets).
  */
@@ -27,6 +27,7 @@
 #include <time.h>
 #include <limits.h>
 #include "loadables.h"
+#include "pax-stream.h"
 
 static unsigned long octal(const char *s, size_t n){
     char b[32]; size_t j=0;
@@ -57,12 +58,11 @@ static int pax_numeric_ext(const struct stat *st, int regular){
    the stream where it was, so every later header read is misaligned. */
 static int skip_bytes(FILE *f, unsigned long n){
     if(n == 0) return 0;
-    if(fseek(f, (long)n, SEEK_CUR) == 0) return 0;
     unsigned char sink[4096];
     while(n){
         size_t want = n > sizeof sink ? sizeof sink : (size_t)n;
         size_t got = fread(sink, 1, want, f);
-        if(got == 0) return -1;
+        if(got == 0){ builtin_error("archive truncated in member body"); return -1; }
         n -= got;
     }
     return 0;
@@ -214,9 +214,11 @@ static int set_mtime(const char *path, time_t mtime, int is_symlink){
     return utimensat(AT_FDCWD, path, ts, is_symlink ? AT_SYMLINK_NOFOLLOW : 0);
 }
 
-static int pax_list_extract(const char *archive, int extract, int verbose){
-    FILE *f = archive ? fopen(archive,"rb") : stdin;
-    if(!f){ builtin_error("%s: %s", archive?archive:"(stdin)", strerror(errno)); return EXECUTION_FAILURE; }
+int bashos_pax_read(FILE *f, const struct bashos_pax_read_options *options){
+    int extract = options->extract, verbose = options->verbose;
+    mode_t mask = umask(0); umask(mask);
+    unsigned char *found = calloc(options->count ? options->count : 1, 1);
+    if(!found){ builtin_error("out of memory"); return 1; }
     unsigned char h[512]; int rc=EXECUTION_SUCCESS; int zero_seen=0;
     struct pax_meta global = {0}, local = {0};
     while(1){
@@ -279,22 +281,59 @@ static int pax_list_extract(const char *archive, int extract, int verbose){
 
         const char *name = eff.path ? eff.path : hdrname;
         const char *ln = eff.linkpath ? eff.linkpath : linkname;
+        const char *unstripped_link = ln;
         if(eff.has_size){ if(eff.size > (unsigned long)LONG_MAX - 1024UL){ builtin_error("%s: member size out of range", name); rc = EXECUTION_FAILURE; pax_meta_free(&eff); break; }
             sz = eff.size; body_padded = ((long)sz+511L)/512L*512L; has_body = (typeflag=='0' || typeflag=='\0' || typeflag=='7'); }
         if(eff.has_mtime) mtime = eff.mtime;
         if(eff.typeflag){ typeflag = eff.typeflag; has_body = (typeflag=='0' || typeflag=='\0' || typeflag=='7'); }
 
+        int selected = options->count == 0;
+        for(size_t i = 0; i < options->count; i++){
+            const char *wanted = options->members[i]; size_t len = strlen(wanted);
+            while(len && wanted[len-1] == '/') len--;
+            if(!strncmp(name, wanted, len) && (name[len] == 0 || name[len] == '/')){
+                selected = 1; found[i] = 1;
+            }
+        }
+        if(!selected){
+            if(skip_bytes(f, body_padded) < 0) rc = 1;
+            pax_meta_free(&eff); continue;
+        }
         if(!extract){
             if(verbose) printf("%c %06o %lu %s\n", typeflag, mode, sz, name);
-            else printf("%s\n", name);
-            if(has_body) skip_bytes(f, body_padded);
-            pax_meta_free(&eff);
-            continue;
+            else printf("%s%s\n", name, options->tar_mode && typeflag == '5' && name[strlen(name)-1] != '/' ? "/" : "");
+            if(skip_bytes(f, body_padded) < 0) rc = 1;
+            pax_meta_free(&eff); continue;
         }
+        for(unsigned i = 0; i < options->strip; i++){
+            const char *slash = strchr(name, '/');
+            name = slash ? slash + 1 : "";
+        }
+        if(typeflag == '1') for(unsigned i = 0; i < options->strip; i++){
+            const char *slash = strchr(ln, '/');
+            ln = slash ? slash + 1 : "";
+        }
+        if(!*name){
+            if(skip_bytes(f, body_padded) < 0) rc = 1;
+            pax_meta_free(&eff); continue;
+        }
+        if(options->tar_mode && !options->preserve) mode &= ~mask;
+        if(options->to_stdout){
+            unsigned char data[16384]; unsigned long left = sz;
+            while(left){
+                size_t want = left > sizeof data ? sizeof data : (size_t)left;
+                size_t got = fread(data, 1, want, f);
+                if(!got || (has_body && fwrite(data, 1, got, stdout) != got)){ rc = 1; break; }
+                left -= got;
+            }
+            if(left || skip_bytes(f, (512 - sz % 512) % 512) < 0) rc = 1;
+            pax_meta_free(&eff); if(rc) break; continue;
+        }
+        if(options->tar_mode && verbose) fprintf(stderr, "%s\n", name);
 
         if(unsafe_path(name)){
             builtin_error("%s: unsafe archive path", name); rc = EXECUTION_FAILURE;
-            if(has_body) skip_bytes(f, body_padded);
+            if(skip_bytes(f, body_padded) < 0) rc = 1;
             pax_meta_free(&eff);
             continue;
         }
@@ -323,9 +362,17 @@ static int pax_list_extract(const char *archive, int extract, int verbose){
             break;
         }
         case '1': {  /* hardlink */
-            if(ln[0]==0 || ln[0]=='/' || unsafe_path(ln)){
+            if(unstripped_link[0]==0 || unstripped_link[0]=='/' || unsafe_path(unstripped_link) ||
+               ln[0]==0 || ln[0]=='/' || unsafe_path(ln)){
                 builtin_error("%s: unsafe or empty hardlink target '%s'", name, ln); rc = EXECUTION_FAILURE; break;
             }
+            struct stat existing, target;
+            /* Repeated archive operands can link a name to itself, or to
+               an already-linked destination. Keep that inode in place. */
+            if(lstat(name, &existing) == 0 && lstat(ln, &target) == 0 &&
+               S_ISREG(existing.st_mode) && S_ISREG(target.st_mode) &&
+               existing.st_dev == target.st_dev && existing.st_ino == target.st_ino)
+                break;
             mkpath_parents(name, 0755);
             unlink(name);
             if(link(ln, name) < 0){
@@ -333,8 +380,25 @@ static int pax_list_extract(const char *archive, int extract, int verbose){
             }
             break;
         }
-        case '3': case '4': case '6':
-            builtin_error("%s: unsupported typeflag '%c' (device/fifo)", name, typeflag);
+        case '6': {  /* FIFO: metadata only; never open its byte stream. */
+            if(mkpath_parents(name, 0755) < 0){
+                builtin_error("%s: mkdir parent: %s", name, strerror(errno)); rc = 1; break;
+            }
+            if(unlink(name) < 0 && errno != ENOENT){
+                builtin_error("%s: %s", name, strerror(errno)); rc = 1; break;
+            }
+            /* mode already incorporates tar's default umask, or the -p
+               override. Create exactly that mode and restore the mask. */
+            mode_t saved_mask = umask(0);
+            int result = mkfifo(name, mode & 0777);
+            int saved_errno = errno;
+            umask(saved_mask);
+            if(result < 0){ builtin_error("%s: %s", name, strerror(saved_errno)); rc = 1; break; }
+            if(set_mtime(name, mtime, 0) < 0){ builtin_error("%s: %s", name, strerror(errno)); rc = 1; }
+            break;
+        }
+        case '3': case '4':
+            builtin_error("%s: unsupported typeflag '%c' (device)", name, typeflag);
             rc = EXECUTION_FAILURE;
             break;
         case 'x': case 'g':
@@ -359,21 +423,26 @@ static int pax_list_extract(const char *archive, int extract, int verbose){
                 size_t want = left > sizeof buf ? sizeof buf : (size_t)left;
                 size_t n = fread(buf,1,want,f);
                 if(n==0){ short_body = 1; break; }
-                fwrite(buf,1,n,o); left -= n;
+                if(fwrite(buf,1,n,o) != n){ builtin_error("%s: write error", name); rc = 1; }
+                left -= n;
             }
-            fclose(o);
+            if(fclose(o)){ builtin_error("%s: close error", name); rc = 1; }
             if(short_body){ builtin_error("%s: archive truncated in member body", name); rc = EXECUTION_FAILURE; break; }
             chmod(name, mode & 0777);
             set_mtime(name, mtime, 0);
             unsigned long pad = (512 - (sz % 512)) % 512;
-            if(pad) skip_bytes(f, pad);
+            if(pad && skip_bytes(f, pad) < 0){ builtin_error("archive truncated in padding"); rc = 1; }
             break;
         }
         }
         pax_meta_free(&eff);
     }
     pax_meta_free(&global); pax_meta_free(&local);
-    if(f != stdin) fclose(f);
+    for(size_t i = 0; i < options->count; i++) if(!found[i]){
+        builtin_error("%s: not found in archive", options->members[i]); rc = 1;
+    }
+    free(found);
+    if(ferror(f) || ferror(stdout)) rc = 1;
     return rc;
 }
 
@@ -413,8 +482,7 @@ static int write_header(FILE *out, const char *path, const struct stat *st, char
     memcpy(h+257, "ustar", 6); memcpy(h+263, "00", 2);
     unsigned sum = 0; for(int i=0;i<512;i++) sum += h[i];
     snprintf((char*)h+148, 8, "%06o", sum); h[154]='\0'; h[155]=' ';
-    fwrite(h, 1, 512, out);
-    return 0;
+    return fwrite(h, 1, 512, out) == 512 ? 0 : -1;
 }
 
 static int append_bytes(char **buf, size_t *len, size_t *cap, const char *s, size_t n){
@@ -494,7 +562,32 @@ static int path_join3(char *out, size_t outsz, const char *a, const char *b);
    so `pax -w .` archives the full tree like GNU tar. */
 static int bp_no_recurse = 0;
 
-static int write_member(FILE *out, const char *path){
+struct bashos_pax_hardlink {
+    dev_t device;
+    ino_t inode;
+    char *path;
+    struct bashos_pax_hardlink *next;
+};
+
+void bashos_pax_write_clear(struct bashos_pax_write_context *ctx){
+    while(ctx->links){
+        struct bashos_pax_hardlink *next = ctx->links->next;
+        free(ctx->links->path); free(ctx->links); ctx->links = next;
+    }
+}
+
+static int remember_hardlink(struct bashos_pax_write_context *ctx, const struct stat *st, const char *path){
+    if(st->st_nlink < 2) return 0;
+    struct bashos_pax_hardlink *entry = malloc(sizeof *entry);
+    if(!entry){ builtin_error("out of memory tracking hardlinks"); return 1; }
+    entry->path = strdup(path);
+    if(!entry->path){ free(entry); builtin_error("out of memory tracking hardlinks"); return 1; }
+    entry->device = st->st_dev; entry->inode = st->st_ino;
+    entry->next = ctx->links; ctx->links = entry;
+    return 0;
+}
+
+static int write_member(FILE *out, const char *path, struct bashos_pax_write_context *ctx){
     struct stat st;
     if(lstat(path, &st) < 0){ builtin_error("%s: %s", path, strerror(errno)); return 1; }
 
@@ -506,7 +599,7 @@ static int write_member(FILE *out, const char *path){
     if(S_ISDIR(st.st_mode)){
         if((need_path_ext || numext) && write_pax_ext(out, path, need_path_ext, NULL, &st, numext) < 0) return 1;
         if(write_header(out, stored_path, &st, '5', NULL) < 0) return 1;
-        if(bp_no_recurse) return 0;
+        if(ctx->no_recurse) return 0;
         DIR *d = opendir(path);
         if(!d){ builtin_error("%s: %s", path, strerror(errno)); return 1; }
         int rc = 0; struct dirent *de;
@@ -514,7 +607,7 @@ static int write_member(FILE *out, const char *path){
             if(!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
             char child[1024];
             if(path_join3(child, sizeof child, path, de->d_name) < 0){ builtin_error("%s/%s: path too long", path, de->d_name); rc = 1; continue; }
-            rc |= write_member(out, child);
+            rc |= write_member(out, child, ctx);
         }
         closedir(d);
         return rc;
@@ -528,8 +621,21 @@ static int write_member(FILE *out, const char *path){
         if((need_path_ext || need_link_ext || numext) && write_pax_ext(out, path, need_path_ext, need_link_ext ? tgt : NULL, &st, numext) < 0) return 1;
         return write_header(out, stored_path, &st, '2', need_link_ext ? "" : tgt) < 0 ? 1 : 0;
     }
+    if(S_ISFIFO(st.st_mode)){
+        if((need_path_ext || numext) && write_pax_ext(out, path, need_path_ext, NULL, &st, numext) < 0) return 1;
+        return write_header(out, stored_path, &st, '6', NULL) < 0 ? 1 : 0;
+    }
     if(!S_ISREG(st.st_mode)){
         builtin_error("%s: unsupported file type for ustar", path); return 1;
+    }
+
+    for(struct bashos_pax_hardlink *entry = ctx->links; entry; entry = entry->next){
+        if(entry->device != st.st_dev || entry->inode != st.st_ino) continue;
+        int need_link_ext = strlen(entry->path) > 100;
+        numext = pax_numeric_ext(&st, 0); /* Hardlinks have no body/size record. */
+        if((need_path_ext || need_link_ext || numext) &&
+           write_pax_ext(out, path, need_path_ext, need_link_ext ? entry->path : NULL, &st, numext) < 0) return 1;
+        return write_header(out, stored_path, &st, '1', need_link_ext ? "" : entry->path) < 0 ? 1 : 0;
     }
 
     if((need_path_ext || numext) && write_pax_ext(out, path, need_path_ext, NULL, &st, numext) < 0) return 1;
@@ -537,18 +643,51 @@ static int write_member(FILE *out, const char *path){
     FILE *in = fopen(path, "rb");
     if(!in){ builtin_error("%s: %s", path, strerror(errno)); return 1; }
     unsigned char buf[4096]; size_t r;
-    while((r = fread(buf, 1, sizeof buf, in)) > 0) fwrite(buf, 1, r, out);
-    fclose(in);
+    off_t remaining = st.st_size;
+    int failed = 0;
+    while(remaining > 0){
+        size_t want = remaining > (off_t)sizeof buf ? sizeof buf : (size_t)remaining;
+        r = fread(buf, 1, want, in);
+        if(!r){ builtin_error("%s: short read", path); failed = 1; break; }
+        if(fwrite(buf, 1, r, out) != r){ failed = 1; break; }
+        remaining -= (off_t)r;
+    }
+    if(ferror(in)) failed = 1;
+    if(fclose(in)) failed = 1;
+    if(failed) return 1;
     long pad = (512 - ((long)st.st_size % 512)) % 512;
     for(long i = 0; i < pad; i++) fputc(0, out);
-    return 0;
+    if(ferror(out)) return 1;
+    return remember_hardlink(ctx, &st, path);
+}
+
+int bashos_pax_write_member_context(FILE *out, const char *path, struct bashos_pax_write_context *ctx){
+    return write_member(out, path, ctx) || ferror(out);
+}
+
+int bashos_pax_write_member(FILE *out, const char *path, int no_recurse){
+    struct bashos_pax_write_context ctx = { .no_recurse = no_recurse };
+    int rc = bashos_pax_write_member_context(out, path, &ctx);
+    bashos_pax_write_clear(&ctx);
+    return rc;
+}
+
+static int pax_list_extract(const char *archive, int extract, int verbose){
+    FILE *f = archive ? fopen(archive,"rb") : stdin;
+    if(!f){ builtin_error("%s: %s", archive ? archive : "stdin", strerror(errno)); return 1; }
+    struct bashos_pax_read_options options = { .extract = extract, .verbose = verbose };
+    int rc = bashos_pax_read(f, &options);
+    if(f != stdin && fclose(f)) rc = 1;
+    return rc;
 }
 
 static int pax_write(const char *archive, WORD_LIST *files){
     FILE *out = archive ? fopen(archive,"wb") : stdout;
     if(!out){ builtin_error("%s: %s", archive, strerror(errno)); return EXECUTION_FAILURE; }
     int rc = 0;
-    for(; files; files = files->next) rc |= write_member(out, files->word->word);
+    struct bashos_pax_write_context ctx = { .no_recurse = bp_no_recurse };
+    for(; files; files = files->next) rc |= bashos_pax_write_member_context(out, files->word->word, &ctx);
+    bashos_pax_write_clear(&ctx);
     unsigned char z[1024]; memset(z, 0, sizeof z);
     fwrite(z, 1, sizeof z, out);
     if(out != stdout) fclose(out);

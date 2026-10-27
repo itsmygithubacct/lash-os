@@ -1589,7 +1589,9 @@ bfd_parse_mbr_spec_default (const char *spec, struct bfd_mbr_spec *out,
         if (rc < 0 || v > UINT32_MAX) { free (buf); return -1; }
         if (rc == 0) { out->have_size = 1; out->size = (uint32_t) v; }
     }
-    if (bfd_parse_mbr_type (f[2], &out->type) < 0) { free (buf); return -1; }
+    if (f[2][0] && bfd_parse_mbr_type (f[2], &out->type) < 0) {
+        free (buf); return -1;
+    }
     if (f[3][0]) {
         if (!strcmp (f[3], "boot") || !strcmp (f[3], "*"))
             out->boot = 1;

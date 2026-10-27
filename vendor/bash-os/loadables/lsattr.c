@@ -38,20 +38,32 @@ static const struct { unsigned int bit; char ch; } lsattr_flagtab[] = {
     { 0x00000001u, 's' }, { 0x00000002u, 'u' }, { 0x00000008u, 'S' },
     { 0x00010000u, 'D' }, { 0x00000010u, 'i' }, { 0x00000020u, 'a' },
     { 0x00000040u, 'd' }, { 0x00000080u, 'A' }, { 0x00000004u, 'c' },
-    { 0x00004000u, 'j' }, { 0x00008000u, 't' }, { 0x00020000u, 'T' },
-    { 0x00080000u, 'e' }, { 0x00800000u, 'C' },
+    { 0x00000800u, 'E' }, { 0x00004000u, 'j' }, { 0x00001000u, 'I' },
+    { 0x00008000u, 't' }, { 0x00020000u, 'T' }, { 0x00080000u, 'e' },
+    { 0x10000000u, 'N' }, { 0x00800000u, 'C' }, { 0x02000000u, 'x' },
+    { 0x00100000u, 'V' }, { 0x40000000u, 'F' }, { 0x20000000u, 'P' },
+    { 0x00000400u, 'm' },
 };
 #define LSATTR_NFLAGS (sizeof lsattr_flagtab / sizeof lsattr_flagtab[0])
 
 static int
 format_flags (const char *path, char *out, size_t outsz)
 {
-    int fd = open (path, O_RDONLY | O_NONBLOCK);
+    struct stat st;
+    if (lstat (path, &st) < 0) return -1;
+    /* Attribute queries apply to regular files and directories, not the
+       targets of symlinks supplied as operands or found during a walk. */
+    if (!S_ISREG (st.st_mode) && !S_ISDIR (st.st_mode)) {
+        errno = EOPNOTSUPP;
+        return -1;
+    }
+    int fd = open (path, O_RDONLY | O_NONBLOCK | O_NOFOLLOW);
     if (fd < 0) return -1;
     unsigned int flags = 0;
     int rc = ioctl (fd, FS_IOC_GETFLAGS, &flags);
+    int saved_errno = errno;
     close (fd);
-    if (rc < 0) return -1;
+    if (rc < 0) { errno = saved_errno; return -1; }
 
     size_t n = 0;
     for (size_t i = 0; i < LSATTR_NFLAGS && n + 1 < outsz; i++)
@@ -79,22 +91,26 @@ list_dir_contents (const char *path, int show_all, int recurse)
 {
     DIR *d = opendir (path);
     if (!d) { builtin_error ("%s: %s", path, strerror (errno)); return -1; }
-    int rc = 0;
     struct dirent *de;
     while ((de = readdir (d))) {
-        if (!strcmp (de->d_name, ".") || !strcmp (de->d_name, "..")) continue;
+        int dot_dir = !strcmp (de->d_name, ".") || !strcmp (de->d_name, "..");
         if (!show_all && de->d_name[0] == '.') continue;
         char child[4096];
         snprintf (child, sizeof child, "%s/%s", path, de->d_name);
-        if (print_one (child) < 0) rc = -1;
-        if (recurse) {
+        /* e2fsprogs diagnoses individual entry failures without failing
+           the enclosing directory operand. */
+        print_one (child);
+        if (recurse && !dot_dir) {
             struct stat st;
-            if (lstat (child, &st) == 0 && S_ISDIR (st.st_mode) && !S_ISLNK (st.st_mode))
-                if (list_dir_contents (child, show_all, recurse) < 0) rc = -1;
+            if (lstat (child, &st) == 0 && S_ISDIR (st.st_mode)) {
+                printf ("\n%s:\n", child);
+                list_dir_contents (child, show_all, recurse);
+                putchar ('\n');
+            }
         }
     }
     closedir (d);
-    return rc;
+    return 0;
 }
 
 static int
@@ -130,7 +146,7 @@ lsattr_builtin (WORD_LIST *list)
             }
             if (!ok) break;
         }
-        if (!ok) { builtin_error ("unknown option: %s", w); builtin_usage (); return EX_USAGE; }
+        if (!ok) { builtin_error ("unknown option: %s", w); builtin_usage (); return EXECUTION_FAILURE; }
         list = list->next;
     }
 

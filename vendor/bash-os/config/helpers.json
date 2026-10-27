@@ -1,5 +1,10 @@
 {
   "commands": {
+    "grep": {
+      "libs": [
+        "-lpcre2-8"
+      ]
+    },
     "pcre": {
       "libs": [
         "-lpcre2-8"
@@ -114,6 +119,11 @@
         "_bl_key"
       ]
     },
+    "cluster": {
+      "helpers": [
+        "_monocypher"
+      ]
+    },
     "crypto": {
       "helpers": [
         "_mbedtls",
@@ -182,7 +192,7 @@
     },
     "obj": {
       "helpers": [
-        "_sha1dc"
+        "_git"
       ],
       "libs": [
         "-lz"
@@ -190,12 +200,25 @@
     },
     "index": {
       "helpers": [
-        "_sha1dc"
+        "_git",
+        "_monocypher"
+      ],
+      "libs": [
+        "-lz"
+      ]
+    },
+    "git": {
+      "helpers": [
+        "_git",
+        "_monocypher"
+      ],
+      "libs": [
+        "-lz"
       ]
     },
     "pack": {
       "helpers": [
-        "_sha1dc"
+        "_git"
       ],
       "libs": [
         "-lz"
@@ -208,7 +231,8 @@
     },
     "pkg": {
       "helpers": [
-        "_mbedtls"
+        "_mbedtls",
+        "_monocypher"
       ],
       "libs": [
         "-llzma"
@@ -314,7 +338,8 @@
         "_mbedtls"
       ],
       "requires": [
-        "doas"
+        "doas",
+        "auth"
       ]
     },
     "killall": {
@@ -383,6 +408,34 @@
       "libs": [
         "-ldl"
       ]
+    },
+    "bashperl": {
+      "helpers": [
+        "_perl"
+      ]
+    },
+    "bashpython": {
+      "helpers": [
+        "_python"
+      ]
+    },
+    "sha256sum": {
+      "helpers": [
+        "_mbedtls"
+      ]
+    },
+    "gzip": {
+      "libs": [
+        "-lz"
+      ]
+    },
+    "tar": {
+      "requires": [
+        "pax"
+      ],
+      "libs": [
+        "-lz"
+      ]
     }
   },
   "helpers": {
@@ -445,6 +498,16 @@
       "notice": "LICENSE.txt",
       "requires": []
     },
+    "_git": {
+      "license": "MIT",
+      "notice": "LICENSE.txt",
+      "requires": [
+        "_sha1dc"
+      ],
+      "libs": [
+        "-lz"
+      ]
+    },
     "_md4": {
       "license": "Public domain",
       "notice": "LICENSE.txt",
@@ -502,6 +565,14 @@
       "notice": "LICENSE.txt"
     },
     "_ptybroker": {
+      "license": "MIT",
+      "notice": "LICENSE.txt"
+    },
+    "_perl": {
+      "license": "MIT",
+      "notice": "LICENSE.txt"
+    },
+    "_python": {
       "license": "MIT",
       "notice": "LICENSE.txt"
     }

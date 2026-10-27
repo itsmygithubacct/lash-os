@@ -459,12 +459,15 @@ bp_spawn_cmd (WORD_LIST *args)
       close (gate[1]);
       bp_clear_statuses ();
       bp_close_cloexec (statpipe[1], gate[0]);
-      /* A closed status reader must not kill the target's reaper. */
-      struct sigaction ignore;
+      /* A closed status reader must not kill the target's reaper.
+         Save the caller's action so the target can have it back:
+         the reaper itself keeps the ignore. */
+      struct sigaction ignore, previous;
       memset (&ignore, 0, sizeof ignore);
+      memset (&previous, 0, sizeof previous);
       ignore.sa_handler = SIG_IGN;
       sigemptyset (&ignore.sa_mask);
-      sigaction (SIGPIPE, &ignore, NULL);
+      int pipe_saved = sigaction (SIGPIPE, &ignore, &previous) == 0;
       struct bp_child_guard target_guard;
       if (bp_child_guard_begin (&target_guard) < 0) _exit (126);
       pid_t target = fork ();
@@ -487,6 +490,10 @@ bp_spawn_cmd (WORD_LIST *args)
           if (dup2 (slave, 0) < 0 || dup2 (slave, 1) < 0 || dup2 (slave, 2) < 0)
             { dprintf (2, "pty spawn child: dup2: %s\n", strerror (errno)); _exit (126); }
           if (slave > 2) close (slave);
+          /* Restore before bos_prepare_child so a trap handler becomes
+             the original action and an ignore stays an ignore. */
+          if (pipe_saved)
+            sigaction (SIGPIPE, &previous, NULL);
           bos_prepare_child ();
           bos_run_builtin (argv[0], argv, NULL);
           execvp (argv[0], argv);

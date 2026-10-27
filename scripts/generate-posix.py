@@ -99,26 +99,40 @@ for prefix in ['', 'l', 'f']:
       (prefix+'listxattr','ssize_t',leading+[('char *','list','optional:size'),('size_t','size','value')]),
       (prefix+'removexattr','int',leading+[('const char *','name','string')]),
     ]
+functions += [
+ ('renameat','int',[('int','old_directory','dirfd'),('const char *','old_path','path'),('int','new_directory','dirfd'),('const char *','new_path','path')]),
+ ('copy_file_range','ssize_t',[('int','input','fd'),('off_t *','input_offset','optional:sizeof(off_t)'),('int','output','fd'),('off_t *','output_offset','optional:sizeof(off_t)'),('size_t','length','value'),('unsigned','flags','value')]),
+ ('mq_unlink','int',[('const char *','name','string')]),
+ ('mq_open','mqd_t',[('const char *','name','string'),('int','flags','openflags'),('mode_t','mode','value'),('const struct mq_attr *','attributes','optional:sizeof(struct mq_attr)')]),
+ ('linkat','int',[('int','old_directory','dirfd'),('const char *','old_path','path'),('int','new_directory','dirfd'),('const char *','new_path','path'),('int','flags','atflags')]),
+ ('statfs','int',[('const char *','path','path'),('struct statfs *','out','bytes:sizeof(struct statfs)')]),
+ ('mkfifoat','int',[('int','directory','dirfd'),('const char *','path','path'),('mode_t','mode','value')]),
+ ('mkdirat','int',[('int','directory','dirfd'),('const char *','path','path'),('mode_t','mode','value')]),
+ ('symlinkat','int',[('const char *','target','string'),('int','directory','dirfd'),('const char *','path','path')]),
+]
 for name,result,parameters in functions:
     for index,(t,n,k) in enumerate(parameters):
         if k in {'string','optstring'} and (n=='path' or name=='rename' or (name=='mount' and n in {'source','target'})):
             parameters[index]=(t,n,'path' if k=='string' else 'optpath')
-nofollow_paths={'lchown','readlinkat','unlinkat','rename','mknod','lgetxattr','lsetxattr','llistxattr','lremovexattr'}
-fd_returns={'socket','inotify_init1','posix_openpt','memfd_create','shm_open','epoll_create1'}
+nofollow_paths={'lchown','readlinkat','unlinkat','rename','renameat','mkdirat','mkfifoat','symlinkat','mknod','lgetxattr','lsetxattr','llistxattr','lremovexattr'}
+fd_returns={'socket','inotify_init1','posix_openpt','memfd_create','shm_open','epoll_create1','mq_open'}
 error_returns={'posix_fallocate','ptsname_r','ttyname_r'}
 # Guest and host layouts differ here; misc_guest.h and misc_host.h convert them.
-converted={'utimes','adjtime','setitimer','statvfs','fstatvfs','epoll_wait','adjtimex'}
-host_converted=converted|{'setsockopt'}
+converted={'utimes','adjtime','setitimer','statvfs','fstatvfs','epoll_wait','adjtimex','mq_open'}
+host_converted=(converted-{'mq_open'})|{'setsockopt'}
 # Structures still passed unchanged need one 64-bit Linux layout on both sides.
 raw_layouts={
  'struct timespec':['sizeof(struct timespec) == 16','sizeof(((struct timespec *)0)->tv_nsec) == 8'],
  'struct tms':['sizeof(struct tms) == 32'],
  'gid_t':['sizeof(gid_t) == 4'],
+ 'off_t':['sizeof(off_t) == 8'],
+ 'struct statfs':['sizeof(struct statfs) == 120','offsetof(struct statfs, f_fsid) == 56','offsetof(struct statfs, f_flags) == 80'],
+ 'struct mq_attr':['sizeof(struct mq_attr) == 64','offsetof(struct mq_attr, mq_curmsgs) == 24'],
 }
 layouts=[]
 for name,result,parameters in functions:
     for t,n,k in parameters:
-        for layout in re.findall(r'sizeof\(([^)]+)\)',k) if name not in converted else []:
+        for layout in re.findall(r'sizeof\(([^)]+)\)',k) if name not in converted or name == 'mq_open' else []:
             if layout not in raw_layouts:
                 sys.exit(f'{name}: declare the Linux ABI layout of {layout} or convert it')
             if layout not in layouts:layouts.append(layout)
@@ -156,6 +170,8 @@ for ordinal,(name,result,parameters) in enumerate(functions,1):
         elif k in {'path','optpath'}:
             at_index=next((i for i,(_,_,kind) in enumerate(parameters) if kind=='atflags'),None)
             follow='0' if name in nofollow_paths else f'!(at_flags(a[{at_index}]) & AT_SYMLINK_NOFOLLOW)' if at_index is not None else '1'
+            if name == 'linkat':
+                follow='(at_flags(a[4]) & AT_SYMLINK_FOLLOW) != 0' if n == 'old_path' else '0'
             expression=f'path_string_mode(h,a[{index}],{n}_storage,{follow})'
             host+=f'        char {n}_storage[BRIDGE_PATH_SIZE];\n'
             if k=='optpath':host+=f'        {t} {n}=a[{index}]?{expression}:NULL; if(a[{index}]&&!{n})return -1;\n'

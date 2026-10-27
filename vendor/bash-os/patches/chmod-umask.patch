@@ -1,0 +1,378 @@
+--- examples/loadables/chmod.c
++++ examples/loadables/chmod.c
+@@ -26,6 +26,7 @@
+ #include "posixstat.h"
+ #include <errno.h>
+ #include <stdio.h>
++#include <dirent.h>
+ #include "../bashansi.h"
+ #if defined (HAVE_UNISTD_H)
+ #  include <unistd.h>
+@@ -42,94 +43,273 @@
+ 
+ #define ISOCTAL(c)	((c) >= '0' && (c) <= '7')
+ 
+-extern int parse_symbolic_mode (char *, mode_t);
+-
+-#define STANDARD_BITS	(S_IRWXU | S_IRWXG | S_IRWXO)
+-#define ALLBITS (STANDARD_BITS | S_ISUID| S_ISGID | S_ISVTX)
++#define STANDARD_BITS (S_IRWXU | S_IRWXG | S_IRWXO)
++#define ALLBITS (STANDARD_BITS | S_ISUID | S_ISGID | S_ISVTX)
++
++/* Keep chmod semantics local: the shared symbolic parser also serves umask.
++   An omitted class is filtered by the creation mask, but special bits are
++   independent of that mask. X tests the mode at the start of each action. */
++static int
++parse_mode_with_umask (const char *mode, mode_t initial, int ignore_mask)
++{
++  mode_t mask, bits, who, perm, affected, special;
++  const char *p;
++  int named, op, copy;
++
++  mask = umask (0);
++  umask (mask);
++  if (ignore_mask) mask = 0;
++  bits = initial & ALLBITS;
++  p = mode;
++  do
++    {
++      who = 0;
++      named = 0;
++      while (*p && strchr ("ugoa", *p))
++        {
++          named = 1;
++          if (*p == 'u' || *p == 'a') who |= S_IRWXU | S_ISUID;
++          if (*p == 'g' || *p == 'a') who |= S_IRWXG | S_ISGID;
++          if (*p == 'o' || *p == 'a') who |= S_IRWXO | S_ISVTX;
++          p++;
++        }
++      if (named == 0)
++        who = ALLBITS;
++      if (*p == 0 || strchr ("+-=", *p) == 0)
++        return -1;
++      do
++        {
++          op = *p++;
++          perm = special = 0;
++          copy = 0;
++          if (*p && strchr ("ugo", *p))
++            {
++              copy = 1;
++              perm = (*p == 'u') ? (bits >> 6) & 7 :
++                     (*p == 'g') ? (bits >> 3) & 7 : bits & 7;
++              perm |= (perm << 3) | (perm << 6);
++              p++;
++            }
++          while (*p && strchr ("rwxXst", *p))
++            {
++              if (copy) return -1;
++              switch (*p++)
++                {
++                case 'r': perm |= 0444; break;
++                case 'w': perm |= 0222; break;
++                case 'x': perm |= 0111; break;
++                case 'X':
++                  if (S_ISDIR (initial) || (bits & 0111)) perm |= 0111;
++                  break;
++                case 's': special |= S_ISUID | S_ISGID; break;
++                case 't': special |= S_ISVTX; break;
++                }
++            }
++          perm = (perm | special) & who;
++          affected = who;
++          if (named == 0)
++            {
++              perm &= ~mask;
++              if (op != '=') affected &= ~mask;
++            }
++          /* GNU preserves directory set-ID bits unless explicitly requested. */
++          if (S_ISDIR (initial))
++            affected &= ~((S_ISUID | S_ISGID) & ~special);
++          if (op == '=') bits &= ~affected;
++          if (op == '-') bits &= ~perm;
++          else bits |= perm;
++        }
++      while (*p && strchr ("+-=", *p));
++      if (*p == 0) return (int) bits;
++      if (*p++ != ',' || *p == 0) return -1;
++    }
++  while (*p);
++  return -1;
++}
++
++static void
++chmod_mode_string (mode_t mode, char *text)
++{
++  int i;
++  for (i = 0; i < 9; i++)
++    text[i] = (mode & (0400 >> i)) ? "rwx"[i % 3] : '-';
++  if (mode & S_ISUID) text[2] = (mode & S_IXUSR) ? 's' : 'S';
++  if (mode & S_ISGID) text[5] = (mode & S_IXGRP) ? 's' : 'S';
++  if (mode & S_ISVTX) text[8] = (mode & S_IXOTH) ? 't' : 'T';
++  text[9] = 0;
++}
++
++#define CHMOD_RECURSE 1
++#define CHMOD_QUIET 2
++#define CHMOD_VERBOSE 4
++#define CHMOD_DIAGNOSE 8
++
++/* Descendant links are skipped; command-line links are followed. Open each
++   directory before changing its mode so removing read permission still permits
++   traversal. Never follow a link encountered by recursive descent. */
++static int
++chmod_path (const char *path, const char *mode, int nmode, int flags, int top)
++{
++  struct stat st, linkst, after;
++  DIR *dir;
++  struct dirent *entry;
++  mode_t newmode;
++  int result, saved_errno;
++  char oldtext[10], newtext[10], *child;
++  size_t len;
++
++  if (lstat (path, &linkst) < 0 ||
++      (S_ISLNK (linkst.st_mode) && (top || !(flags & CHMOD_RECURSE)) &&
++       stat (path, &linkst) < 0))
++    {
++      if (!(flags & CHMOD_QUIET))
++        builtin_error ("cannot access '%s': %s", path, strerror (errno));
++      if (flags & CHMOD_VERBOSE) printf ("'%s' could not be accessed\n", path);
++      return EXECUTION_FAILURE;
++    }
++  if (S_ISLNK (linkst.st_mode)) return EXECUTION_SUCCESS;
++  st = linkst;
++  dir = 0;
++  result = EXECUTION_SUCCESS;
++  if ((flags & CHMOD_RECURSE) && S_ISDIR (st.st_mode))
++    {
++      dir = opendir (path);
++      if (dir == 0)
++        {
++          if (!(flags & CHMOD_QUIET))
++            builtin_error ("cannot read directory '%s': %s", path, strerror (errno));
++          result = EXECUTION_FAILURE;
++        }
++    }
++  newmode = (nmode < 0) ? parse_mode_with_umask (mode, st.st_mode, 0) : nmode;
++  if (nmode >= 0 && S_ISDIR (st.st_mode) && strlen (mode) < 5)
++    newmode |= st.st_mode & (S_ISUID | S_ISGID);
++  if (chmod (path, newmode) < 0)
++    {
++      if (!(flags & CHMOD_QUIET))
++        builtin_error ("cannot change mode of '%s': %s", path, strerror (errno));
++      result = EXECUTION_FAILURE;
++    }
++  else if (flags & CHMOD_VERBOSE)
++    {
++      /* The filesystem may clear set-ID bits on a successful chmod. */
++      if (stat (path, &after) == 0) newmode = after.st_mode & ALLBITS;
++      chmod_mode_string (st.st_mode, oldtext);
++      chmod_mode_string (newmode, newtext);
++      if ((st.st_mode & ALLBITS) == newmode)
++        printf ("mode of '%s' retained as %04o (%s)\n", path, (unsigned int) newmode, newtext);
++      else
++        printf ("mode of '%s' changed from %04o (%s) to %04o (%s)\n",
++                path, (unsigned int) (st.st_mode & ALLBITS), oldtext,
++                (unsigned int) newmode, newtext);
++    }
++  /* GNU diagnoses a negative mode parsed as an option when the umask
++     prevented the removals its spelling appears to request. -- disables it. */
++  if ((flags & CHMOD_DIAGNOSE) &&
++      stat (path, &after) == 0 && (after.st_mode & ALLBITS) == newmode)
++    {
++      mode_t intended = parse_mode_with_umask (mode, st.st_mode, 1);
++      if (intended != newmode)
++        {
++          chmod_mode_string (newmode, newtext);
++          chmod_mode_string (intended, oldtext);
++          if (!(flags & CHMOD_QUIET))
++            builtin_error ("%s: new permissions are %s, not %s", path, newtext, oldtext);
++          result = EXECUTION_FAILURE;
++        }
++    }
++  if (dir)
++    {
++      for (;;)
++        {
++          errno = 0;
++          entry = readdir (dir);
++          if (entry == 0)
++            {
++              saved_errno = errno;
++              if (saved_errno)
++                {
++                  if (!(flags & CHMOD_QUIET))
++                    builtin_error ("cannot read directory '%s': %s", path, strerror (saved_errno));
++                  result = EXECUTION_FAILURE;
++                }
++              break;
++            }
++          if (STREQ (entry->d_name, ".") || STREQ (entry->d_name, "..")) continue;
++          len = strlen (path) + strlen (entry->d_name) + 2;
++          child = xmalloc (len);
++          snprintf (child, len, "%s/%s", path, entry->d_name);
++          if (chmod_path (child, mode, nmode, flags, 0) != EXECUTION_SUCCESS)
++            result = EXECUTION_FAILURE;
++          free (child);
++        }
++      if (closedir (dir) < 0)
++        {
++          if (!(flags & CHMOD_QUIET))
++            builtin_error ("cannot close directory '%s': %s", path, strerror (errno));
++          result = EXECUTION_FAILURE;
++        }
++    }
++  return result;
++}
+ 
+ int
+ chmod_builtin (WORD_LIST *list)
+ {
+-  int opt, nmode, lmode, rval;
++  int nmode, rval, flags;
++  const char *p;
+   char *mode;
+-  struct stat st;
+   WORD_LIST *l;
+ 
+-  reset_internal_getopt ();
+-  mode = (char *)NULL;
+-  while ((opt = internal_getopt(list, "fhvRHLP")) != -1)
+-    switch (opt)
+-      {
+-	CASE_HELPOPT;
+-	default:
+-	  return (EX_DISKFALLBACK);
+-      }
+-  list = loptend;
+-
+-  if (list == 0)
++  flags = 0;
++  /* A leading -r/-w/-x is a symbolic mode, not a short option. */
++  while (list && list->word->word[0] == '-')
++    {
++      p = list->word->word;
++      if (STREQ (p, "--")) { list = list->next; break; }
++      if (p[1] && strchr ("rwxXstugo=+-", p[1]))
++        { flags |= CHMOD_DIAGNOSE; break; }
++      if (STREQ (p, "--help")) { builtin_help (); return EX_USAGE; }
++      if (STREQ (p, "--recursive")) flags |= CHMOD_RECURSE;
++      else if (STREQ (p, "--quiet") || STREQ (p, "--silent")) flags |= CHMOD_QUIET;
++      else if (STREQ (p, "--verbose")) flags |= CHMOD_VERBOSE;
++      else
++        for (p++; *p; p++)
++          switch (*p)
++            {
++            case 'R': flags |= CHMOD_RECURSE; break;
++            case 'f': flags |= CHMOD_QUIET; break;
++            case 'v': flags |= CHMOD_VERBOSE; break;
++            default: return EX_DISKFALLBACK;
++            }
++      list = list->next;
++    }
++  if (list == 0 || list->next == 0)
+     {
+       builtin_usage ();
+-      return (EX_USAGE);
+-    }
+-
++      return EXECUTION_FAILURE;
++    }
+   mode = list->word->word;
+   list = list->next;
+-
+-  if (list == 0)
+-    {
+-      builtin_usage ();
+-      return (EX_USAGE);
+-    }
+-
+   nmode = -1;
+-  if (ISOCTAL (*mode))	/* octal number */
++  if (ISOCTAL (*mode))
+     {
+       nmode = read_octal (mode);
+       if (nmode < 0)
+-	{
+-	  builtin_error ("invalid file mode: %s", mode);
+-	  return (EXECUTION_FAILURE);
+-	}
+-    }
+-  else 				/* test for valid symbolic mode */
+-    {
+-      /* initial bits are a=rwx; the mode argument modifies them */
+-      lmode = parse_symbolic_mode (mode, ALLBITS);
+-      if (lmode < 0)
+-	{
+-	  builtin_error ("invalid file mode: %s", mode);
+-	  return (EXECUTION_FAILURE);
+-	}
+-    }
+-
+-  for (rval = EXECUTION_SUCCESS, l = list; l; l = l->next)
+-    {
+-      lmode = nmode;
+-      if (stat (l->word->word, &st) < 0)
+-	{
+-	  builtin_error ("`%s': cannot stat: %s", l->word->word, strerror (errno));
+-	  rval = EXECUTION_FAILURE;
+-	  continue;
+-	}
+-
+-      if (lmode == -1)
+-	{
+-	  lmode = parse_symbolic_mode (mode, st.st_mode & ALLBITS);
+-	  if (lmode < 0)
+-	    {
+-	      builtin_error ("`%s': invalid file mode: %s", l->word->word, mode);
+-	      rval = EXECUTION_FAILURE;
+-	      continue;
+-	    }
+-	}
+-
+-      if (chmod (l->word->word, lmode))
+-	{
+-	  builtin_error ("`%s': cannot change mode: %s", l->word->word, strerror (errno));
+-	  rval = EXECUTION_FAILURE;
+-	  continue;
+-	}
+-    }
++        {
++          builtin_error ("invalid file mode: %s", mode);
++          return EXECUTION_FAILURE;
++        }
++    }
++  else if (parse_mode_with_umask (mode, ALLBITS, 0) < 0)
++    {
++      builtin_error ("invalid file mode: %s", mode);
++      return EXECUTION_FAILURE;
++    }
++  rval = EXECUTION_SUCCESS;
++  for (l = list; l; l = l->next)
++    if (chmod_path (l->word->word, mode, nmode, flags, 1) != EXECUTION_SUCCESS)
++      rval = EXECUTION_FAILURE;
+   return rval;
+ }
+ 
+@@ -137,10 +317,10 @@
+ 	"Change file mode bits.",
+ 	"",
+ 	"Change file mode bits.  Change the mode bits of files named as",
+-	"arguments, in the order specified, as specified by MODE."
++	"arguments, in the order specified, as specified by MODE.",
+ 	"The MODE argument may be an octal number or a symbolic mode like",
+ 	"that described in chmod(1).  If a symbolic mode is used, the",
+-	"operations are interpreted relative to an initial mode of \"a=rwx\".",
++	"operations are interpreted relative to each file's current mode.",
+ 	"",
+ 	"The return value is 0 unless an error occurs.",
+ 	(char *)NULL
+@@ -151,6 +331,6 @@
+ 	chmod_builtin,
+ 	BUILTIN_ENABLED,
+ 	chmod_doc,
+-	"chmod [-R] mode file [file...]",
++	"chmod [-Rfv] mode file [file...]",
+ 	0
+ };

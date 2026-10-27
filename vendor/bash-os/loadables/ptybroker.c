@@ -370,7 +370,7 @@ static int bw_create(int argc, char **argv, int service)
     free(cwd); errno = saved;
     if (rc < 0) return bw_failure(service ? "serve" : "create");
     if (!service) bw_status_line(argv[2], &status);
-    return EXECUTION_SUCCESS;
+    return service ? EXECUTION_SUCCESS : sh_chkwrite(EXECUTION_SUCCESS);
 }
 
 static int bw_send_fd(const char *root, const char *id, int fd, char *variable)
@@ -485,7 +485,10 @@ int ptybroker_builtin(WORD_LIST *list)
     } else if (!strcmp(command, "terminate") && argc == 3) {
         rc = pb_terminate(argv[1], argv[2]);
     } else { builtin_usage(); return EX_USAGE; }
-    return rc < 0 ? bw_failure(command) : EXECUTION_SUCCESS;
+    if (rc < 0) return bw_failure(command);
+    if (!strcmp(command, "status") || !strcmp(command, "list"))
+        return sh_chkwrite(EXECUTION_SUCCESS);
+    return EXECUTION_SUCCESS;
 }
 
 char *ptybroker_doc[] = {

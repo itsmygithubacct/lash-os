@@ -41,28 +41,76 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+#include <limits.h>
+#include <ctype.h>
 
 #include "_bl_screen_screen.h"
 #include "_bl_key_bl_key.h"
 #include "loadables.h"
 
-static int32_t
-btui_color (const char *s)
+/* Strict decimal parsing: do not turn malformed API input into coordinates. */
+static int
+btui_number (const char *s, int lo, int hi, int *out)
 {
-    if (!s || !strcmp (s, "default")) return BLS_DEFAULT;
+    char *end;
+    if (!s || !*s || isspace ((unsigned char) *s)) return 0;
+    errno = 0;
+    long value = strtol (s, &end, 10);
+    if (errno || *end || value < lo || value > hi) return 0;
+    *out = (int) value;
+    return 1;
+}
+
+static int
+btui_color (const char *s, int32_t *out)
+{
+    if (!strcmp (s, "default")) { *out = BLS_DEFAULT; return 1; }
     if (s[0] == '#' && strlen (s) == 7) {
-        unsigned r, g, b;
-        if (sscanf (s + 1, "%2x%2x%2x", &r, &g, &b) == 3) return BLS_RGB (r, g, b);
+        for (int i = 1; i < 7; i++) if (!isxdigit ((unsigned char) s[i])) return 0;
+        *out = (int32_t) strtol (s + 1, NULL, 16); return 1;
     }
     if (strchr (s, ',')) {
-        int r, g, b;
-        if (sscanf (s, "%d,%d,%d", &r, &g, &b) == 3) return BLS_RGB (r, g, b);
+        char *end; const char *p = s; int rgb[3];
+        for (int i = 0; i < 3; i++) {
+            if (!isdigit ((unsigned char) *p)) return 0;
+            errno = 0; long v = strtol (p, &end, 10);
+            if (errno || v < 0 || v > 255 || *end != (i == 2 ? '\0' : ',')) return 0;
+            rgb[i] = (int) v; p = end + (i != 2);
+        }
+        *out = BLS_RGB (rgb[0], rgb[1], rgb[2]); return 1;
     }
     static const char *nm[] = { "black","red","green","yellow","blue","magenta","cyan","white" };
-    for (int i = 0; i < 8; i++) if (!strcmp (s, nm[i])) return BLS_PALETTE (i);
-    char *e; long v = strtol (s, &e, 10);
-    if (e != s && !*e && v >= 0 && v <= 255) return BLS_PALETTE ((int) v);
-    return BLS_DEFAULT;
+    for (int i = 0; i < 8; i++) if (!strcmp (s, nm[i])) { *out = BLS_PALETTE (i); return 1; }
+    int v;
+    if (!btui_number (s, 0, 255, &v)) return 0;
+    *out = BLS_PALETTE (v); return 1;
+}
+
+/* A line glyph is exactly one printable Unicode scalar, not its first byte. */
+static int
+btui_glyph (const char *s, uint32_t *cp)
+{
+    const unsigned char *p = (const unsigned char *) s;
+    size_t n = strlen (s); uint32_t v; int bytes;
+    if (n == 1 && p[0] >= 32 && p[0] != 127) { *cp = p[0]; return p[0] < 128; }
+    if (n == 2 && p[0] >= 0xc2 && p[0] <= 0xdf) { v = p[0] & 31; bytes = 2; }
+    else if (n == 3 && p[0] >= 0xe0 && p[0] <= 0xef) { v = p[0] & 15; bytes = 3; }
+    else if (n == 4 && p[0] >= 0xf0 && p[0] <= 0xf4) { v = p[0] & 7; bytes = 4; }
+    else return 0;
+    for (int i = 1; i < bytes; i++) {
+        if ((p[i] & 0xc0) != 0x80) return 0;
+        v = (v << 6) | (p[i] & 63);
+    }
+    if ((bytes == 3 && v < 0x800) || (bytes == 4 && v < 0x10000) ||
+        (v >= 0x80 && v < 0xa0) || (v >= 0xd800 && v <= 0xdfff) || v > 0x10ffff) return 0;
+    *cp = v; return 1;
+}
+
+static int
+btui_output (void)
+{
+    return fflush (stdout) == EOF || ferror (stdout) ? EXECUTION_FAILURE : EXECUTION_SUCCESS;
 }
 
 static const char *
@@ -116,7 +164,7 @@ btui_argv (WORD_LIST *l, const char **av, int max)
 {
     int n = 0;
     for (; l && n < max; l = l->next) av[n++] = l->word->word;
-    return n;
+    return l ? -1 : n;
 }
 
 int
@@ -128,15 +176,26 @@ tui_builtin (WORD_LIST *list)
     const char *av[8];
     int ac = btui_argv (rest, av, 8);
     bls_win *w = bls_stdscr ();
+    int min = 0, max = 0;
+    if (!strcmp (cmd, "move")) min = max = 2;
+    else if (!strcmp (cmd, "fg") || !strcmp (cmd, "bg") || !strcmp (cmd, "timeout")) min = max = 1;
+    else if (!strcmp (cmd, "colormode")) max = 1;
+    else if (!strcmp (cmd, "hline") || !strcmp (cmd, "vline")) { min = 1; max = 2; }
+    else if (!strcmp (cmd, "addstr") || !strcmp (cmd, "addansi")) { min = 1; max = 6; }
+    else if (!strcmp (cmd, "getstr")) max = 6;
+    if (strcmp (cmd, "attr") && (ac < min || ac > max)) {
+        builtin_error ("%s: wrong number of arguments", cmd); return EX_USAGE;
+    }
+    clearerr (stdout);
 
     if (!strcmp (cmd, "init"))
         return bls_init () == 0 ? EXECUTION_SUCCESS : EXECUTION_FAILURE;
     if (!strcmp (cmd, "end"))      { bls_end (); return EXECUTION_SUCCESS; }
-    if (!strcmp (cmd, "lines"))    { printf ("%d\n", bls_lines ()); return EXECUTION_SUCCESS; }
-    if (!strcmp (cmd, "cols"))     { printf ("%d\n", bls_cols ()); return EXECUTION_SUCCESS; }
+    if (!strcmp (cmd, "lines"))    { printf ("%d\n", bls_lines ()); return btui_output (); }
+    if (!strcmp (cmd, "cols"))     { printf ("%d\n", bls_cols ()); return btui_output (); }
     if (!strcmp (cmd, "resized")) {
         int r = bls_resized (); printf ("%d\n", r);
-        return r ? EXECUTION_SUCCESS : EXECUTION_FAILURE;
+        return btui_output () == EXECUTION_SUCCESS && r ? EXECUTION_SUCCESS : EXECUTION_FAILURE;
     }
     if (!strcmp (cmd, "colormode")) {
         if (ac >= 1) {
@@ -147,11 +206,13 @@ tui_builtin (WORD_LIST *list)
         }
         const char *m[] = { "16", "256", "truecolor" };
         puts (m[bls_color_mode ()]);
-        return EXECUTION_SUCCESS;
+        return btui_output ();
     }
     if (!strcmp (cmd, "timeout")) {
         if (ac < 1) { builtin_error ("timeout MS"); return EX_USAGE; }
-        bls_timeout (atoi (av[0])); return EXECUTION_SUCCESS;
+        int ms;
+        if (!btui_number (av[0], -1, INT_MAX, &ms)) goto bad_value;
+        bls_timeout (ms); return EXECUTION_SUCCESS;
     }
 
     /* Everything below needs an active screen. Distinguish an unknown
@@ -174,50 +235,55 @@ tui_builtin (WORD_LIST *list)
     if (!w) { builtin_error ("not initialized (run: tui init)"); return EXECUTION_FAILURE; }
 
     if (!strcmp (cmd, "erase"))    { bls_erase (w); return EXECUTION_SUCCESS; }
-    if (!strcmp (cmd, "refresh"))  { bls_refresh (w); return EXECUTION_SUCCESS; }
+    if (!strcmp (cmd, "refresh"))  { return bls_refresh_checked (w) == 0 ? EXECUTION_SUCCESS : EXECUTION_FAILURE; }
     if (!strcmp (cmd, "box"))      { bls_box (w, 0, 0); return EXECUTION_SUCCESS; }
     if (!strcmp (cmd, "clrtoeol")) { bls_clrtoeol (w); return EXECUTION_SUCCESS; }
     if (!strcmp (cmd, "clrtobot")) { bls_clrtobot (w); return EXECUTION_SUCCESS; }
     if (!strcmp (cmd, "move")) {
         if (ac < 2) { builtin_error ("move Y X"); return EX_USAGE; }
-        bls_move (w, atoi (av[0]), atoi (av[1])); return EXECUTION_SUCCESS;
+        int y, x;
+        if (!btui_number (av[0], -32768, 32767, &y) || !btui_number (av[1], -32768, 32767, &x)) goto bad_value;
+        bls_move (w, y, x); return EXECUTION_SUCCESS;
     }
     if (!strcmp (cmd, "fg")) {
         if (ac < 1) { builtin_error ("fg COLOR"); return EX_USAGE; }
-        bls_setfg (w, btui_color (av[0])); return EXECUTION_SUCCESS;
+        int32_t c; if (!btui_color (av[0], &c)) goto bad_value;
+        bls_setfg (w, c); return EXECUTION_SUCCESS;
     }
     if (!strcmp (cmd, "bg")) {
         if (ac < 1) { builtin_error ("bg COLOR"); return EX_USAGE; }
-        bls_setbg (w, btui_color (av[0])); return EXECUTION_SUCCESS;
+        int32_t c; if (!btui_color (av[0], &c)) goto bad_value;
+        bls_setbg (w, c); return EXECUTION_SUCCESS;
     }
     if (!strcmp (cmd, "attr")) {
         unsigned a = BLS_A_NORMAL;
-        for (int i = 0; i < ac; i++) {
-            int b = btui_attr_bit (av[i]);
-            if (b < 0) { builtin_error ("attr: bad attribute '%s'", av[i]); return EX_USAGE; }
+        for (WORD_LIST *arg = rest; arg; arg = arg->next) {
+            int b = btui_attr_bit (arg->word->word);
+            if (b < 0) { builtin_error ("attr: bad attribute '%s'", arg->word->word); return EX_USAGE; }
             a |= (unsigned) b;
         }
         bls_attrset (w, a); return EXECUTION_SUCCESS;
     }
     if (!strcmp (cmd, "hline") || !strcmp (cmd, "vline")) {
         uint32_t ch = 0; int n;
-        if (ac >= 2) { ch = (uint32_t) (unsigned char) av[0][0]; n = atoi (av[1]); }
-        else if (ac == 1) { n = atoi (av[0]); }
+        if (ac == 2) { if (!btui_glyph (av[0], &ch) || !btui_number (av[1], 0, 32767, &n)) goto bad_value; }
+        else if (ac == 1) { if (!btui_number (av[0], 0, 32767, &n)) goto bad_value; }
         else { builtin_error ("%s [CH] N", cmd); return EX_USAGE; }
         if (cmd[0] == 'h') bls_hline (w, ch, n); else bls_vline (w, ch, n);
         return EXECUTION_SUCCESS;
     }
     if (!strcmp (cmd, "addstr") || !strcmp (cmd, "addansi")) {
-        int y = -1, x = -1, i = 0;
+        int y = 0, x = 0, has_y = 0, has_x = 0, i = 0;
         while (i < ac && av[i][0] == '-' && av[i][1] && !av[i][2]) {
-            if (av[i][1] == 'y' && i + 1 < ac) { y = atoi (av[++i]); }
-            else if (av[i][1] == 'x' && i + 1 < ac) { x = atoi (av[++i]); }
-            else break;
+            if (av[i][1] == 'y' && i + 1 < ac) { if (!btui_number (av[++i], -32768, 32767, &y)) goto bad_value; has_y = 1; }
+            else if (av[i][1] == 'x' && i + 1 < ac) { if (!btui_number (av[++i], -32768, 32767, &x)) goto bad_value; has_x = 1; }
+            else if (!strcmp (av[i], "--")) { i++; break; }
+            else goto bad_value;
             i++;
         }
-        if (i >= ac) { builtin_error ("%s [-y Y] [-x X] STR", cmd); return EX_USAGE; }
-        if (y >= 0 || x >= 0) {
-            int cy = y >= 0 ? y : 0, cx = x >= 0 ? x : 0;
+        if (i + 1 != ac) { builtin_error ("%s [-y Y] [-x X] STR", cmd); return EX_USAGE; }
+        if (has_y || has_x) {
+            int cy = has_y ? y : 0, cx = has_x ? x : 0;
             bls_move (w, cy, cx);
         }
         if (!strcmp (cmd, "addansi")) bls_addstr_ansi (w, av[i], -1);
@@ -230,26 +296,29 @@ tui_builtin (WORD_LIST *list)
         if (k == BLS_ERR) return 2;                            /* timeout */
         char buf[16];
         puts (btui_keyname (k, buf, sizeof buf));
-        return EXECUTION_SUCCESS;
+        return btui_output ();
     }
     if (!strcmp (cmd, "getstr")) {
-        int y = -1, x = -1, i = 0;
+        int y = 0, x = 0, has_y = 0, has_x = 0, i = 0;
         while (i < ac && av[i][0] == '-' && av[i][1] && !av[i][2]) {
-            if (av[i][1] == 'y' && i + 1 < ac) { y = atoi (av[++i]); }
-            else if (av[i][1] == 'x' && i + 1 < ac) { x = atoi (av[++i]); }
-            else break;
+            if (av[i][1] == 'y' && i + 1 < ac) { if (!btui_number (av[++i], -32768, 32767, &y)) goto bad_value; has_y = 1; }
+            else if (av[i][1] == 'x' && i + 1 < ac) { if (!btui_number (av[++i], -32768, 32767, &x)) goto bad_value; has_x = 1; }
+            else if (!strcmp (av[i], "--")) { i++; break; }
+            else goto bad_value;
             i++;
         }
+        if (ac - i > 1) goto bad_value;
         const char *prompt = (i < ac) ? av[i] : "";
         char buf[1024];
-        int r = bls_getnstr (w, y >= 0 ? y : bls_lines () - 1, x >= 0 ? x : 0,
+        int r = bls_getnstr (w, has_y ? y : bls_lines () - 1, has_x ? x : 0,
                              prompt, buf, sizeof buf);
         if (r < 0) return EXECUTION_FAILURE;
         puts (buf);
-        return EXECUTION_SUCCESS;
+        return btui_output ();
     }
 
-    builtin_error ("unknown subcommand: %s", cmd);
+bad_value:
+    builtin_error ("%s: invalid argument", cmd);
     builtin_usage ();
     return EX_USAGE;
 }
@@ -269,6 +338,10 @@ char *tui_doc[] = {
     "  fg COLOR | bg COLOR   (default|NAME|N|#RRGGBB|R,G,B)",
     "  hline [CH] N | vline [CH] N | box | clrtoeol | clrtobot | refresh",
     "  timeout MS | getkey | getstr [-y Y][-x X] PROMPT",
+    "",
+    "Coordinates: -32768..32767; line length: 0..32767; timeout: -1..INT_MAX.",
+    "Use -- before text beginning with an option. Invalid arguments return 2.",
+    "refresh returns 1 on output failure; restore the destination and retry.",
     "",
     "getkey prints a token (UP/DOWN/LEFT/RIGHT/HOME/END/PGUP/PGDN/RET/TAB/ESC/",
     "BS/DEL/F1..F4/C-A.. or the literal char); rc 0 key, 1 EOF, 2 timeout.",

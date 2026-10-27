@@ -42,7 +42,19 @@ fsfreeze_builtin (WORD_LIST *list)
     while (list && list->word->word[0] == '-' && list->word->word[1]) {
         const char *w = list->word->word;
         if (!strcmp (w, "--")) { list = list->next; break; }
-        if (!strcmp (w, "--help")) { extern char *fsfreeze_doc[]; for (char **lp = fsfreeze_doc; *lp; lp++) puts (*lp); return EXECUTION_SUCCESS; }
+        if (!strcmp (w, "--help")) {
+            extern char *fsfreeze_doc[];
+            clearerr (stdout);
+            for (char **lp = fsfreeze_doc; *lp; lp++)
+                if (puts (*lp) == EOF) return EXECUTION_FAILURE;
+            return (fflush (stdout) == EOF || ferror (stdout))
+                ? EXECUTION_FAILURE : EXECUTION_SUCCESS;
+        }
+        if (op && (!strcmp (w, "-f") || !strcmp (w, "--freeze") ||
+                   !strcmp (w, "-u") || !strcmp (w, "--unfreeze"))) {
+            builtin_error ("exactly one of --freeze or --unfreeze is required");
+            builtin_usage (); return EX_USAGE;
+        }
         if (!strcmp (w, "-f") || !strcmp (w, "--freeze"))   { op = 'f'; list = list->next; continue; }
         if (!strcmp (w, "-u") || !strcmp (w, "--unfreeze")) { op = 'u'; list = list->next; continue; }
         builtin_error ("unknown option: %s", w); builtin_usage (); return EX_USAGE;
@@ -50,13 +62,18 @@ fsfreeze_builtin (WORD_LIST *list)
     if (list) { mp = list->word->word; list = list->next; }
 
     if (op == 0)  { builtin_error ("exactly one of --freeze or --unfreeze is required"); builtin_usage (); return EX_USAGE; }
-    if (!mp)      { builtin_error ("a mountpoint is required"); builtin_usage (); return EX_USAGE; }
+    if (!mp || !*mp) { builtin_error ("a mountpoint is required"); builtin_usage (); return EX_USAGE; }
+
+    if (list) { builtin_error ("too many operands"); builtin_usage (); return EX_USAGE; }
 
     struct stat st;
     if (stat (mp, &st) < 0) { builtin_error ("%s: %s", mp, strerror (errno)); return EXECUTION_FAILURE; }
     if (!S_ISDIR (st.st_mode)) { builtin_error ("%s: not a directory", mp); return EXECUTION_FAILURE; }
 
-    int fd = open (mp, O_RDONLY);
+    /* O_DIRECTORY validates the object actually opened as well as protecting
+     * against a replacement between stat and open. The kernel ioctl decides
+     * whether this directory's filesystem supports the requested action. */
+    int fd = open (mp, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (fd < 0) { builtin_error ("%s: %s", mp, strerror (errno)); return EXECUTION_FAILURE; }
 
     int rc = ioctl (fd, (op == 'f') ? FIFREEZE : FITHAW, 0);

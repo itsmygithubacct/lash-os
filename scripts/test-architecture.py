@@ -99,7 +99,7 @@ def main():
         "/bin/linux-bash-os --host --stats -c 'set -e; "
         "[[ $MACHTYPE == bpf-linux-capsule ]]; "
         "registered=0; while read -r name; do [[ ${ type -t \"$name\"; } == builtin ]]; "
-        "((++registered)); done < /builtin-names; [[ $registered == 279 ]]; "
+        "((++registered)); done < /builtin-names; [[ $registered == 286 ]]; "
         "printf \"BPF_SMOKE_OK %s %s\\n\" \"$BASH_VERSION\" \"$registered\"'")
     if args.network_only:
         command = "/bin/linux-bash-os --host --stats /network-cases.sh"
@@ -109,6 +109,9 @@ export LASHOS_TEST_STEP_TIMEOUT_MS=300000
 /bin/busybox mount -t proc proc /proc
 /bin/busybox mount -t sysfs sysfs /sys
 /bin/busybox mount -t devtmpfs devtmpfs /dev
+/bin/busybox mkdir -p /dev/shm /dev/mqueue
+/bin/busybox mount -t tmpfs -o mode=1777 tmpfs /dev/shm
+/bin/busybox mount -t mqueue mqueue /dev/mqueue
 /bin/busybox mkdir -p /dev/pts
 /bin/busybox mount -t devpts devpts /dev/pts
 /bin/busybox ln -s /proc/self/fd /dev/fd

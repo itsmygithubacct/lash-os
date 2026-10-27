@@ -13,6 +13,8 @@
     "description": "Everyday file, text and process tools",
     "extends": "pure",
     "include": [
+      "bashclear",
+      "clear",
       "ls",
       "cp",
       "mv",
@@ -73,7 +75,11 @@
       "uudecode",
       "timeout",
       "flock",
-      "setsid"
+      "setsid",
+      "base64",
+      "sha256sum",
+      "gzip",
+      "tar"
     ]
   },
   "device": {
@@ -217,6 +223,7 @@
       "obj",
       "index",
       "pack",
+      "git",
       "procstat",
       "vmstat",
       "uptime",

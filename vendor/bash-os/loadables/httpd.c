@@ -204,8 +204,10 @@ parse_fd (const char *s, const char *what, long *out)
 {
   char *end; long v;
   if (s == 0 || *s == 0) { builtin_error ("%s: fd required", what); return -1; }
+  errno = 0;
   v = strtol (s, &end, 10);
-  if (*end || v < 0) { builtin_error ("%s: bad fd '%s'", what, s); return -1; }
+  if (errno == ERANGE || *end || v < 0 || v > INT_MAX)
+    { builtin_error ("%s: bad fd '%s'", what, s); return -1; }
   *out = v;
   return 0;
 }
@@ -315,8 +317,10 @@ do_accept (WORD_LIST *list)
       case 'c': v_ct = list_optarg; break;
       case 'r': v_rem = list_optarg; break;
       case 't':
+	errno = 0;
 	secs = strtol (list_optarg, &end, 10);
-	if (*list_optarg == 0 || *end || secs < 0) { builtin_error ("accept: bad -t '%s'", list_optarg); return (EX_USAGE); }
+	if (errno == ERANGE || *list_optarg == 0 || *end || secs < 0 || secs > INT_MAX / 1000)
+	  { builtin_error ("accept: -t must be in 0..%d", INT_MAX / 1000); return (EX_USAGE); }
 	break;
       default: builtin_usage (); return (EX_USAGE);
       }
@@ -447,7 +451,7 @@ do_reply (WORD_LIST *list)
   long cfd, status = 200, clen = 0;
   int opt, rc = EXECUTION_SUCCESS, err = 0, ffd = -1;
   char *end, *buf = 0;
-  char hdr[512];
+  char *hdr = NULL;
 
   if (list == 0) { builtin_usage (); return (EX_USAGE); }
   if (parse_fd (list->word->word, "reply", &cfd) != 0) return (EX_USAGE);
@@ -493,9 +497,10 @@ do_reply (WORD_LIST *list)
       clen = (long) len;
     }
 
-  snprintf (hdr, sizeof hdr, "HTTP/1.1 %ld %s\r\nContent-Type: %s\r\nContent-Length: %ld\r\nConnection: close\r\n\r\n",
-	    status, reason ((int) status), ctype, clen);
-  if (send_all ((int) cfd, hdr, strlen (hdr)) != 0) { rc = EXECUTION_FAILURE; err = errno; }
+  int hlen = asprintf (&hdr, "HTTP/1.1 %ld %s\r\nContent-Type: %s\r\nContent-Length: %ld\r\nConnection: close\r\n\r\n",
+		       status, reason ((int) status), ctype, clen);
+  if (hlen < 0) { rc = EXECUTION_FAILURE; err = ENOMEM; }
+  else if (send_all ((int) cfd, hdr, (size_t) hlen) != 0) { rc = EXECUTION_FAILURE; err = errno; }
   else if (file)
     {
       char chunk[CHUNK];
@@ -511,6 +516,7 @@ do_reply (WORD_LIST *list)
   else if (clen > 0 && send_all ((int) cfd, buf, (size_t) clen) != 0) { rc = EXECUTION_FAILURE; err = errno; }
 
   if (ffd >= 0) close (ffd);
+  free (hdr);
   free (buf);
   close ((int) cfd);					/* always: the connection is ours to end */
   if (rc != EXECUTION_SUCCESS) builtin_error ("reply: %s", strerror (err));
@@ -553,13 +559,42 @@ disp_param (const char *disp, const char *param, int want_base, char *out, size_
 }
 
 static int
+boundary_line (const unsigned char *p, const unsigned char *end,
+	       const unsigned char **after, int *closing)
+{
+  *closing = end - p >= 2 && p[0] == '-' && p[1] == '-';
+  if (*closing) p += 2;
+  while (p < end && (*p == ' ' || *p == '\t')) p++;
+  if (end - p >= 2 && p[0] == '\r' && p[1] == '\n') { *after = p + 2; return 1; }
+  if (*closing && p == end) { *after = p; return 1; }
+  return 0;
+}
+
+static const unsigned char *
+find_boundary (const unsigned char *start, const unsigned char *end,
+	       const char *delimiter, size_t length, int first)
+{
+  const unsigned char *cursor = start;
+  while (cursor < end)
+    {
+      const unsigned char *p = memmem (cursor, (size_t) (end - cursor), delimiter, length), *after;
+      int closing;
+      if (!p) return NULL;
+      if (((first && p == start) || (p - start >= 2 && p[-2] == '\r' && p[-1] == '\n')) &&
+	  boundary_line (p + length, end, &after, &closing)) return p;
+      cursor = p + 1;
+    }
+  return NULL;
+}
+
+static int
 do_part (WORD_LIST *list)
 {
   const char *bodyfile, *boundary = 0, *outfile = 0, *field = 0, *v_fn = 0, *v_len = 0;
   int opt, fd, rc = 1;					/* 1: no such part */
-  char delim[280], needle[284];
+  char delim[280];
   unsigned char *buf = 0;
-  size_t len, dl, nl;
+  size_t len, dl;
   struct stat st;
 
   if (list == 0) { builtin_usage (); return (EX_USAGE); }
@@ -583,7 +618,6 @@ do_part (WORD_LIST *list)
     if (bl >= 2 && boundary[0] == '"' && boundary[bl - 1] == '"') { boundary++; bl -= 2; }
     if (bl == 0 || bl > 250) { builtin_error ("part: bad boundary"); return (EX_USAGE); }
     dl = (size_t) snprintf (delim, sizeof delim, "--%.*s", (int) bl, boundary);
-    nl = (size_t) snprintf (needle, sizeof needle, "\r\n%s", delim);
   }
 
   /* The whole body: accept capped it at BODY_MAX, so this is bounded. */
@@ -604,18 +638,18 @@ do_part (WORD_LIST *list)
   close (fd);
 
   {
-    const unsigned char *end = buf + len, *p = memmem (buf, len, delim, dl);
+    const unsigned char *end = buf + len, *p = find_boundary (buf, end, delim, dl, 1);
     while (p)
       {
-	const unsigned char *after = p + dl, *hdr, *hend, *body, *bend;
-	if (after + 2 <= end && after[0] == '-' && after[1] == '-') break;	/* closing delimiter */
-	if (after + 2 > end || after[0] != '\r' || after[1] != '\n') break;	/* malformed */
-	hdr = after + 2;
+	const unsigned char *hdr, *hend, *body, *bend, *next_boundary;
+	int closing;
+	if (!boundary_line (p + dl, end, &hdr, &closing) || closing) break;
 	hend = memmem (hdr, (size_t) (end - hdr), "\r\n\r\n", 4);
 	if (hend == 0) break;
 	body = hend + 4;
-	bend = memmem (body, (size_t) (end - body), needle, nl);		/* CRLF + delimiter */
-	if (bend == 0) break;
+	next_boundary = find_boundary (body, end, delim, dl, 0);
+	if (next_boundary == 0) break;
+	bend = next_boundary - 2;                     /* exclude delimiter's CRLF */
 	{
 	  size_t hl = (size_t) (hend - hdr);
 	  char *h = malloc (hl + 1), *line, *nx;
@@ -646,7 +680,7 @@ do_part (WORD_LIST *list)
 	      break;
 	    }
 	}
-	p = bend + 2;						/* the next delimiter */
+	p = next_boundary;
       }
   }
   free (buf);

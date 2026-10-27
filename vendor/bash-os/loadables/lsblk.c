@@ -443,9 +443,11 @@ blb_probe_super (const char *name, blb_dev *d)
         const unsigned char *sb = buf + 1024;
         uint32_t compat = blb_le32 (sb + 0x5c);
         uint32_t incompat = blb_le32 (sb + 0x60);
-        const char *t = "ext2";
-        if (compat & 0x4)
-            t = (incompat & 0x40) ? "ext4" : "ext3";
+        uint32_t ro_compat = blb_le32 (sb + 0x64);
+        /* Journal-free ext4 still has features unsupported by ext3. */
+        const char *t = (incompat & 0x8) ? "jbd" :
+            ((incompat & ~0x16u) || (ro_compat & ~0x7u)) ? "ext4" :
+            (compat & 0x4) ? "ext3" : "ext2";
         snprintf (d->fstype, sizeof d->fstype, "%s", t);
         snprintf (d->fsver, sizeof d->fsver, "1.0");
         blb_uuid_be (d->uuid, sb + 0x68);

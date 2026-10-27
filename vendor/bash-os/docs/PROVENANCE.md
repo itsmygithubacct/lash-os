@@ -56,10 +56,23 @@ bash-os is assembled from these sources:
 
 ## Licences, file by file
 
+`bashperl.c` and `_perl` are new MIT implementations using Perl's public
+embedding API, studied alongside GNU Bash's `examples/loadables/perl` and
+Perl's `perlembed` documentation. No upstream interpreter source is vendored
+in the project. `config/perl.json` pins Perl 5.44.0, downloaded and built in a
+private prefix with its original `Artistic` and `Copying` notices. The static
+embedding archives redirect C environment API references to the wrapper's
+private environment because Bash exports versions that mutate shell variables.
+The standard native extension registrations are generated from Perl's build
+configuration. See [Perl inside Bash](https://github.com/itsmygithubacct/bash-os/blob/8381e8136626d18083d470ac26ba079ad0b2f602/docs/perl.md).
+
 | Files | Licence |
 |---|---|
-| command sources and `loadables/common/` | MIT (`LICENSE`) |
+| command sources and `loadables/common/` except `sed-regex.h` | MIT (`LICENSE`) |
+| `loadables/common/sed-regex.h` | LGPL-2.1-or-later, GNU sed 4.9 gnulib regex; notice `docs/sol-sed-regex-LGPL-2.1.txt`; registered in `config/vendored-files.json` |
 | `_ptybroker` native client and service | MIT, original project code |
+| `_perl` embedding and environment helpers | MIT, original project code |
+| `_git` object, index and pack library | MIT, original project code; git's formats implemented from their published descriptions, with no code from git |
 | `_jsmn`, `_bl_key`, `_bl_screen`, `_bl_proc`, `_tomlc17` helpers | MIT, per-tree notices |
 | `_libgrapheme` | ISC, per-tree notice |
 | `_sqlite` | Public domain, upstream disclaimer retained |
@@ -71,10 +84,11 @@ bash-os is assembled from these sources:
 | `_tree_sitter` | MIT with Unicode/ICU notices for bundled Unicode headers |
 | `_ts_bash`, `_ts_json`, `_ts_toml`, `_ts_markdown`, `_ts_markdown_inline` | MIT, per-grammar notices |
 | `tests/*.c`, `build.sh`, `config/` | MIT |
-| `patches/head-stdin.patch` (adaptation of Bash's stock head) | GPL-3.0-or-later |
+| Stock Bash adaptations listed in `config/stock-patches.json` | GPL-3.0-or-later |
 
 The project sources carry an MIT marker. Vendored helpers retain their original
-notices and are registered in `config/helpers.json`; `tests/licence-check.sh`
+notices and are registered in `config/helpers.json`. Other vendored files are
+registered in `config/vendored-files.json`. `tests/licence-check.sh`
 checks all C/header/data files and rejects unregistered helper trees. The
 combined executable remains governed by Bash's GPL-3.0-or-later licence.
 
@@ -101,9 +115,10 @@ the host's util-linux and by `gcc -fanalyzer`:
   leaking the stream on that path.
 
 Known differences from util-linux, left as they are (these are subsets, not
-reimplementations): `lsattr` shows fewer attribute flags, `fincore` and
-`prlimit` lay their columns out differently, and `ipcctl` refuses removals by
-default policy. `tests/util-linux-smoke.sh` covers what can be exercised
+reimplementations): `prlimit` lays its columns out differently, and `ipcctl` refuses removals by
+default policy. Focused parity checks now cover the `lsattr` flag layout and
+`fincore` headings, byte/human units and alignment on small private files;
+other options and larger `fincore` tables remain unqualified. `tests/util-linux-smoke.sh` covers what can be exercised
 without privilege or destroying anything, and compares `ionice`, `taskset` and
 `chrt` against the host's tools.
 
@@ -158,17 +173,47 @@ project. bash-os is the board-agnostic layer it builds on.
 
 ## Local adaptations
 
-Fixes to stock loadables, applied at build time in `build.sh` so the pinned
-sources stay as taken:
+Fixes to stock loadables are selected by `config/stock-patches.json` and applied
+by both `build.sh` and `config/build-packages.py`, so the pinned originals stay
+as taken. The patches preserve their upstream GPL headers:
 
-- `head`: [a tracked patch](../patches/head-stdin.patch) gives redirected stdin
+- `head`: [a tracked patch](https://github.com/itsmygithubacct/bash-os/blob/8381e8136626d18083d470ac26ba079ad0b2f602/docs/../patches/head-stdin.patch) gives redirected stdin
   a private stream, restores unread seekable input, avoids pipe read-ahead and
   propagates I/O errors. The upstream copyright and GPL header are preserved;
-  [behavior and validation](https://github.com/itsmygithubacct/bash-os/blob/fa178afafddfce8ee870975a38a7f271b25140a9/docs/head-sed.md) document the remaining option limits.
+  [behavior and validation](https://github.com/itsmygithubacct/bash-os/blob/8381e8136626d18083d470ac26ba079ad0b2f602/docs/head-sed.md) document the remaining option limits.
 - `mkdir -p`: only `chmod` the components it actually created, not existing
-  parents.
+  parents or an existing final directory. Explicit `-m` modes ignore the umask;
+  missing operands and invalid options return status 1.
+- `mktemp`: invalid options return status 1; `-u` retains the existing fix to
+  generate a name without creating or removing filesystem entries.
+- `printenv`: print every requested exported value, continue past missing
+  variables with status 1, and support `-0`/`--null`, successful help/version
+  requests, and GNU option ordering. Help and version identify this implementation.
 - `fltexpr`: initialise NaN/Inf at compile time (its runtime `_builtin_load`
   hook never fires for a static builtin). Needs `libm`, linked via `LOCAL_LIBS`.
+  Its lexer also recognizes the logical `&&` and `||` operators already handled
+  by the expression parser.
+- `basename`, `dirname`, `pathchk`, `rm`, `tee`, `tty`, `unlink`: operand and
+  option validation, empty-path behavior, pathname limits and error statuses.
+  `dirname` accepts multiple operands and NUL termination; `unlink` validates
+  its single operand before changing the filesystem.
+- `chmod`, `mkfifo`, `rmdir`: GNU mode semantics, creation umasks, recursive
+  permission changes, and removal of empty parent directories. Directory
+  set-ID preservation and command-line versus descendant symlinks have focused
+  fixtures.
+- `realpath`, `getconf`, `finfo`: missing final path components and lexical
+  normalization, configuration listings and undefined values, and sticky bits.
+- `id`, `logname`, `whoami`, `uname`: identity/group formatting, operand checks
+  and selected GNU option aliases, with synthetic account fixtures.
+- `sleep`, `strftime`, `strptime`: multiple intervals, negative epochs,
+  longest matching common date formats, reset state between parsing attempts,
+  and numeric timezone offsets. The C-library date parser's locale and ISO-week
+  limitations remain documented.
+
+The [compatibility notes](https://github.com/itsmygithubacct/bash-os/blob/8381e8136626d18083d470ac26ba079ad0b2f602/docs/gnu-compatibility.md) and
+[`tests/loadable-parity/regressions/`](https://github.com/itsmygithubacct/bash-os/blob/8381e8136626d18083d470ac26ba079ad0b2f602/docs/../tests/loadable-parity/regressions/)
+describe the bounded comparisons for these adaptations. They are correctness
+fixtures, not new timing measurements or claims of complete GNU conformance.
 
 Changes carried in the sources, noted there:
 
@@ -219,6 +264,43 @@ Changes carried in the sources, noted there:
   that points back at the source truncated the source before the same-file
   check: it now opens without truncating, compares the open descriptors'
   inodes, then truncates (contributed with `tests/regressions.py`).
+  Nonrecursive source symlinks follow GNU's default; `-P` preserves them.
+  Force retries a failed destination open, preserving openable destination
+  symlinks and hardlinks. `mv` validates its source before a no-clobber skip
+  and reports interactive refusal as failure.
+- `find`: missing starting paths and detected directory cycles report failure;
+  the walker does not open children at the maximum depth and stops safely when
+  traversal-state allocation fails. `du -L` counts a file only once when a
+  nested symlink later reaches the same inode, unless `-l` requests each link.
+- `df`: mount lookup requires the resolved operand to be contained by the mount
+  path, distinguishes the original file operand from its mount target, and
+  preserves full string fields. `ps`, `free`, `tr`, `wc`, `touch` and `tail`
+  report the selected GNU argument-error statuses. `cmp -l` aligns its offset
+  and octal columns using the available input lengths.
+- `chown`: rejects negative, overflowing and unchanged-sentinel numeric IDs
+  before calling the ownership syscall; legacy dot separators warn. These
+  checks use private fixtures with the runner's existing identity.
+- `env`: repeated assignments replace earlier values, and external commands
+  use the requested child environment's search path without changing the caller.
+  `od` numeric and GNU string modes preserve one input state across file
+  boundaries, including global skip/count limits and repeated stdin operands.
+- `rev` recognizes the end-of-options marker; `comm`, `fold`, `paste`, `date`,
+  `truncate` and `uniq` use GNU argument-error statuses. The documented `blkid`
+  export format emits one newline per field without an extra trailing blank line.
+- `xargs`: tracks logical input lines separately from words, implements GNU
+  quoting and batching-option precedence, keeps logical batches intact under
+  `-s`, and diagnoses child status 255 while preserving fatal-stop cleanup.
+- `lsattr`: expands the short flag field to e2fsprogs' 22 columns, rejects
+  symlink queries and matches dot-entry and recursive heading behavior.
+  Tests read attributes on private files and do not set inode flags.
+- `zstd`, `zstdcat`: read stdin by default and preserve strict decoding after
+  recognized frame magic while supporting forced pass-through of ordinary
+  input. The alias selects `-dcf`; later `-o` and `-c` options select the output
+  destination in argument order. Other compression formats remain unsupported.
+- `bashbase64`, `binhex`, `bashmount`, `stat`: preserve complete decoded groups
+  before an invalid base64 suffix, reject an incomplete single-zero hex byte,
+  report an empty mount-table query as no match, and handle unknown/stat-context
+  format directives. No mount operation is used by the mount-table fixtures.
 - `diff`: the line-table growth is checked; out of memory is an error, not a
   crash.
 - `wc`: a block-reading path for every call without `-m`/`-L` (lines by
@@ -485,4 +567,4 @@ bitmap fonts retain their upstream public-domain and permissive notices in the
 font headers. The helper manifest selects this rasterizer only for `gpu`.
 Canvas and presenter tests check independent pixel expectations, protocol replay,
 resource cleanup, and optional real-driver rendering/export; the sanitizer
-harness includes the rasterizer itself. See [the graphics API](https://github.com/itsmygithubacct/bash-os/blob/fa178afafddfce8ee870975a38a7f271b25140a9/docs/gpu.md).
+harness includes the rasterizer itself. See [the graphics API](https://github.com/itsmygithubacct/bash-os/blob/8381e8136626d18083d470ac26ba079ad0b2f602/docs/gpu.md).

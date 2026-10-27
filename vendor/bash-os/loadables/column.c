@@ -17,8 +17,8 @@
  *      bytes collapse into one separator; with -s, each char in
  *      SEPSTR splits, so consecutive separators produce empty
  *      fields (matching `column -s : -t /etc/passwd`). OUTSTR
- *      (default "  ") joins output columns. The last column is not
- *      right-padded.
+ *      (default "  ") joins output columns. Missing fields are padded
+ *      through the final table column, which is not right-padded.
  *      Option parsing follows getopt shape for the implemented
  *      options, so `-ts :`, `-s:`, and `-o::` are accepted.
  *      Non-table mode supports `-S N` / `--use-spaces=N` as the
@@ -26,19 +26,17 @@
  *
  *   col [-b] [FILE...]
  *      Preserve CTL-H (backspace) overstrike sequences by default. With
- *      -b the backspace and the preceding byte are both removed
- *      (man-page "no backspaces" mode). ESC-7 (DECRC / reverse linefeed) and
- *      RI bytes are dropped on sight — they cannot be honored without
- *      a line buffer model col(1) does not advertise as required.
+ *      -b the backspace and the preceding character are both removed.
+ *      Escape pairs, including ESC-7 (reverse linefeed), are dropped by
+ *      this focused filter. Invalid
+ *      multibyte bytes are escaped as \xNN; decoded C1 controls are dropped.
  *
  *   colrm [START [END]]
- *      Remove byte-columns START..END (1-based, inclusive) from each
- *      stdin line. With just START, remove START..end-of-line. With
- *      no operands, passthrough. Out-of-range columns produce a no-op
- *      on lines shorter than START. TAB-expansion (util-linux's
- *      colrm calls it out for the "<TAB> is 1 column" rule) is NOT
- *      done — columns are treated as bytes, which matches the most
- *      common ASCII use and avoids the heavier `wcwidth` dependency.
+ *      Remove display columns START..END (1-based, inclusive). Tabs advance
+ *      to eight-column stops, backspaces retreat one column, and multibyte
+ *      characters use their locale display widths. Partially removed tabs
+ *      and wide characters leave spaces for the surviving cells. A zero
+ *      START passes input through; END zero means through end-of-line.
  *
  * Source counterparts (read for spec shape, not vendored):
  *   research/refs/util-linux/text-utils/column.c
@@ -59,6 +57,8 @@
 #include <string.h>
 #include <errno.h>
 #include <ctype.h>
+#include <limits.h>
+#include <wchar.h>
 
 #include "loadables.h"
 
@@ -137,6 +137,16 @@ bcol_getline (FILE *fp, char **out, size_t *cap)
   if (ferror (fp))
     return -1;
   return (ssize_t) len;
+}
+
+/* column ignores whitespace-only records in both layout modes. */
+static int
+bcol_blank (const char *line, size_t len)
+{
+  for (size_t i = 0; i < len; i++)
+    if (!isspace ((unsigned char) line[i]))
+      return 0;
+  return 1;
 }
 
 /* ===================================================================
@@ -264,12 +274,13 @@ column_builtin (WORD_LIST *list)
               builtin_usage ();
               return EX_USAGE;
             }
+          errno = 0;
           output_width = strtol (p->next->word->word, &endp, 10);
-          if (!endp || *endp || output_width < 1)
+          if (errno || endp == p->next->word->word || !endp || *endp || output_width < 0)
             {
               builtin_error ("column: bad output width: %s", p->next->word->word);
               builtin_usage ();
-              return EX_USAGE;
+              return EXECUTION_FAILURE;
             }
           p = p->next;
           continue;
@@ -277,12 +288,13 @@ column_builtin (WORD_LIST *list)
       if (strncmp (w, "--output-width=", 15) == 0)
         {
           char *endp = NULL;
+          errno = 0;
           output_width = strtol (w + 15, &endp, 10);
-          if (!endp || *endp || output_width < 1)
+          if (errno || endp == w + 15 || !endp || *endp || output_width < 0)
             {
               builtin_error ("column: bad output width: %s", w + 15);
               builtin_usage ();
-              return EX_USAGE;
+              return EXECUTION_FAILURE;
             }
           continue;
         }
@@ -372,12 +384,13 @@ column_builtin (WORD_LIST *list)
                       arg = p->next->word->word;
                       p = p->next;
                     }
+                  errno = 0;
                   output_width = strtol (arg, &endp, 10);
-                  if (!endp || *endp || output_width < 1)
+                  if (errno || endp == arg || !endp || *endp || output_width < 0)
                     {
                       builtin_error ("column: bad output width: %s", arg);
                       builtin_usage ();
-                      return EX_USAGE;
+                      return EXECUTION_FAILURE;
                     }
                   break;
                 }
@@ -456,6 +469,8 @@ column_builtin (WORD_LIST *list)
             {
               if (line[got - 1] == '\n')
                 got--;
+              if (bcol_blank (line, (size_t) got))
+                continue;
               if (n_items >= cap_items)
                 {
                   int nc = cap_items ? cap_items * 2 : 16;
@@ -552,6 +567,8 @@ columnar_cleanup:
         {
           if (line[got - 1] == '\n')
             got--;
+          if (bcol_blank (line, (size_t) got))
+            continue;
           if (n_rows >= cap_rows)
             {
               int nc = cap_rows ? cap_rows * 2 : 16;
@@ -596,12 +613,13 @@ columnar_cleanup:
 
   for (int r = 0; r < n_rows; r++)
     {
-      for (int k = 0; k < rows[r].n; k++)
+      for (int k = 0; k < n_cols; k++)
         {
-          fputs (rows[r].fields[k], stdout);
-          if (k + 1 < rows[r].n)
+          const char *field = k < rows[r].n ? rows[r].fields[k] : "";
+          fputs (field, stdout);
+          if (k + 1 < n_cols)
             {
-              size_t pad = colw[k] - strlen (rows[r].fields[k]);
+              size_t pad = colw[k] - strlen (field);
               for (size_t p = 0; p < pad; p++) putchar (' ');
               fputs (outsep, stdout);
             }
@@ -617,6 +635,19 @@ cleanup:
   free (rows);
   free (colw);
   return rc;
+}
+
+/* Decode one character without changing the bytes used for output. Invalid
+   bytes consume one position so the next character can still be decoded. */
+static size_t
+bcol_character (const char *s, size_t len, wchar_t *wc, int *valid)
+{
+  mbstate_t state = {0};
+  size_t n = mbrtowc (wc, s, len, &state);
+  *valid = n != (size_t) -1 && n != (size_t) -2;
+  if (!*valid)
+    { *wc = (unsigned char) *s; return 1; }
+  return n ? n : 1;
 }
 
 /* ===================================================================
@@ -649,7 +680,7 @@ col_builtin (WORD_LIST *list)
         {
           builtin_error ("col: unknown flag: %s", w);
           builtin_usage ();
-          return EX_USAGE;
+          return EXECUTION_FAILURE;
         }
       if (n_files < BCOL_MAX_FILES)
         files[n_files++] = w;
@@ -667,39 +698,73 @@ col_builtin (WORD_LIST *list)
     {
       FILE *fp = bcol_open (n_files ? files[fi] : NULL, &in_stdin);
       if (!fp) { rc = EXECUTION_FAILURE; continue; }
-      /* Hold the most recent input byte so -b can drop the byte a
-         backspace overstrikes. Without -b, preserve the overstrike bytes. */
-      int pending = -1;
+      /* Hold the last printable character for the simple -b overstrike
+         contract. Decode before filtering so a UTF-8 continuation byte is
+         never mistaken for a raw C1 control. */
+      char pending[MB_LEN_MAX];
+      size_t pending_len = 0;
       int in_esc = 0;
-      int c;
-      while ((c = fgetc (fp)) != EOF)
-        {
-          if (in_esc) { in_esc = 0; continue; }
-          if (c == 0x1b) { in_esc = 1; continue; }
-          if (c == '\b')
-            {
-              if (bflag)
-                {
-                  if (pending != -1) pending = -1;
-                }
-              else
-                {
-                  if (pending != -1)
-                    {
-                      putchar (pending);
-                      last = pending;
-                      pending = -1;
-                    }
-                  putchar ('\b');
-                  last = '\b';
-                }
+      char *line = NULL;
+      size_t cap = 0;
+      ssize_t got;
+      while ((got = bcol_getline (fp, &line, &cap)) > 0)
+        for (size_t pos = 0; pos < (size_t) got; )
+          {
+            wchar_t wc;
+            int valid;
+            size_t n = bcol_character (line + pos, (size_t) got - pos,
+                                       &wc, &valid);
+            const char *text = line + pos;
+            pos += n;
+            if (in_esc) { in_esc = 0; continue; }
+            if (valid && wc == 0x1b) { in_esc = 1; continue; }
+            if (valid && wc >= 0x80 && wc <= 0x9f)
               continue;
-            }
-          if (pending != -1) { putchar (pending); last = pending; }
-          pending = c;
+            if (valid && wc == '\b')
+              {
+                if (bflag)
+                  pending_len = 0;
+                else
+                  {
+                    if (pending_len)
+                      fwrite (pending, 1, pending_len, stdout);
+                    pending_len = 0;
+                    putchar ('\b');
+                    last = '\b';
+                  }
+                continue;
+              }
+            if (pending_len)
+              {
+                fwrite (pending, 1, pending_len, stdout);
+                last = (unsigned char) pending[pending_len - 1];
+                pending_len = 0;
+              }
+            if (!valid)
+              {
+                /* Invalid input is displayed as four printable ASCII cells.
+                   Keep the last cell pending so -b can overstrike it. */
+                char escaped[5];
+                snprintf (escaped, sizeof escaped, "\\x%02x",
+                          (unsigned char) *text);
+                fwrite (escaped, 1, 3, stdout);
+                last = (unsigned char) escaped[2];
+                pending[0] = escaped[3];
+                pending_len = 1;
+              }
+            else
+              {
+                memcpy (pending, text, n);
+                pending_len = n;
+              }
+          }
+      free (line);
+      if (pending_len)
+        {
+          fwrite (pending, 1, pending_len, stdout);
+          last = (unsigned char) pending[pending_len - 1];
         }
-      if (pending != -1) { putchar (pending); last = pending; pending = -1; }
-      if (ferror (fp))
+      if (got < 0)
         { builtin_error ("read: %s", strerror (errno)); rc = EXECUTION_FAILURE; }
       if (fp != in_stdin) fclose (fp);
     }
@@ -733,8 +798,9 @@ colrm_builtin (WORD_LIST *list)
           return EX_USAGE;
         }
       char *e = NULL;
+      errno = 0;
       long v = strtol (w, &e, 10);
-      if (!e || *e != '\0' || v < 1)
+      if (errno || e == w || !e || *e != '\0' || v < 0)
         {
           builtin_error ("colrm: bad column: %s", w);
           builtin_usage ();
@@ -751,12 +817,6 @@ colrm_builtin (WORD_LIST *list)
       n_pos++;
     }
   if (n_pos == 1) end = 0;          /* 0 == "to end-of-line" */
-  if (n_pos == 2 && end < start)
-    {
-      builtin_error ("colrm: END (%ld) < START (%ld)", end, start);
-      builtin_usage ();
-      return EX_USAGE;
-    }
 
   char *line = NULL;
   size_t cap = 0;
@@ -767,23 +827,57 @@ colrm_builtin (WORD_LIST *list)
     return EXECUTION_FAILURE;
   while ((got = bcol_getline (in, &line, &cap)) > 0)
     {
-      int has_nl = (line[got - 1] == '\n');
-      size_t dlen = has_nl ? (size_t) got - 1 : (size_t) got;
-      if (n_pos == 0)
+      if (start == 0)
         {
           fwrite (line, 1, (size_t) got, stdout);
           continue;
         }
-      if ((long) dlen < start)
+      long column = 0, trailing_pad = 0;
+      int removing = 0, tail = 0;
+      for (size_t pos = 0; pos < (size_t) got; )
         {
-          fwrite (line, 1, (size_t) got, stdout);
-          continue;
+          wchar_t wc;
+          int valid;
+          size_t n = bcol_character (line + pos, (size_t) got - pos,
+                                     &wc, &valid);
+          const char *text = line + pos;
+          pos += n;
+          if (wc == '\n')
+            { putchar ('\n'); column = trailing_pad = 0; removing = tail = 0; continue; }
+          if (tail)
+            {
+              for (long cell = 0; cell < trailing_pad; cell++)
+                putchar (' ');
+              trailing_pad = 0;
+              fwrite (text, 1, n, stdout);
+              continue;
+            }
+          long previous = column;
+          int width = valid ? wcwidth (wc) : 1;
+          if (wc == '\b')
+            { if (column > 0) column--; }
+          else if (wc == '\t')
+            column += 8 - column % 8;
+          else if (width > 0)
+            column += width;
+          if (!removing && column < start)
+            { fwrite (text, 1, n, stdout); continue; }
+          if (!removing)
+            {
+              /* Retain the part before START of a tab or wide glyph. */
+              for (long cell = previous; cell < start - 1; cell++)
+                putchar (' ');
+              removing = 1;
+            }
+          if (end && column >= end)
+            {
+              /* Right-side cells matter only when more text follows on
+                 this line. Do not materialize padding at newline or EOF.
+                 This also retains historical reversed-range padding. */
+              trailing_pad = column - end;
+              tail = 1;
+            }
         }
-      fwrite (line, 1, (size_t) (start - 1), stdout);
-      if (end > 0 && (long) dlen > end)
-        fwrite (line + end, 1, dlen - (size_t) end, stdout);
-      if (has_nl)
-        putchar ('\n');
     }
   if (got < 0)
     { builtin_error ("read: %s", strerror (errno)); rc = EXECUTION_FAILURE; }
@@ -840,11 +934,12 @@ char *col_doc[] = {
   "    col [-b] [FILE...]",
   "    col --help | --version",
   "",
-  "  -b   drop backspace and the byte it overstrikes (no overprint)",
+  "  -b   drop backspace and the character it overstrikes (no overprint)",
   "  -H, --help     show usage",
   "  -V, --version  show version",
   "",
-  "Without -b, backspace overstrike bytes are preserved. ESC and RI bytes are silently dropped.",
+  "Without -b, backspace overstrike bytes are preserved. Escape pairs and decoded C1 controls are dropped.",
+  "Invalid multibyte bytes are displayed as \\xNN.",
   (char *) NULL
 };
 
@@ -858,7 +953,7 @@ struct builtin col_struct = {
 };
 
 char *colrm_doc[] = {
-  "Remove byte-columns from each stdin line (util-linux colrm).",
+  "Remove display columns from each stdin line (util-linux colrm).",
   "",
   "    colrm [START [END]]",
   "    colrm --help | --version",
@@ -868,7 +963,9 @@ char *colrm_doc[] = {
   "  -h, --help     show usage",
   "  -V, --version  show version",
   "",
-  "Bytes (not display cells) are used for column counts.",
+  "Tabs use eight-column stops; backspaces retreat one display column.",
+  "Multibyte characters use locale display widths; partially removed cells become spaces.",
+  "START zero passes input through; END zero removes through end-of-line.",
   (char *) NULL
 };
 

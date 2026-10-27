@@ -8,9 +8,9 @@
  *
  * v1 scope: ext2-only superblock + group descriptors + block/inode
  * bitmaps + root directory + lost+found. No journal (ext3), no
- * extents / 64bit / dir_index / huge_file (ext4). The mkfs.ext2 +
- * mkfs.ext4 wrapper scripts both dispatch here; mkfs.ext4 prints a
- * one-line stderr warning that journal/extents are deferred to v2.
+ * extents / 64bit / huge_file (ext4). This builtin invokes no external
+ * tools and has no ext3/ext4 backend. The dir_index feature flag permits
+ * future indexing; the initial directories use ordinary linear entries.
  *
  * Subcommands:
  *     mkfs IMAGE [-L LABEL] [-b BLOCKSIZE] [-m PCT] [-F] [-n]
@@ -23,11 +23,9 @@
  *     -b BLOCKSIZE          1024 / 2048 / 4096. Default 1024.
  *     -m PCT                reserved-for-superuser percent (0..50).
  *                           Default 5.
- *     -F                    force; do not refuse if IMAGE is not a
- *                           regular file/block device or if it looks
- *                           already-formatted. v1 only really uses
- *                           the not-a-block-device gate; we trust the
- *                           operator otherwise.
+ *     -F                    accepted for mke2fs compatibility. Existing
+ *                           filesystems are replaced with or without it.
+ *                           Other file types are always refused.
  *     -n                    dry run; compute the layout and print the
  *                           summary but do not write.
  *
@@ -142,14 +140,11 @@ static int has_super (uint32_t g) {
    marked free. */
 static void mkfs_bitmap (unsigned char *bm, uint32_t bs,
                          uint32_t start, uint32_t end) {
-    uint32_t i;
     memset (bm, 0, bs);
-    i = start / 8;
-    memset (bm, 0xff, i);
-    bm[i] = (1u << (start & 7)) - 1;       /* low `start & 7` bits set */
-    i = end / 8;
-    bm[bs - i - 1] |= (uint8_t) (0x7f00 >> (end & 7));
-    memset (bm + bs - i, 0xff, i);
+    memset (bm, 0xff, start / 8);
+    if (start % 8) bm[start / 8] = (1u << (start % 8)) - 1;
+    memset (bm + bs - end / 8, 0xff, end / 8);
+    if (end % 8) bm[bs - end / 8 - 1] |= (uint8_t) (0xffu << (8 - end % 8));
 }
 
 /* pwrite()-loop that handles short writes and EINTR. */
@@ -213,14 +208,22 @@ int mkfs_builtin (WORD_LIST *list) {
     const char *label = "";
     unsigned blocksize = 1024;
     unsigned reserved_percent = 5;
-    int force = 0, dry_run = 0;
+    int dry_run = 0, end_options = 0;
 
     /* Parse args: positional IMAGE plus -L, -b, -m, -F, -n. */
     for (WORD_LIST *l = list; l; l = l->next) {
         const char *a = l->word->word;
-        if (a[0] == '-' && a[1] && a[2] == 0) {
+        if (!end_options && strcmp (a, "--") == 0) {
+            end_options = 1;
+            continue;
+        }
+        if (!end_options && a[0] == '-' && a[1]) {
+            if (a[2]) {
+                builtin_error ("unknown option: %s", a);
+                return EX_USAGE;
+            }
             switch (a[1]) {
-            case 'F': force = 1; continue;
+            case 'F': continue;
             case 'n': dry_run = 1; continue;
             case 'L': case 'b': case 'm': {
                 if (!l->next) {
@@ -233,8 +236,10 @@ int mkfs_builtin (WORD_LIST *list) {
                     label = v;
                 } else if (a[1] == 'b') {
                     char *e = NULL;
+                    errno = 0;
                     unsigned long bs = strtoul (v, &e, 10);
-                    if (!e || *e || (bs != 1024 && bs != 2048 && bs != 4096)) {
+                    if (v[0] < '0' || v[0] > '9' || errno || *e ||
+                        (bs != 1024 && bs != 2048 && bs != 4096)) {
                         builtin_error ("bad blocksize: %s "
                                        "(must be 1024, 2048, or 4096)", v);
                         return EX_USAGE;
@@ -242,8 +247,9 @@ int mkfs_builtin (WORD_LIST *list) {
                     blocksize = (unsigned) bs;
                 } else { /* 'm' */
                     char *e = NULL;
+                    errno = 0;
                     unsigned long pct = strtoul (v, &e, 10);
-                    if (!e || *e || pct > 50) {
+                    if (v[0] < '0' || v[0] > '9' || errno || *e || pct > 50) {
                         builtin_error ("bad reserved percent: %s "
                                        "(must be 0..50)", v);
                         return EX_USAGE;
@@ -273,9 +279,17 @@ int mkfs_builtin (WORD_LIST *list) {
     /* Open. For dry-run we still need fstat/BLKGETSIZE64 so open RW
        (or RO if dry-run); regular files: O_RDONLY suffices for
        dry-run; block devices: same. For non-dry-run, O_WRONLY. */
-    int fd = open (image, dry_run ? O_RDONLY : O_WRONLY);
+    int fd = open (image, (dry_run ? O_RDONLY : O_WRONLY) |
+                          O_CLOEXEC | O_NONBLOCK);
     if (fd < 0) {
         builtin_error ("%s: %s", image, strerror (errno));
+        return EXECUTION_FAILURE;
+    }
+
+    /* A closed stderr can make open() reuse fd 2. Do not let layout
+       diagnostics write into the image through that descriptor. */
+    if (fd == STDERR_FILENO) {
+        close (fd);
         return EXECUTION_FAILURE;
     }
 
@@ -284,10 +298,6 @@ int mkfs_builtin (WORD_LIST *list) {
     if (mkfs_devsize (fd, image, &devbytes, &is_block) < 0) {
         if (errno != EINVAL) {
             builtin_error ("%s: stat/ioctl: %s", image, strerror (errno));
-        }
-        if (!force && !is_block) {
-            /* Already errored above on non-reg/non-blk. */
-            close (fd); return EXECUTION_FAILURE;
         }
         close (fd); return EXECUTION_FAILURE;
     }
@@ -351,9 +361,26 @@ int mkfs_builtin (WORD_LIST *list) {
     uint32_t nreserved =
         (uint32_t) (((uint64_t) nblocks * reserved_percent) / 100u);
 
+    /* Validate every group before either reporting a viable dry run or
+       writing anything. A short final group may not fit its metadata. */
+    for (uint32_t i = 0; i < ngroups; i++) {
+        uint32_t pos = first_block + i * blocks_per_group;
+        uint32_t available = nblocks - pos;
+        if (available > blocks_per_group) available = blocks_per_group;
+        uint32_t overhead = (has_super (i) ? 1u + group_desc_blocks : 0u)
+                            + 2u + inode_table_blocks
+                            + (i == 0 ? 1u + laf_blocks : 0u);
+        if (overhead > available) {
+            builtin_error ("%s: group %u too small for metadata (%u < %u blocks)",
+                           image, i, available, overhead);
+            close (fd);
+            return EXECUTION_FAILURE;
+        }
+    }
+
     /* Print the layout summary (mimics mke2fs human-readable output;
        matches the busybox shape close enough for operator scripts). */
-    fprintf (stderr,
+    int summary = fprintf (stderr,
         "mkfs: %s\n"
         "  device size: %" PRIu64 " bytes (%s)\n"
         "  block size:  %u bytes\n"
@@ -365,10 +392,15 @@ int mkfs_builtin (WORD_LIST *list) {
         blocksize, nblocks, first_block, ngroups,
         inodes_per_group * ngroups, inodes_per_group, inodesize,
         nreserved, reserved_percent, label);
-    if (dry_run) {
+    if (summary < 0 || fflush (stderr) == EOF) {
         close (fd);
-        fprintf (stderr, "  (dry run; no write)\n");
-        return EXECUTION_SUCCESS;
+        return EXECUTION_FAILURE;
+    }
+    if (dry_run) {
+        int failed = fprintf (stderr, "  (dry run; no write)\n") < 0;
+        if (fflush (stderr) == EOF) failed = 1;
+        if (close (fd) < 0) failed = 1;
+        return failed ? EXECUTION_FAILURE : EXECUTION_SUCCESS;
     }
 
     /* Allocate scratch buffers. */
@@ -411,10 +443,7 @@ int mkfs_builtin (WORD_LIST *list) {
             used_dirs = 2;
             group_free_inodes -= EXT2_GOOD_OLD_FIRST_INO;
         }
-        uint32_t group_blocks =
-            (uint32_t) ((i + 1) * blocks_per_group + first_block <= nblocks
-                        ? blocks_per_group
-                        : (nblocks - i * blocks_per_group - first_block));
+        uint32_t group_blocks = nblocks - pos;
         if (group_blocks > blocks_per_group) group_blocks = blocks_per_group;
         if (overhead > group_blocks) {
             builtin_error ("internal: overhead (%u) > group_blocks (%u) "
@@ -521,9 +550,9 @@ int mkfs_builtin (WORD_LIST *list) {
     /* +208 s_journal_uuid (16); zeroed. */
     /* +224 s_journal_inum/dev (4+4); zeroed. */
     /* +232 s_last_orphan (4); zeroed. */
-    put_le32 (sb + 236, EXT2_HASH_HALF_MD4);                 /* s_def_hash_version */
-    /* s_hash_seed[4] at offset 220 (4 * 4 = 16 bytes). */
-    memcpy (sb + 220, hash_seed, 16);
+    sb[252] = EXT2_HASH_HALF_MD4;                           /* s_def_hash_version */
+    /* s_hash_seed[4] at offset 236; journal/orphan fields stay zero. */
+    memcpy (sb + 236, hash_seed, 16);
     put_le32 (sb + 352, EXT2_FLAGS_UNSIGNED_HASH);           /* s_flags */
 
     /* Write superblock + group descriptors to each "has_super"
@@ -619,7 +648,7 @@ int mkfs_builtin (WORD_LIST *list) {
         return EXECUTION_FAILURE;
     }
 
-    /* lost+found inode #11: dir mode 0755, links_count = 2,
+    /* lost+found inode #11: dir mode 0700, links_count = 2,
        size = laf_blocks * blocksize, pointers at i_block[0..laf-1]. */
     memset (inode, 0, sizeof inode);
     put_le16 (inode +  0, 040700);                       /* S_IFDIR | 0700 */
@@ -671,8 +700,7 @@ int mkfs_builtin (WORD_LIST *list) {
     }
 
     /* Build the lost+found dir block: { ".", ".." } in block 0; all
-       subsequent blocks are zeroed (filesystem-check fodder, never
-       inspected by the kernel on mount). */
+       subsequent blocks contain one unused entry spanning the block. */
     memset (buf, 0, blocksize);
     put_le32 (buf +  0, EXT2_GOOD_OLD_FIRST_INO);
     put_le16 (buf +  4, 12);
@@ -686,8 +714,9 @@ int mkfs_builtin (WORD_LIST *list) {
         free (sb); free (gd); free (buf); close (fd);
         return EXECUTION_FAILURE;
     }
-    /* Zero any remaining lost+found blocks. */
+    /* An empty directory block still needs a valid record length. */
     memset (buf, 0, blocksize);
+    put_le16 (buf + 4, (uint16_t) blocksize);
     for (uint32_t i = 1; i < laf_blocks; i++) {
         if (mkfs_pwrite (fd, buf, blocksize,
                          (off_t) (gd0_it_pos + inode_table_blocks + 1u + i)
@@ -703,7 +732,7 @@ int mkfs_builtin (WORD_LIST *list) {
        (block-device writes are non-buffered for the FS but page-cache
        pwrite to a regular file backing a loop device needs a flush
        before losetup --find --show + mount). */
-    if (fsync (fd) < 0 && errno != EINVAL) {
+    if (fsync (fd) < 0) {
         builtin_error ("fsync: %s", strerror (errno));
         free (sb); free (gd); free (buf); close (fd);
         return EXECUTION_FAILURE;
@@ -713,7 +742,6 @@ int mkfs_builtin (WORD_LIST *list) {
         builtin_error ("close: %s", strerror (errno));
         return EXECUTION_FAILURE;
     }
-    (void) force;       /* currently only the parse path uses it */
     return EXECUTION_SUCCESS;
 }
 
@@ -729,11 +757,11 @@ char *mkfs_doc[] = {
     "",
     "v1 produces ext2-only layout (no journal, no extents, no",
     "dir_index hash). The on-disk result mounts under both 'ext2'",
-    "and 'ext4' kernel drivers; mkfs.ext4 sibling wrapper prints a",
-    "one-line warning that ext4-specific features are deferred to v2.",
+    "and 'ext4' kernel drivers. No external formatter is required.",
     "",
-    "Use -n for a dry-run summary; -F to force formatting of a",
-    "non-block, non-regular file.",
+    "Use -n for a dry-run summary. -F is accepted for compatibility;",
+    "only regular files and block devices are supported. Existing",
+    "filesystems are replaced. Use -- before a dash-prefixed IMAGE.",
     (char *) NULL
 };
 

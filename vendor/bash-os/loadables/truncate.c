@@ -140,36 +140,36 @@ truncate_builtin (WORD_LIST *list)
             block_mode = 1; list = list->next; continue;
         }
         if (!strcmp (w, "-s")) {
-            if (!list->next) { builtin_error ("-s needs SIZE"); builtin_usage (); return EX_USAGE; }
+            if (!list->next) { builtin_error ("-s needs SIZE"); builtin_usage (); return EXECUTION_FAILURE; }
             list = list->next; sval = list->word->word;
         } else if (!strncmp (w, "--size=", 7)) {
             sval = w + 7;
         } else if (!strcmp (w, "--size")) {
-            if (!list->next) { builtin_error ("--size needs SIZE"); builtin_usage (); return EX_USAGE; }
+            if (!list->next) { builtin_error ("--size needs SIZE"); builtin_usage (); return EXECUTION_FAILURE; }
             list = list->next; sval = list->word->word;
         } else if (!strcmp (w, "-r")) {
-            if (!list->next) { builtin_error ("-r needs REF"); builtin_usage (); return EX_USAGE; }
+            if (!list->next) { builtin_error ("-r needs REF"); builtin_usage (); return EXECUTION_FAILURE; }
             list = list->next; rval = list->word->word;
         } else if (!strncmp (w, "--reference=", 12)) {
             rval = w + 12;
         } else if (!strcmp (w, "--reference")) {
-            if (!list->next) { builtin_error ("--reference needs REF"); builtin_usage (); return EX_USAGE; }
+            if (!list->next) { builtin_error ("--reference needs REF"); builtin_usage (); return EXECUTION_FAILURE; }
             list = list->next; rval = list->word->word;
         } else {
             builtin_error ("unknown flag: %s", w);
             builtin_usage ();
-            return EX_USAGE;
+            return EXECUTION_FAILURE;
         }
 
         if (sval) {
             if (bt_parse_size (sval, &mode, &mag) < 0) {
                 builtin_error ("invalid number: %s", sval);
                 builtin_usage ();
-                return EX_USAGE;
+                return EXECUTION_FAILURE;
             }
             if ((mode == RM_RDN || mode == RM_RUP) && mag == 0) {
                 builtin_error ("division by zero");
-                return EX_USAGE;
+                return EXECUTION_FAILURE;
             }
             got_size = 1;
         }
@@ -181,18 +181,18 @@ truncate_builtin (WORD_LIST *list)
     if (!ref && !got_size) {
         builtin_error ("you must specify either --size or --reference");
         builtin_usage ();
-        return EX_USAGE;
+        return EXECUTION_FAILURE;
     }
     /* GNU: a reference file combined with -s requires a relative modifier. */
     if (ref && got_size && mode == RM_ABS) {
         builtin_error ("you must specify a relative '--size' with '--reference'");
         builtin_usage ();
-        return EX_USAGE;
+        return EXECUTION_FAILURE;
     }
     if (!list) {
         builtin_error ("missing file operand");
         builtin_usage ();
-        return EX_USAGE;
+        return EXECUTION_FAILURE;
     }
 
     /* Resolve the reference base size (used as fsize for relative modes, and

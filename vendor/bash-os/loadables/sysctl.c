@@ -197,6 +197,8 @@ bsc_read_key (const char *display_name, const char *fspath, int flags)
      * read; the key must still exist (F_OK), so typos are reported. */
     if (flags & BSC_F_NAMES_ONLY) {
         if (access (fspath, F_OK) != 0) {
+            if (errno == ENOENT && !(flags & BSC_F_SHOW_KEY_ERROR))
+                return EXECUTION_SUCCESS;
             if (flags & BSC_F_SHOW_KEY_ERROR)
                 builtin_error ("'%s' is an unknown key", display_name);
             return EXECUTION_FAILURE;
@@ -208,6 +210,8 @@ bsc_read_key (const char *display_name, const char *fspath, int flags)
     int fd = open (fspath, O_RDONLY | O_CLOEXEC);
     if (fd < 0) {
         if (errno == ENOENT) {
+            if (!(flags & BSC_F_SHOW_KEY_ERROR))
+                return EXECUTION_SUCCESS;
             if (flags & BSC_F_SHOW_KEY_ERROR)
                 builtin_error ("'%s' is an unknown key", display_name);
             return EXECUTION_FAILURE;
@@ -260,6 +264,8 @@ bsc_write_key (const char *display_name, const char *fspath,
 
     int fd = open (fspath, O_WRONLY | O_CLOEXEC);
     if (fd < 0) {
+        if (errno == ENOENT && !(flags & BSC_F_SHOW_KEY_ERROR))
+            return EXECUTION_SUCCESS;
         if (bsc_is_known_readonly_key (display_name))
             builtin_error ("'%s' is a known read-only key", display_name);
         else if (errno == ENOENT && (flags & BSC_F_SHOW_KEY_ERROR))

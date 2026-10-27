@@ -75,6 +75,7 @@ typedef struct {
     const char *fs;
     const char *type;
     const char *path;
+    const char *file;
     uint64_t total, used, avail;
     uint64_t inodes, iused, ifree;
     int use_pct, iuse_pct;
@@ -291,7 +292,7 @@ bdf_parse_output (const char *spec, bdf_opts *o)
     char *copy, *tok, *save;
 
     o->output_count = 0;
-    if (spec == NULL || *spec == '\0') {
+    if (spec == NULL) {
         int defaults[] = { BDF_OUT_SOURCE, BDF_OUT_SIZE, BDF_OUT_USED,
                            BDF_OUT_AVAIL, BDF_OUT_PCENT, BDF_OUT_TARGET };
         for (size_t i = 0; i < sizeof defaults / sizeof defaults[0]; i++)
@@ -299,6 +300,10 @@ bdf_parse_output (const char *spec, bdf_opts *o)
                 return -1;
         return 0;
     }
+    /* strtok_r skips empty fields, but GNU df rejects them. */
+    if (*spec == '\0' || *spec == ',' || spec[strlen (spec) - 1] == ','
+        || strstr (spec, ",,") != NULL)
+        return -1;
 
     copy = strdup (spec);
     if (copy == NULL)
@@ -321,11 +326,16 @@ bdf_find_mount_info (const char *path, char *fs, size_t fssz,
     struct stat pst;
     if (stat (path, &pst) < 0)
         return -1;
+    char *resolved = realpath (path, NULL);
+    if (resolved == NULL)
+        return -1;
 
     FILE *mp = fopen ("/proc/mounts", "r");
     if (!mp) mp = fopen ("/proc/self/mounts", "r");
-    if (!mp)
+    if (!mp) {
+        free (resolved);
         return -1;
+    }
 
     int found = 0;
     size_t best_len = 0;
@@ -338,11 +348,16 @@ bdf_find_mount_info (const char *path, char *fs, size_t fssz,
         bdf_unescape (dev);
         bdf_unescape (cur_mnt);
         bdf_unescape (cur_type);
+        size_t len = strlen (cur_mnt);
+        /* Bind mounts can share st_dev with unrelated mount points. Only
+           consider mount points containing the canonical operand, with a
+           component boundary (and '/' containing every absolute path). */
+        if (strncmp (resolved, cur_mnt, len) != 0
+            || (len != 1 && resolved[len] != '\0' && resolved[len] != '/'))
+            continue;
         if (stat (cur_mnt, &mst) < 0 || mst.st_dev != pst.st_dev)
             continue;
-
-        size_t len = strlen (cur_mnt);
-        if (!found || len > best_len) {
+        if (!found || len >= best_len) {
             snprintf (fs, fssz, "%s", dev);
             snprintf (type, typesz, "%s", cur_type);
             snprintf (mnt, mntsz, "%s", cur_mnt);
@@ -351,6 +366,7 @@ bdf_find_mount_info (const char *path, char *fs, size_t fssz,
         }
     }
     fclose (mp);
+    free (resolved);
     return found ? 0 : -1;
 }
 
@@ -370,6 +386,7 @@ bdf_fill_row (const char *path, const char *fs, const char *type, bdf_row *row)
     row->fs = fs;
     row->type = type;
     row->path = path;
+    row->file = path;
     row->total = (uint64_t) vfs.f_blocks * bsize;
     row->avail = (uint64_t) vfs.f_bavail * bsize;
     row->used = row->total - (uint64_t) vfs.f_bfree * bsize;
@@ -422,7 +439,7 @@ bdf_output_value (const bdf_row *row, const bdf_opts *o, int field, char *out, s
     case BDF_OUT_USED: bdf_format_space (row->used, o, out, outsz); break;
     case BDF_OUT_AVAIL: bdf_format_space (row->avail, o, out, outsz); break;
     case BDF_OUT_PCENT: snprintf (out, outsz, "%d%%", row->use_pct); break;
-    case BDF_OUT_FILE: snprintf (out, outsz, "%s", row->path); break;
+    case BDF_OUT_FILE: snprintf (out, outsz, "%s", row->file); break;
     case BDF_OUT_TARGET: snprintf (out, outsz, "%s", row->path); break;
     case BDF_OUT_ITOTAL: snprintf (out, outsz, "%" PRIu64, row->inodes); break;
     case BDF_OUT_IUSED: snprintf (out, outsz, "%" PRIu64, row->iused); break;
@@ -445,8 +462,19 @@ bdf_print_output_row (const bdf_row *row, const bdf_opts *o)
 {
     char val[64];
     for (int i = 0; i < o->output_count; i++) {
-        bdf_output_value (row, o, o->output_fields[i], val, sizeof val);
-        printf ("%s%s", i ? " " : "", val);
+        const char *value;
+        /* Path and source fields need not fit in the numeric buffer. */
+        switch (o->output_fields[i]) {
+        case BDF_OUT_SOURCE: value = row->fs; break;
+        case BDF_OUT_FSTYPE: value = row->type; break;
+        case BDF_OUT_FILE: value = row->file; break;
+        case BDF_OUT_TARGET: value = row->path; break;
+        default:
+            bdf_output_value (row, o, o->output_fields[i], val, sizeof val);
+            value = val;
+            break;
+        }
+        printf ("%s%s", i ? " " : "", value);
     }
     putchar ('\n');
 }
@@ -531,6 +559,7 @@ bdf_total_add (bdf_row *total, const bdf_row *row)
     total->fs = "total";
     total->type = "-";
     total->path = "-";
+    total->file = "-";
     total->total += row->total;
     total->used += row->used;
     total->avail += row->avail;
@@ -546,13 +575,14 @@ bdf_total_add (bdf_row *total, const bdf_row *row)
 }
 
 static int
-bdf_one (const char *path, const char *fs, const char *type,
+bdf_one (const char *path, const char *fs, const char *type, const char *target,
          const bdf_opts *o, int *header_emitted, bdf_row *total)
 {
     bdf_row row;
 
     if (bdf_fill_row (path, fs, type, &row) < 0)
         return -1;
+    row.path = target;
     if (!*header_emitted) {
         if (o->output_count)
             bdf_print_output_header (o);
@@ -623,28 +653,28 @@ df_builtin (WORD_LIST *list)
         if (strcmp (w, "--output") == 0) {
             if (bdf_parse_output (NULL, &o) < 0) {
                 builtin_error ("--output: invalid field list");
-                return EX_USAGE;
+                return EXECUTION_FAILURE;
             }
             continue;
         }
         if (strncmp (w, "--output=", 9) == 0) {
             if (bdf_parse_output (w + 9, &o) < 0) {
                 builtin_error ("--output: invalid field list");
-                return EX_USAGE;
+                return EXECUTION_FAILURE;
             }
             continue;
         }
         if (strncmp (w, "--block-size=", 13) == 0) {
             if (bdf_parse_block_size (w + 13, &o) < 0) {
                 builtin_error ("--block-size: invalid size");
-                return EX_USAGE;
+                return EXECUTION_FAILURE;
             }
             continue;
         }
         if (strcmp (w, "--block-size") == 0) {
             if (p->next == NULL || bdf_parse_block_size (p->next->word->word, &o) < 0) {
                 builtin_error ("--block-size: invalid size");
-                return EX_USAGE;
+                return EXECUTION_FAILURE;
             }
             p = p->next;
             continue;
@@ -730,13 +760,13 @@ df_builtin (WORD_LIST *list)
                     if (w[i + 1]) {
                         if (bdf_parse_block_size (w + i + 1, &o) < 0) {
                             builtin_error ("-B: invalid size");
-                            return EX_USAGE;
+                            return EXECUTION_FAILURE;
                         }
                         i = (int) strlen (w) - 1;
                     } else {
                         if (p->next == NULL || bdf_parse_block_size (p->next->word->word, &o) < 0) {
                             builtin_error ("-B: invalid size");
-                            return EX_USAGE;
+                            return EXECUTION_FAILURE;
                         }
                         p = p->next;
                     }
@@ -805,6 +835,12 @@ df_builtin (WORD_LIST *list)
         /* Per-path mode. */
         for (int i = 0; i < positional.n; i++) {
             char fs[512], type[64], mnt[512];
+            struct stat st;
+            if (stat (positional.v[i], &st) < 0) {
+                builtin_error ("%s: %s", positional.v[i], strerror (errno));
+                rc = EXECUTION_FAILURE;
+                continue;
+            }
             const char *display_fs = positional.v[i];
             const char *display_type = "";
             const char *display_path = positional.v[i];
@@ -817,8 +853,13 @@ df_builtin (WORD_LIST *list)
                 continue;
             if (bdf_type_excluded (&o, display_type))
                 continue;
-            if (bdf_one (display_path, display_fs, display_type, &o, &header_emitted, totalp) < 0)
+            if (bdf_one (positional.v[i], display_fs, display_type, display_path,
+                         &o, &header_emitted, totalp) < 0)
                 rc = EXECUTION_FAILURE;
+        }
+        if (!header_emitted && rc == EXECUTION_SUCCESS) {
+            builtin_error ("no file systems processed");
+            rc = EXECUTION_FAILURE;
         }
         if (o.totalflag && header_emitted)
             bdf_print_total (&o, &total);
@@ -858,7 +899,7 @@ df_builtin (WORD_LIST *list)
             || strcmp (type, "securityfs") == 0 || strcmp (type, "tracefs") == 0
             || strcmp (type, "bpf") == 0 || strcmp (type, "autofs") == 0))
             continue;
-        if (bdf_one (mnt, dev, type, &o, &header_emitted, totalp) < 0)
+        if (bdf_one (mnt, dev, type, mnt, &o, &header_emitted, totalp) < 0)
             rc = EXECUTION_FAILURE;
     }
     fclose (mp);

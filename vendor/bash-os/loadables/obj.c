@@ -1,28 +1,27 @@
 /* SPDX-License-Identifier: MIT */
-/* obj.c — git object access (loose, read-only at v1).
+/* obj.c — git object access.
  *
- * Phase W W-1a of bash-os git primitives. Reads loose objects from
- * <repo>/.git/objects/<aa>/<bbbb...> (zlib-compressed; header
- * "<type> <size>\0" + payload). Pack access is handled by pack.
+ * The object store lives in _git/: odb.c holds the loose format and hashing,
+ * store.c looks an object up across loose objects, every pack and the
+ * alternates, and repo.c finds the repository. This file is the command
+ * surface over them, so `obj cat` reads an object whether it is loose or in a
+ * pack, in a worktree, a linked worktree or a bare repository.
  *
  * Verbs:
  *   obj cat SHA [-r REPO] [-V VAR]
- *       Inflate object, strip header, emit content. -V binds to a
- *       bash variable (truncates at NUL — use -X for binary content).
+ *       Emit object content. -V binds to a bash variable (truncates at NUL
+ *       — use the stdout form for binary content).
  *
  *   obj --batch|--batch-check [-r REPO]
  *       Read object names from stdin and emit git cat-file compatible
  *       batch records.
  *
- *   obj type SHA [-r REPO]
- *       Print the type token (blob/tree/commit/tag).
+ *   obj type|size SHA [-r REPO]
+ *       Print the type token (blob/tree/commit/tag), or the content size.
  *
- *   obj size SHA [-r REPO]
- *       Print the content size in bytes.
- *
- *   obj parse-tree SHA [-r REPO] [-V VAR]
- *       Emit each tree entry as "<mode> <name> <sha>" line. With -V,
- *       binds a bash array (one element per entry).
+ *   obj parse-tree SHA [-r REPO] [-V VAR] [-z]
+ *       Emit each tree entry as "<mode> <name> <sha>". With -V, binds a bash
+ *       array (one element per entry).
  *
  *   obj parse-commit SHA [-r REPO] [-V VAR]
  *       Emit commit fields one per line: "tree <sha>", "parent <sha>"
@@ -31,8 +30,12 @@
  *       <PFX>_parents (space-joined), <PFX>_author, <PFX>_committer,
  *       <PFX>_message.
  *
- *   -r REPO   repo root (containing .git/). Defaults to cwd; if cwd
- *             has no .git/, walks parents like real git.
+ *   obj hash|blob|tree|commit|tag
+ *       Hash and write objects; see obj_doc below.
+ *
+ *   -r REPO   a worktree, a bare repository, or a git directory. Defaults to
+ *             the repository containing the current directory, found as git
+ *             does, following a .git file to its target.
  *
  * --- LICENSE ---
  * MIT License — same boilerplate as binhex.c.
@@ -49,264 +52,19 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/stat.h>
-#include <dirent.h>
-#include <ctype.h>
 #include <time.h>
-#include <zlib.h>
-
-/* sha1dc — collision-detecting SHA-1. Vendored under _sha1dc/, flattened
-   to builtins/_sha1dc_*.{c,h} by patch-bash-loadables.sh at build time. */
-#include "_sha1dc_sha1.h"
 
 #include "loadables.h"
 #include "arrayfunc.h"
+
+#include "_git_odb.h"
+#include "_git_repo.h"
 
 /* git cat-file exits 128 ("fatal") on a missing/unresolvable/malformed
    object. We match that for object-read failures so scripts that branch on
    `$?` behave identically against git and obj. Usage errors keep
    EX_USAGE; this is only for the object-read/resolve paths. */
 #define BO_EX_FATAL 128
-
-/* Object types. */
-enum bo_type { BO_BLOB, BO_TREE, BO_COMMIT, BO_TAG, BO_UNKNOWN };
-
-static const char *
-bo_type_name (enum bo_type t)
-{
-    switch (t) {
-    case BO_BLOB:   return "blob";
-    case BO_TREE:   return "tree";
-    case BO_COMMIT: return "commit";
-    case BO_TAG:    return "tag";
-    default:        return "unknown";
-    }
-}
-
-static int
-bo_type_valid_name (const char *name)
-{
-    return (strcmp (name, "blob") == 0
-            || strcmp (name, "tree") == 0
-            || strcmp (name, "commit") == 0
-            || strcmp (name, "tag") == 0);
-}
-
-static int
-bo_type_literally_acceptable (const char *name)
-{
-    if (!name || !*name)
-        return 0;
-    for (const unsigned char *p = (const unsigned char *) name; *p; p++)
-        if (*p <= ' ' || *p == 0x7f)
-            return 0;
-    return 1;
-}
-
-/* Walk parent dirs from `start` looking for a .git/. Returns malloc'd
-   path to the repo root (parent of .git/), or NULL. */
-static char *
-bor_find_repo (const char *start)
-{
-    char *cur = realpath (start, NULL);
-    if (!cur) return NULL;
-    while (1) {
-        char probe[4096];
-        snprintf (probe, sizeof probe, "%s/.git", cur);
-        struct stat st;
-        if (stat (probe, &st) == 0 && S_ISDIR (st.st_mode)) return cur;
-        /* Walk up. */
-        char *slash = strrchr (cur, '/');
-        if (!slash || slash == cur) { free (cur); return NULL; }
-        *slash = '\0';
-    }
-}
-
-/* Return 1 if `s` is non-empty and entirely lowercase/uppercase hex. */
-static int
-bor_all_hex (const char *s)
-{
-    if (!s || !*s)
-        return 0;
-    for (const char *p = s; *p; p++)
-        if (!isxdigit ((unsigned char) *p))
-            return 0;
-    return 1;
-}
-
-/* Resolve a possibly-abbreviated hex object name to its full 40-char SHA by
-   scanning the loose-object store (<repo>/.git/objects/<aa>/<rest...>),
-   mirroring `git cat-file`'s unique-prefix rule. `sha` is full hex (length
-   4..40). On success writes 40 hex chars + NUL into full[41] and returns 0.
-   On ambiguous/none/error emits a git-style message and returns -1. */
-static int
-bor_resolve_prefix (const char *repo, const char *sha, char full[41])
-{
-    size_t slen = strlen (sha);
-    if (slen == 40) {
-        memcpy (full, sha, 40);
-        full[40] = '\0';
-        return 0;
-    }
-    /* git's minimum abbreviation is 4 hex; shorter is rejected. */
-    if (slen < 4) {
-        builtin_error ("Not a valid object name %s", sha);
-        return -1;
-    }
-    char dir[4096];
-    snprintf (dir, sizeof dir, "%s/.git/objects/%c%c", repo, sha[0], sha[1]);
-    DIR *d = opendir (dir);
-    if (!d) {
-        builtin_error ("Not a valid object name %s", sha);
-        return -1;
-    }
-    const char *rest = sha + 2;          /* prefix to match against filenames */
-    size_t restlen = slen - 2;
-    int matches = 0;
-    char hit[39] = "";                   /* the matched filename (38 hex + NUL) */
-    struct dirent *de;
-    while ((de = readdir (d)) != NULL) {
-        if (de->d_name[0] == '.')
-            continue;
-        if (strlen (de->d_name) != 38)   /* loose-object basename length */
-            continue;
-        if (strncmp (de->d_name, rest, restlen) == 0) {
-            if (matches == 0) {
-                memcpy (hit, de->d_name, 38);
-                hit[38] = '\0';
-            }
-            matches++;
-            if (matches > 1)
-                break;
-        }
-    }
-    closedir (d);
-    if (matches == 0) {
-        builtin_error ("Not a valid object name %s", sha);
-        return -1;
-    }
-    if (matches > 1) {
-        builtin_error ("ambiguous argument '%s': unknown revision or object name", sha);
-        return -1;
-    }
-    full[0] = sha[0];
-    full[1] = sha[1];
-    memcpy (full + 2, hit, 38);
-    full[40] = '\0';
-    return 0;
-}
-
-/* Read a loose object file at <repo>/.git/objects/<aa>/<bbbb...> and
-   return inflated bytes. Caller frees out. Accepts a full 40-char SHA or a
-   unique hex prefix (>= 4 chars), resolving the latter against the store. */
-static int
-bor_read_loose (const char *repo, const char *sha_in,
-                unsigned char **out, size_t *out_len)
-{
-    if (!bor_all_hex (sha_in) || strlen (sha_in) > 40) {
-        builtin_error ("invalid sha: %s", sha_in);
-        return -1;
-    }
-    char sha[41];
-    if (bor_resolve_prefix (repo, sha_in, sha) < 0)
-        return -1;
-    char path[4096];
-    snprintf (path, sizeof path, "%s/.git/objects/%c%c/%s",
-              repo, sha[0], sha[1], sha + 2);
-    int fd = open (path, O_RDONLY);
-    if (fd < 0) {
-        builtin_error ("loose object %s: %s", sha, strerror (errno));
-        return -1;
-    }
-    /* Stat for size; mmap would be nice but read+inflate is simpler. */
-    struct stat st;
-    if (fstat (fd, &st) < 0) { close (fd); return -1; }
-    unsigned char *raw = malloc ((size_t) st.st_size);
-    if (!raw) { close (fd); return -1; }
-    ssize_t got = 0;
-    while (got < st.st_size) {
-        ssize_t r = read (fd, raw + got, (size_t) (st.st_size - got));
-        if (r < 0) {
-            if (errno == EINTR) continue;
-            builtin_error ("read loose: %s", strerror (errno));
-            free (raw); close (fd); return -1;
-        }
-        if (r == 0) break;
-        got += r;
-    }
-    close (fd);
-
-    /* Inflate. Loose objects use zlib format (window bits 15). */
-    z_stream s = {0};
-    if (inflateInit (&s) != Z_OK) {
-        builtin_error ("zlib init failed");
-        free (raw);
-        return -1;
-    }
-    s.next_in = raw;
-    s.avail_in = (uInt) got;
-    size_t cap = (size_t) got * 4 + 256;
-    unsigned char *buf = malloc (cap);
-    size_t total = 0;
-    int z_rc;
-    do {
-        if (total + 4096 > cap) {
-            cap = cap * 2 + 4096;
-            unsigned char *nb = realloc (buf, cap);
-            if (!nb) { free (buf); free (raw); inflateEnd (&s); return -1; }
-            buf = nb;
-        }
-        s.next_out = buf + total;
-        s.avail_out = (uInt) (cap - total);
-        z_rc = inflate (&s, Z_NO_FLUSH);
-        if (z_rc != Z_OK && z_rc != Z_STREAM_END) {
-            builtin_error ("zlib inflate failed: %s", s.msg ? s.msg : "?");
-            free (buf); free (raw); inflateEnd (&s); return -1;
-        }
-        total = cap - s.avail_out;
-    } while (z_rc != Z_STREAM_END);
-    inflateEnd (&s);
-    free (raw);
-    *out = buf;
-    *out_len = total;
-    return 0;
-}
-
-static int
-bor_loose_path_exists (const char *repo, const char sha[41])
-{
-    char path[4096];
-    snprintf (path, sizeof path, "%s/.git/objects/%c%c/%s",
-              repo, sha[0], sha[1], sha + 2);
-    return access (path, R_OK) == 0;
-}
-
-/* Parse "<type> <size>\0" header. Returns offset of NUL+1 (start of
-   payload), or -1 on parse error. */
-static long
-bor_parse_header (const unsigned char *data, size_t len,
-                  enum bo_type *type, size_t *payload_size)
-{
-    /* Find space. */
-    size_t i = 0;
-    while (i < len && data[i] != ' ') i++;
-    if (i >= len) return -1;
-    if (i == 4 && memcmp (data, "blob", 4) == 0)        *type = BO_BLOB;
-    else if (i == 4 && memcmp (data, "tree", 4) == 0)   *type = BO_TREE;
-    else if (i == 6 && memcmp (data, "commit", 6) == 0) *type = BO_COMMIT;
-    else if (i == 3 && memcmp (data, "tag", 3) == 0)    *type = BO_TAG;
-    else                                                return -1;
-    /* Parse size up to NUL. */
-    size_t j = i + 1;
-    size_t sz = 0;
-    while (j < len && data[j] != '\0') {
-        if (data[j] < '0' || data[j] > '9') return -1;
-        sz = sz * 10 + (size_t) (data[j] - '0');
-        j++;
-    }
-    if (j >= len) return -1;
-    *payload_size = sz;
-    return (long) (j + 1);
-}
 
 /* ---- arg parsing helpers ---- */
 
@@ -347,25 +105,31 @@ bor_parse_args (WORD_LIST *args, bor_args *out)
     return 0;
 }
 
-/* Resolve repo: -r REPO if given, else find from cwd. Returns malloc'd
-   path; caller frees. */
-static char *
-bor_resolve_repo (const bor_args *a)
+/* Open the repository REPO_ARG names, or the one containing the current
+   directory, together with its object store. */
+static int
+bor_open (const char *repo_arg, bgit_repo *repo, bgit_odb *odb)
 {
-    if (a->repo_arg) {
-        /* Verify .git/ exists. */
-        char probe[4096];
-        snprintf (probe, sizeof probe, "%s/.git", a->repo_arg);
-        struct stat st;
-        if (stat (probe, &st) != 0 || !S_ISDIR (st.st_mode)) {
-            builtin_error ("not a git repo: %s", a->repo_arg);
-            return NULL;
-        }
-        return strdup (a->repo_arg);
+    int rc = repo_arg ? bgit_repo_open (repo_arg, repo)
+                      : bgit_repo_discover (".", repo);
+    if (rc < 0) {
+        if (repo_arg) builtin_error ("not a git repo: %s", repo_arg);
+        else          builtin_error ("not in a git repo");
+        return -1;
     }
-    char *r = bor_find_repo (".");
-    if (!r) builtin_error ("not in a git repo");
-    return r;
+    if (bgit_odb_open (repo, odb) < 0) {
+        builtin_error ("cannot read the object store of %s", repo->git_dir);
+        bgit_repo_release (repo);
+        return -1;
+    }
+    return 0;
+}
+
+static void
+bor_close (bgit_repo *repo, bgit_odb *odb)
+{
+    bgit_odb_release (odb);
+    bgit_repo_release (repo);
 }
 
 /* ---- verb implementations ---- */
@@ -375,31 +139,30 @@ bor_cat_cmd (WORD_LIST *args)
 {
     bor_args a;
     if (bor_parse_args (args, &a) < 0) return EX_USAGE;
-    char *repo = bor_resolve_repo (&a);
-    if (!repo) return BO_EX_FATAL;
+    bgit_repo repo; bgit_odb odb;
+    if (bor_open (a.repo_arg, &repo, &odb) < 0) return BO_EX_FATAL;
 
-    unsigned char *obj; size_t olen;
-    if (bor_read_loose (repo, a.sha, &obj, &olen) < 0) {
-        free (repo); return BO_EX_FATAL;
-    }
-    free (repo);
-    enum bo_type type; size_t psize;
-    long off = bor_parse_header (obj, olen, &type, &psize);
-    if (off < 0) {
-        builtin_error ("malformed object header");
-        free (obj); return BO_EX_FATAL;
+    enum bgit_type type;
+    unsigned char *data;
+    size_t len;
+    if (bgit_odb_read (&odb, a.sha, &type, &data, &len) < 0) {
+        bor_close (&repo, &odb);
+        return BO_EX_FATAL;
     }
     if (a.var) {
         /* NUL-truncated, but useful for blobs / commit messages. */
-        char *s = malloc (psize + 1);
-        memcpy (s, obj + off, psize);
-        s[psize] = '\0';
-        builtin_bind_variable ((char *) a.var, s, 0);
-        free (s);
+        char *s = malloc (len + 1);
+        if (s) {
+            memcpy (s, data, len);
+            s[len] = '\0';
+            builtin_bind_variable ((char *) a.var, s, 0);
+            free (s);
+        }
     } else {
-        fwrite (obj + off, 1, psize, stdout);
+        fwrite (data, 1, len, stdout);
     }
-    free (obj);
+    free (data);
+    bor_close (&repo, &odb);
     return EXECUTION_SUCCESS;
 }
 
@@ -408,21 +171,19 @@ bor_type_cmd (WORD_LIST *args)
 {
     bor_args a;
     if (bor_parse_args (args, &a) < 0) return EX_USAGE;
-    char *repo = bor_resolve_repo (&a);
-    if (!repo) return BO_EX_FATAL;
+    bgit_repo repo; bgit_odb odb;
+    if (bor_open (a.repo_arg, &repo, &odb) < 0) return BO_EX_FATAL;
 
-    unsigned char *obj; size_t olen;
-    if (bor_read_loose (repo, a.sha, &obj, &olen) < 0) {
-        free (repo); return BO_EX_FATAL;
+    enum bgit_type type;
+    unsigned char *data;
+    size_t len;
+    if (bgit_odb_read (&odb, a.sha, &type, &data, &len) < 0) {
+        bor_close (&repo, &odb);
+        return BO_EX_FATAL;
     }
-    free (repo);
-    enum bo_type type; size_t psize;
-    if (bor_parse_header (obj, olen, &type, &psize) < 0) {
-        builtin_error ("malformed object header");
-        free (obj); return BO_EX_FATAL;
-    }
-    printf ("%s\n", bo_type_name (type));
-    free (obj);
+    printf ("%s\n", bgit_type_name (type));
+    free (data);
+    bor_close (&repo, &odb);
     return EXECUTION_SUCCESS;
 }
 
@@ -431,21 +192,19 @@ bor_size_cmd (WORD_LIST *args)
 {
     bor_args a;
     if (bor_parse_args (args, &a) < 0) return EX_USAGE;
-    char *repo = bor_resolve_repo (&a);
-    if (!repo) return BO_EX_FATAL;
+    bgit_repo repo; bgit_odb odb;
+    if (bor_open (a.repo_arg, &repo, &odb) < 0) return BO_EX_FATAL;
 
-    unsigned char *obj; size_t olen;
-    if (bor_read_loose (repo, a.sha, &obj, &olen) < 0) {
-        free (repo); return BO_EX_FATAL;
+    enum bgit_type type;
+    unsigned char *data;
+    size_t len;
+    if (bgit_odb_read (&odb, a.sha, &type, &data, &len) < 0) {
+        bor_close (&repo, &odb);
+        return BO_EX_FATAL;
     }
-    free (repo);
-    enum bo_type type; size_t psize;
-    if (bor_parse_header (obj, olen, &type, &psize) < 0) {
-        builtin_error ("malformed object header");
-        free (obj); return BO_EX_FATAL;
-    }
-    printf ("%zu\n", psize);
-    free (obj);
+    printf ("%zu\n", len);
+    free (data);
+    bor_close (&repo, &odb);
     return EXECUTION_SUCCESS;
 }
 
@@ -466,11 +225,8 @@ bor_batch_cmd (WORD_LIST *args, int emit_content)
         }
     }
 
-    bor_args a;
-    memset (&a, 0, sizeof a);
-    a.repo_arg = repo_arg;
-    char *repo = bor_resolve_repo (&a);
-    if (!repo)
+    bgit_repo repo; bgit_odb odb;
+    if (bor_open (repo_arg, &repo, &odb) < 0)
         return BO_EX_FATAL;
 
     char *line = NULL;
@@ -480,49 +236,41 @@ bor_batch_cmd (WORD_LIST *args, int emit_content)
         while (nread > 0 && (line[nread - 1] == '\n' || line[nread - 1] == '\r'))
             line[--nread] = '\0';
 
+        /* A name git cannot resolve is reported as missing, not as an error. */
         char full[41];
-        unsigned char *obj = NULL;
-        size_t olen = 0;
-        if (nread <= 0 || !bor_all_hex (line) || strlen (line) > 40
-            || bor_resolve_prefix (repo, line, full) < 0
-            || !bor_loose_path_exists (repo, full)
-            || bor_read_loose (repo, full, &obj, &olen) < 0) {
+        if (nread <= 0 || !bgit_all_hex (line) || strlen (line) > 40) {
+            printf ("%s missing\n", line);
+            continue;
+        }
+        if (strlen (line) == 40) {
+            memcpy (full, line, 41);
+            if (!bgit_odb_has (&odb, full)) {
+                printf ("%s missing\n", line);
+                continue;
+            }
+        } else if (bgit_odb_resolve (&odb, line, full) < 0) {
             printf ("%s missing\n", line);
             continue;
         }
 
-        enum bo_type type;
-        size_t psize;
-        long off = bor_parse_header (obj, olen, &type, &psize);
-        if (off < 0 || (size_t) off > olen || psize > olen - (size_t) off) {
+        enum bgit_type type;
+        unsigned char *data;
+        size_t len;
+        if (bgit_odb_read (&odb, full, &type, &data, &len) < 0) {
             printf ("%s missing\n", line);
-            free (obj);
             continue;
         }
-
-        printf ("%s %s %zu\n", full, bo_type_name (type), psize);
+        printf ("%s %s %zu\n", full, bgit_type_name (type), len);
         if (emit_content) {
-            fwrite (obj + off, 1, psize, stdout);
+            fwrite (data, 1, len, stdout);
             putchar ('\n');
         }
-        free (obj);
+        free (data);
     }
 
     free (line);
-    free (repo);
+    bor_close (&repo, &odb);
     return EXECUTION_SUCCESS;
-}
-
-/* Format a 20-byte SHA as 40 hex chars. */
-static void
-bor_sha_to_hex (const unsigned char *sha, char *out)
-{
-    static const char d[] = "0123456789abcdef";
-    for (int i = 0; i < 20; i++) {
-        out[2*i]   = d[sha[i] >> 4];
-        out[2*i+1] = d[sha[i] & 0xF];
-    }
-    out[40] = '\0';
 }
 
 static int
@@ -530,17 +278,18 @@ bor_parse_tree_cmd (WORD_LIST *args)
 {
     bor_args a;
     if (bor_parse_args (args, &a) < 0) return EX_USAGE;
-    char *repo = bor_resolve_repo (&a);
-    if (!repo) return BO_EX_FATAL;
+    bgit_repo repo; bgit_odb odb;
+    if (bor_open (a.repo_arg, &repo, &odb) < 0) return BO_EX_FATAL;
 
-    unsigned char *obj; size_t olen;
-    if (bor_read_loose (repo, a.sha, &obj, &olen) < 0) {
-        free (repo); return BO_EX_FATAL;
+    enum bgit_type type;
+    unsigned char *obj;
+    size_t len;
+    if (bgit_odb_read (&odb, a.sha, &type, &obj, &len) < 0) {
+        bor_close (&repo, &odb);
+        return BO_EX_FATAL;
     }
-    free (repo);
-    enum bo_type type; size_t psize;
-    long off = bor_parse_header (obj, olen, &type, &psize);
-    if (off < 0 || type != BO_TREE) {
+    bor_close (&repo, &odb);
+    if (type != BGIT_TREE) {
         builtin_error ("not a tree object");
         free (obj); return BO_EX_FATAL;
     }
@@ -553,24 +302,23 @@ bor_parse_tree_cmd (WORD_LIST *args)
         arr = find_or_make_array_variable ((char *) a.var, 1);
     }
 
-    size_t pos = (size_t) off;
-    size_t end = (size_t) off + psize;
-    while (pos < end) {
+    size_t pos = 0;
+    while (pos < len) {
         /* mode: ASCII digits up to space. */
         size_t ms = pos;
-        while (pos < end && obj[pos] != ' ') pos++;
-        if (pos >= end) { builtin_error ("malformed tree (mode)"); free (obj); return EXECUTION_FAILURE; }
+        while (pos < len && obj[pos] != ' ') pos++;
+        if (pos >= len) { builtin_error ("malformed tree (mode)"); free (obj); return EXECUTION_FAILURE; }
         size_t ml = pos - ms;
         pos++;  /* skip space */
         size_t ns = pos;
-        while (pos < end && obj[pos] != '\0') pos++;
-        if (pos >= end) { builtin_error ("malformed tree (name)"); free (obj); return EXECUTION_FAILURE; }
+        while (pos < len && obj[pos] != '\0') pos++;
+        if (pos >= len) { builtin_error ("malformed tree (name)"); free (obj); return EXECUTION_FAILURE; }
         size_t nl = pos - ns;
         pos++;  /* skip NUL */
-        if (pos + 20 > end) { builtin_error ("malformed tree (sha)"); free (obj); return EXECUTION_FAILURE; }
+        if (pos + 20 > len) { builtin_error ("malformed tree (sha)"); free (obj); return EXECUTION_FAILURE; }
 
         char hex[41];
-        bor_sha_to_hex (obj + pos, hex);
+        bgit_sha_to_hex (obj + pos, hex);
         pos += 20;
 
         char line[4096];
@@ -612,17 +360,18 @@ bor_parse_commit_cmd (WORD_LIST *args)
 {
     bor_args a;
     if (bor_parse_args (args, &a) < 0) return EX_USAGE;
-    char *repo = bor_resolve_repo (&a);
-    if (!repo) return BO_EX_FATAL;
+    bgit_repo repo; bgit_odb odb;
+    if (bor_open (a.repo_arg, &repo, &odb) < 0) return BO_EX_FATAL;
 
-    unsigned char *obj; size_t olen;
-    if (bor_read_loose (repo, a.sha, &obj, &olen) < 0) {
-        free (repo); return BO_EX_FATAL;
+    enum bgit_type type;
+    unsigned char *obj;
+    size_t len;
+    if (bgit_odb_read (&odb, a.sha, &type, &obj, &len) < 0) {
+        bor_close (&repo, &odb);
+        return BO_EX_FATAL;
     }
-    free (repo);
-    enum bo_type type; size_t psize;
-    long off = bor_parse_header (obj, olen, &type, &psize);
-    if (off < 0 || type != BO_COMMIT) {
+    bor_close (&repo, &odb);
+    if (type != BGIT_COMMIT) {
         builtin_error ("not a commit object");
         free (obj); return BO_EX_FATAL;
     }
@@ -630,8 +379,8 @@ bor_parse_commit_cmd (WORD_LIST *args)
     char tree[64] = "";
     char author[1024] = "", committer[1024] = "";
     char parents[8192] = "";
-    char *p = (char *) obj + off;
-    char *end = (char *) obj + off + psize;
+    char *p = (char *) obj;
+    char *end = (char *) obj + len;
     char *body = NULL;
     while (p < end) {
         char *nl = memchr (p, '\n', (size_t) (end - p));
@@ -702,195 +451,10 @@ bor_parse_commit_cmd (WORD_LIST *args)
     return EXECUTION_SUCCESS;
 }
 
-/* ===== W-1b: write path ===================================================
- * Verbs: hash, blob, tree, commit. All hash via sha1dc and (with -w / by
- * default for blob/tree/commit) write zlib-compressed loose objects to
- * <repo>/.git/objects/<aa>/<bbbb...>. Atomic via mkstemp + rename. */
-
-/* Hash bytes through sha1dc. Returns 0 on success; -1 if a SHAttered-style
-   collision was detected (caller should refuse to write). digest[20] gets
-   the canonical SHA-1 either way (SafeHash=0). */
-static int
-bow_sha1 (const unsigned char *data, size_t n, unsigned char digest[20])
-{
-    SHA1_CTX ctx;
-    SHA1DCInit (&ctx);
-    SHA1DCSetSafeHash (&ctx, 0);   /* always emit canonical SHA-1 */
-    SHA1DCUpdate (&ctx, (const char *) data, n);
-    return SHA1DCFinal (digest, &ctx) == 0 ? 0 : -1;
-}
-
-/* zlib-deflate `data[0..n)` into a malloc'd output buffer; caller frees. */
-static int
-bow_deflate (const unsigned char *data, size_t n,
-             unsigned char **out, size_t *out_len)
-{
-    z_stream s = {0};
-    if (deflateInit (&s, Z_DEFAULT_COMPRESSION) != Z_OK) return -1;
-    size_t cap = deflateBound (&s, n);
-    unsigned char *buf = malloc (cap);
-    if (!buf) { deflateEnd (&s); return -1; }
-    s.next_in = (unsigned char *) data;
-    s.avail_in = (uInt) n;
-    s.next_out = buf;
-    s.avail_out = (uInt) cap;
-    int rc = deflate (&s, Z_FINISH);
-    if (rc != Z_STREAM_END) {
-        free (buf);
-        deflateEnd (&s);
-        return -1;
-    }
-    *out = buf;
-    *out_len = cap - s.avail_out;
-    deflateEnd (&s);
-    return 0;
-}
-
-/* Atomically write deflated bytes to <repo>/.git/objects/<aa>/<bbbb...>.
-   No-op if the object already exists (git's standard behavior). */
-static int
-bow_write_loose (const char *repo, const char *sha,
-                 const unsigned char *deflated, size_t dlen)
-{
-    char dir[4096], path[4096], tmp[4096];
-    snprintf (dir, sizeof dir, "%s/.git/objects/%c%c", repo, sha[0], sha[1]);
-    snprintf (path, sizeof path, "%s/%s", dir, sha + 2);
-    /* If already present, success. */
-    struct stat st;
-    if (stat (path, &st) == 0) return 0;
-    if (mkdir (dir, 0755) < 0 && errno != EEXIST) {
-        builtin_error ("mkdir %s: %s", dir, strerror (errno));
-        return -1;
-    }
-    snprintf (tmp, sizeof tmp, "%s.tmpXXXXXX", path);
-    int fd = mkstemp (tmp);
-    if (fd < 0) {
-        builtin_error ("mkstemp %s: %s", tmp, strerror (errno));
-        return -1;
-    }
-    fchmod (fd, 0444);  /* git uses 0444 for loose objects */
-    size_t off = 0;
-    while (off < dlen) {
-        ssize_t w = write (fd, deflated + off, dlen - off);
-        if (w < 0) {
-            if (errno == EINTR) continue;
-            builtin_error ("write %s: %s", tmp, strerror (errno));
-            close (fd); unlink (tmp);
-            return -1;
-        }
-        off += w;
-    }
-    fdatasync (fd);
-    close (fd);
-    if (rename (tmp, path) < 0) {
-        builtin_error ("rename %s -> %s: %s", tmp, path, strerror (errno));
-        unlink (tmp);
-        return -1;
-    }
-    return 0;
-}
-
-/* Build the in-memory pre-image (header + content), hash it, optionally
-   write it. Returns 0 + sets sha_hex (40 chars + NUL) on success. */
-static int
-bow_hash_and_write (const char *type, const unsigned char *content, size_t clen,
-                    int do_write, const char *repo, char sha_hex[41])
-{
-    /* Header: "TYPE LEN\0" */
-    char hdr[64];
-    int hl = snprintf (hdr, sizeof hdr, "%s %zu", type, clen);
-    if (hl <= 0 || hl >= (int) sizeof hdr) return -1;
-    size_t pre_len = (size_t) hl + 1 + clen;  /* +1 for NUL */
-    unsigned char *pre = malloc (pre_len);
-    if (!pre) { builtin_error ("malloc"); return -1; }
-    memcpy (pre, hdr, (size_t) hl);
-    pre[hl] = '\0';
-    memcpy (pre + hl + 1, content, clen);
-
-    unsigned char digest[20];
-    int collision = bow_sha1 (pre, pre_len, digest);
-    bor_sha_to_hex (digest, sha_hex);
-    if (collision < 0) {
-        free (pre);
-        builtin_error ("sha1dc: collision attempt detected for %s — refusing to write", sha_hex);
-        return -1;
-    }
-
-    if (do_write) {
-        unsigned char *deflated;
-        size_t dlen;
-        if (bow_deflate (pre, pre_len, &deflated, &dlen) < 0) {
-            free (pre);
-            builtin_error ("deflate failed");
-            return -1;
-        }
-        free (pre);
-        int rc = bow_write_loose (repo, sha_hex, deflated, dlen);
-        free (deflated);
-        return rc;
-    }
-    free (pre);
-    return 0;
-}
-
-/* Read entire stdin into malloc'd buffer. Caller frees. */
-static int
-bow_slurp_stdin (unsigned char **out, size_t *out_len)
-{
-    size_t cap = 8192, n = 0;
-    unsigned char *buf = malloc (cap);
-    if (!buf) return -1;
-    ssize_t r;
-    while ((r = read (STDIN_FILENO, buf + n, cap - n)) > 0) {
-        n += r;
-        if (n == cap) {
-            cap *= 2;
-            unsigned char *nb = realloc (buf, cap);
-            if (!nb) { free (buf); return -1; }
-            buf = nb;
-        }
-    }
-    if (r < 0) { free (buf); return -1; }
-    *out = buf;
-    *out_len = n;
-    return 0;
-}
-
-/* Read the named file into a malloc'd buffer. Caller frees. */
-static int
-bow_slurp_file (const char *path, unsigned char **out, size_t *out_len)
-{
-    int fd = open (path, O_RDONLY);
-    if (fd < 0) {
-        builtin_error ("hash: %s: %s", path, strerror (errno));
-        return -1;
-    }
-
-    size_t cap = 8192, n = 0;
-    unsigned char *buf = malloc (cap);
-    if (!buf) { close (fd); return -1; }
-
-    ssize_t r;
-    while ((r = read (fd, buf + n, cap - n)) > 0) {
-        n += r;
-        if (n == cap) {
-            cap *= 2;
-            unsigned char *nb = realloc (buf, cap);
-            if (!nb) { free (buf); close (fd); return -1; }
-            buf = nb;
-        }
-    }
-    close (fd);
-    if (r < 0) {
-        builtin_error ("hash: %s: %s", path, strerror (errno));
-        free (buf);
-        return -1;
-    }
-
-    *out = buf;
-    *out_len = n;
-    return 0;
-}
+/* ===== write path =========================================================
+ * Verbs: hash, blob, tree, commit, tag. All hash via sha1dc and (with -w /
+ * by default for blob/tree/commit/tag) write a loose object into the
+ * repository's own objects directory. */
 
 /* hash [--stdin|--stdin-paths] [--no-filters] [--filters] [--path FILE]
    [--literally] [-t TYPE] [-w] [-r REPO] [-V VAR] — read stdin, hash,
@@ -929,12 +493,12 @@ bow_hash_cmd (WORD_LIST *args)
         else { builtin_error ("hash: unexpected arg '%s'", w); builtin_usage (); return EX_USAGE; }
     }
 
-    if (!bo_type_valid_name (type) && !literally) {
+    if (!bgit_type_valid_name (type) && !literally) {
         builtin_error ("hash: invalid object type '%s'", type);
         builtin_usage ();
         return EX_USAGE;
     }
-    if (literally && !bo_type_literally_acceptable (type)) {
+    if (literally && !bgit_type_printable (type)) {
         builtin_error ("hash: invalid object type '%s'", type);
         builtin_usage ();
         return EX_USAGE;
@@ -961,11 +525,11 @@ bow_hash_cmd (WORD_LIST *args)
         return EX_USAGE;
     }
 
-    char *repo = NULL;
+    bgit_repo repo; bgit_odb odb;
+    char *objects = NULL;
     if (do_write) {
-        bor_args ra = { .repo_arg = repo_arg };
-        repo = bor_resolve_repo (&ra);
-        if (!repo) return EXECUTION_FAILURE;
+        if (bor_open (repo_arg, &repo, &odb) < 0) return EXECUTION_FAILURE;
+        objects = odb.object_dirs[0];
     }
 
     if (stdin_paths) {
@@ -982,33 +546,37 @@ bow_hash_cmd (WORD_LIST *args)
 
             unsigned char *content;
             size_t clen;
-            if (bow_slurp_file (line, &content, &clen) < 0) {
-                free (line); free (repo);
+            if (bgit_slurp_file (line, &content, &clen) < 0) {
+                free (line);
+                if (do_write) bor_close (&repo, &odb);
                 return EXECUTION_FAILURE;
             }
             char sha_hex[41];
-            int rc = bow_hash_and_write (type, content, clen, do_write, repo, sha_hex);
+            int rc = bgit_write_object (objects, type, content, clen, do_write, sha_hex);
             free (content);
             if (rc < 0) {
-                free (line); free (repo);
+                free (line);
+                if (do_write) bor_close (&repo, &odb);
                 return EXECUTION_FAILURE;
             }
             printf ("%s\n", sha_hex);
         }
-        free (line); free (repo);
+        free (line);
+        if (do_write) bor_close (&repo, &odb);
         return ferror (stdin) ? EXECUTION_FAILURE : EXECUTION_SUCCESS;
     }
 
     unsigned char *content;
     size_t clen;
-    if (bow_slurp_stdin (&content, &clen) < 0) {
-        free (repo);
+    if (bgit_slurp_fd (STDIN_FILENO, &content, &clen) < 0) {
+        if (do_write) bor_close (&repo, &odb);
         builtin_error ("hash: read stdin: %s", strerror (errno));
         return EXECUTION_FAILURE;
     }
     char sha_hex[41];
-    int rc = bow_hash_and_write (type, content, clen, do_write, repo, sha_hex);
-    free (content); free (repo);
+    int rc = bgit_write_object (objects, type, content, clen, do_write, sha_hex);
+    free (content);
+    if (do_write) bor_close (&repo, &odb);
     if (rc < 0) return EXECUTION_FAILURE;
 
     if (var) builtin_bind_variable ((char *) var, sha_hex, 0);
@@ -1036,37 +604,28 @@ bow_blob_cmd (WORD_LIST *args)
     }
     if (!file) { builtin_error ("blob: missing FILE"); builtin_usage (); return EX_USAGE; }
 
-    bor_args ra = { .repo_arg = repo_arg };
-    char *repo = bor_resolve_repo (&ra);
-    if (!repo) return EXECUTION_FAILURE;
+    bgit_repo repo; bgit_odb odb;
+    if (bor_open (repo_arg, &repo, &odb) < 0) return EXECUTION_FAILURE;
 
     int fd = open (file, O_RDONLY);
     if (fd < 0) {
-        free (repo);
+        bor_close (&repo, &odb);
         builtin_error ("blob open %s: %s", file, strerror (errno));
         return EXECUTION_FAILURE;
     }
-    struct stat st;
-    if (fstat (fd, &st) < 0) {
-        close (fd); free (repo); return EXECUTION_FAILURE;
-    }
-    unsigned char *content = malloc ((size_t) st.st_size);
-    if (!content) { close (fd); free (repo); return EXECUTION_FAILURE; }
-    ssize_t got = 0;
-    while (got < st.st_size) {
-        ssize_t r = read (fd, content + got, (size_t) (st.st_size - got));
-        if (r <= 0) {
-            if (r < 0 && errno == EINTR) continue;
-            free (content); close (fd); free (repo);
-            return EXECUTION_FAILURE;
-        }
-        got += r;
+    unsigned char *content = NULL;
+    size_t clen = 0;
+    if (bgit_slurp_fd (fd, &content, &clen) < 0) {
+        close (fd); bor_close (&repo, &odb);
+        builtin_error ("blob read %s: %s", file, strerror (errno));
+        return EXECUTION_FAILURE;
     }
     close (fd);
 
     char sha_hex[41];
-    int rc = bow_hash_and_write ("blob", content, (size_t) got, 1, repo, sha_hex);
-    free (content); free (repo);
+    int rc = bgit_write_object (odb.object_dirs[0], "blob", content, clen, 1, sha_hex);
+    free (content);
+    bor_close (&repo, &odb);
     if (rc < 0) return EXECUTION_FAILURE;
 
     if (var) builtin_bind_variable ((char *) var, sha_hex, 0);
@@ -1087,20 +646,18 @@ bow_tree_cmd (WORD_LIST *args)
         else if (strcmp (w, "-V") == 0 && p->next) { var = p->next->word->word; p = p->next; }
         else { builtin_error ("tree: unexpected arg '%s'", w); builtin_usage (); return EX_USAGE; }
     }
-    bor_args ra = { .repo_arg = repo_arg };
-    char *repo = bor_resolve_repo (&ra);
-    if (!repo) return EXECUTION_FAILURE;
+    bgit_repo repo; bgit_odb odb;
+    if (bor_open (repo_arg, &repo, &odb) < 0) return EXECUTION_FAILURE;
 
     /* Build payload by reading lines from stdin. */
     size_t cap = 4096, n = 0;
     unsigned char *body = malloc (cap);
-    if (!body) { free (repo); return EXECUTION_FAILURE; }
+    if (!body) { bor_close (&repo, &odb); return EXECUTION_FAILURE; }
 
     char *line = NULL;
     size_t llen = 0;
     ssize_t got;
-    FILE *in = stdin;
-    while ((got = getline (&line, &llen, in)) > 0) {
+    while ((got = getline (&line, &llen, stdin)) > 0) {
         if (got > 0 && line[got - 1] == '\n') { line[got - 1] = '\0'; got--; }
         if (got == 0) continue;
         /* parse: MODE SP NAME SP SHA40 */
@@ -1113,7 +670,7 @@ bow_tree_cmd (WORD_LIST *args)
         *sp2 = '\0';
         char *sha = sp2 + 1;
         if (strlen (sha) != 40) {
-            free (line); free (body); free (repo);
+            free (line); free (body); bor_close (&repo, &odb);
             builtin_error ("tree: bad sha (must be 40 hex)");
             return EXECUTION_FAILURE;
         }
@@ -1122,29 +679,28 @@ bow_tree_cmd (WORD_LIST *args)
         if (n + need > cap) {
             while (n + need > cap) cap *= 2;
             unsigned char *nb = realloc (body, cap);
-            if (!nb) { free (line); free (body); free (repo); return EXECUTION_FAILURE; }
+            if (!nb) { free (line); free (body); bor_close (&repo, &odb); return EXECUTION_FAILURE; }
             body = nb;
         }
         memcpy (body + n, line, strlen (line));     n += strlen (line);
         body[n++] = ' ';
         memcpy (body + n, name, strlen (name));     n += strlen (name);
         body[n++] = '\0';
-        for (int i = 0; i < 20; i++) {
-            int hi = sha[2*i],   lo = sha[2*i+1];
-            hi = (hi >= '0' && hi <= '9') ? hi - '0'
-                 : (hi >= 'a' && hi <= 'f') ? hi - 'a' + 10
-                 : (hi >= 'A' && hi <= 'F') ? hi - 'A' + 10 : 0;
-            lo = (lo >= '0' && lo <= '9') ? lo - '0'
-                 : (lo >= 'a' && lo <= 'f') ? lo - 'a' + 10
-                 : (lo >= 'A' && lo <= 'F') ? lo - 'A' + 10 : 0;
-            body[n++] = (unsigned char) ((hi << 4) | lo);
+        unsigned char binary[20];
+        if (bgit_hex_to_sha (sha, binary) < 0) {
+            free (line); free (body); bor_close (&repo, &odb);
+            builtin_error ("tree: bad sha (must be 40 hex)");
+            return EXECUTION_FAILURE;
         }
+        memcpy (body + n, binary, 20);
+        n += 20;
     }
     free (line);
 
     char sha_hex[41];
-    int rc = bow_hash_and_write ("tree", body, n, 1, repo, sha_hex);
-    free (body); free (repo);
+    int rc = bgit_write_object (odb.object_dirs[0], "tree", body, n, 1, sha_hex);
+    free (body);
+    bor_close (&repo, &odb);
     if (rc < 0) return EXECUTION_FAILURE;
     if (var) builtin_bind_variable ((char *) var, sha_hex, 0);
     else     printf ("%s\n", sha_hex);
@@ -1190,9 +746,8 @@ bow_commit_cmd (WORD_LIST *args)
     if (!msg)  { builtin_error ("commit: -m MSG required"); builtin_usage (); return EX_USAGE; }
     if (strlen (tree) != 40) { builtin_error ("commit: bad tree sha"); builtin_usage (); return EX_USAGE; }
 
-    bor_args ra = { .repo_arg = repo_arg };
-    char *repo = bor_resolve_repo (&ra);
-    if (!repo) return EXECUTION_FAILURE;
+    bgit_repo repo; bgit_odb odb;
+    if (bor_open (repo_arg, &repo, &odb) < 0) return EXECUTION_FAILURE;
 
     /* Default identity = "obj <obj@bash-os>" */
     if (!author)    author    = "obj <obj@bash-os>";
@@ -1204,17 +759,17 @@ bow_commit_cmd (WORD_LIST *args)
     /* Build commit body. */
     size_t cap = 4096, n = 0;
     char *body = malloc (cap);
-    if (!body) { free (repo); return EXECUTION_FAILURE; }
+    if (!body) { bor_close (&repo, &odb); return EXECUTION_FAILURE; }
     int wrote;
 #define BO_APPEND(...) do { \
     while (1) { \
         size_t left = cap - n; \
         wrote = snprintf (body + n, left, __VA_ARGS__); \
-        if (wrote < 0) { free (body); free (repo); return EXECUTION_FAILURE; } \
+        if (wrote < 0) { free (body); bor_close (&repo, &odb); return EXECUTION_FAILURE; } \
         if ((size_t) wrote < left) { n += (size_t) wrote; break; } \
         cap *= 2; \
         char *nb = realloc (body, cap); \
-        if (!nb) { free (body); free (repo); return EXECUTION_FAILURE; } \
+        if (!nb) { free (body); bor_close (&repo, &odb); return EXECUTION_FAILURE; } \
         body = nb; \
     } \
 } while (0)
@@ -1225,15 +780,15 @@ bow_commit_cmd (WORD_LIST *args)
     if (gpgsig_file) {
         unsigned char *sig = NULL;
         size_t sig_len = 0;
-        if (bow_slurp_file (gpgsig_file, &sig, &sig_len) < 0) {
-            free (body); free (repo);
+        if (bgit_slurp_file (gpgsig_file, &sig, &sig_len) < 0) {
+            free (body); bor_close (&repo, &odb);
             return EXECUTION_FAILURE;
         }
         while (sig_len > 0 && (sig[sig_len - 1] == '\n' || sig[sig_len - 1] == '\r'))
             sig_len--;
         if (sig_len == 0) {
             builtin_error ("commit: empty gpgsig file");
-            free (sig); free (body); free (repo);
+            free (sig); free (body); bor_close (&repo, &odb);
             return EXECUTION_FAILURE;
         }
         BO_APPEND ("gpgsig ");
@@ -1251,8 +806,10 @@ bow_commit_cmd (WORD_LIST *args)
 #undef BO_APPEND
 
     char sha_hex[41];
-    int rc = bow_hash_and_write ("commit", (unsigned char *) body, n, 1, repo, sha_hex);
-    free (body); free (repo);
+    int rc = bgit_write_object (odb.object_dirs[0], "commit",
+                               (unsigned char *) body, n, 1, sha_hex);
+    free (body);
+    bor_close (&repo, &odb);
     if (rc < 0) return EXECUTION_FAILURE;
     if (var) builtin_bind_variable ((char *) var, sha_hex, 0);
     else     printf ("%s\n", sha_hex);
@@ -1262,9 +819,8 @@ bow_commit_cmd (WORD_LIST *args)
 /* tag -o OBJECT -n NAME [-T TYPE] [-m MSG] [-a "NAME <email>"]
         [-r REPO] [-V VAR]
    Builds an annotated tag object (object/type/tag/tagger\n\nmsg), hashes it
-   with sha1dc and writes the loose object. Completes the blob/tree/commit/tag
-   write quartet (read side already exists via cat/type/parse-*). TYPE defaults
-   to commit; the tagger timestamp defaults to now (UTC), mirroring `commit`. */
+   with sha1dc and writes the loose object. TYPE defaults to commit; the
+   tagger timestamp defaults to now (UTC), mirroring `commit`. */
 static int
 bow_tag_cmd (WORD_LIST *args)
 {
@@ -1290,14 +846,12 @@ bow_tag_cmd (WORD_LIST *args)
     if (!object) { builtin_error ("tag: -o OBJECT required"); builtin_usage (); return EX_USAGE; }
     if (!name)   { builtin_error ("tag: -n NAME required"); builtin_usage (); return EX_USAGE; }
     if (strlen (object) != 40) { builtin_error ("tag: bad object sha"); builtin_usage (); return EX_USAGE; }
-    if (strcmp (type, "blob") && strcmp (type, "tree")
-        && strcmp (type, "commit") && strcmp (type, "tag")) {
+    if (!bgit_type_valid_name (type)) {
         builtin_error ("tag: bad object type '%s'", type); builtin_usage (); return EX_USAGE;
     }
 
-    bor_args ra = { .repo_arg = repo_arg };
-    char *repo = bor_resolve_repo (&ra);
-    if (!repo) return EXECUTION_FAILURE;
+    bgit_repo repo; bgit_odb odb;
+    if (bor_open (repo_arg, &repo, &odb) < 0) return EXECUTION_FAILURE;
 
     /* Default identity = "obj <obj@bash-os>", message = empty. */
     if (!tagger) tagger = "obj <obj@bash-os>";
@@ -1307,17 +861,17 @@ bow_tag_cmd (WORD_LIST *args)
 
     size_t cap = 4096, n = 0;
     char *body = malloc (cap);
-    if (!body) { free (repo); return EXECUTION_FAILURE; }
+    if (!body) { bor_close (&repo, &odb); return EXECUTION_FAILURE; }
     int wrote;
 #define BO_APPEND(...) do { \
     while (1) { \
         size_t left = cap - n; \
         wrote = snprintf (body + n, left, __VA_ARGS__); \
-        if (wrote < 0) { free (body); free (repo); return EXECUTION_FAILURE; } \
+        if (wrote < 0) { free (body); bor_close (&repo, &odb); return EXECUTION_FAILURE; } \
         if ((size_t) wrote < left) { n += (size_t) wrote; break; } \
         cap *= 2; \
         char *nb = realloc (body, cap); \
-        if (!nb) { free (body); free (repo); return EXECUTION_FAILURE; } \
+        if (!nb) { free (body); bor_close (&repo, &odb); return EXECUTION_FAILURE; } \
         body = nb; \
     } \
 } while (0)
@@ -1331,8 +885,10 @@ bow_tag_cmd (WORD_LIST *args)
 #undef BO_APPEND
 
     char sha_hex[41];
-    int rc = bow_hash_and_write ("tag", (unsigned char *) body, n, 1, repo, sha_hex);
-    free (body); free (repo);
+    int rc = bgit_write_object (odb.object_dirs[0], "tag",
+                               (unsigned char *) body, n, 1, sha_hex);
+    free (body);
+    bor_close (&repo, &odb);
     if (rc < 0) return EXECUTION_FAILURE;
     if (var) builtin_bind_variable ((char *) var, sha_hex, 0);
     else     printf ("%s\n", sha_hex);
@@ -1358,7 +914,7 @@ obj_builtin (WORD_LIST *list)
     if (!strcmp (cmd, "size"))         return bor_size_cmd (args);
     if (!strcmp (cmd, "parse-tree"))   return bor_parse_tree_cmd (args);
     if (!strcmp (cmd, "parse-commit")) return bor_parse_commit_cmd (args);
-    /* write (W-1b) */
+    /* write */
     if (!strcmp (cmd, "hash"))         return bow_hash_cmd (args);
     if (!strcmp (cmd, "blob"))         return bow_blob_cmd (args);
     if (!strcmp (cmd, "tree"))         return bow_tree_cmd (args);
@@ -1370,7 +926,7 @@ obj_builtin (WORD_LIST *list)
 }
 
 char *obj_doc[] = {
-    "Read + write loose git objects (zlib + sha1dc).",
+    "Read + write git objects (loose or packed; zlib + sha1dc).",
     "",
     "  Read:",
     "    obj cat SHA [-r REPO] [-V VAR]      → object content",
@@ -1386,7 +942,7 @@ char *obj_doc[] = {
     "          With -V: binds <VAR>_tree, <VAR>_parents, _author,",
     "          _committer, _message",
     "",
-    "  Write (W-1b — uses sha1dc collision-detecting SHA-1):",
+    "  Write (uses sha1dc collision-detecting SHA-1):",
     "    obj hash [--stdin|--stdin-paths] [--no-filters] [--literally]",
     "                 [-t TYPE] [-w] [-r REPO] [-V VAR]",
     "        Read stdin, hash, optionally -w write loose object.",
@@ -1401,8 +957,10 @@ char *obj_doc[] = {
     "                [-a 'NAME <email>'] [-r REPO] [-V VAR]",
     "        Build + write an annotated tag object (TYPE default commit).",
     "",
-    "Default repo = walk up from cwd looking for .git/.",
-    "Pack access is handled by pack when available.",
+    "Reads search loose objects, every pack, and the alternates named by",
+    "objects/info/alternates or GIT_ALTERNATE_OBJECT_DIRECTORIES. The repo",
+    "is -r REPO, GIT_DIR, or the one containing the current directory; a",
+    "linked worktree's .git file and a bare repository both work.",
     (char *)NULL
 };
 

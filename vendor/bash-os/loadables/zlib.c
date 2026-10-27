@@ -142,6 +142,29 @@ bz_codec_zlib (int in_fd, int out_fd, int encode, int level, enum bz_format fmt)
           s.next_out = outbuf;
           s.avail_out = sizeof outbuf;
           ret = encode ? deflate (&s, flush) : inflate (&s, flush);
+          /* Inflate may produce valid prefix bytes in the same call that
+             detects a CRC or length error. Keep streaming output visible
+             before reporting the failure, as gzip does. */
+          size_t produced = sizeof outbuf - s.avail_out;
+          if (produced > 0)
+            {
+              unsigned char *p = outbuf;
+              size_t left = produced;
+              while (left > 0)
+                {
+                  ssize_t w = write (out_fd, p, left);
+                  if (w <= 0)
+                    {
+                      if (w < 0 && errno == EINTR) continue;
+                      if (w == 0) errno = EIO;
+                      builtin_error ("write: %s", strerror (errno));
+                      (encode ? deflateEnd : inflateEnd) (&s);
+                      return 1;
+                    }
+                  p += w;
+                  left -= (size_t) w;
+                }
+            }
           if (ret == Z_STREAM_ERROR ||
               ret == Z_NEED_DICT    ||
               ret == Z_DATA_ERROR   ||
@@ -152,25 +175,6 @@ bz_codec_zlib (int in_fd, int out_fd, int encode, int level, enum bz_format fmt)
                              s.msg ? s.msg : zError (ret));
               (encode ? deflateEnd : inflateEnd) (&s);
               return 1;
-            }
-          size_t produced = sizeof outbuf - s.avail_out;
-          if (produced > 0)
-            {
-              unsigned char *p = outbuf;
-              size_t left = produced;
-              while (left > 0)
-                {
-                  ssize_t w = write (out_fd, p, left);
-                  if (w < 0)
-                    {
-                      if (errno == EINTR) continue;
-                      builtin_error ("write: %s", strerror (errno));
-                      (encode ? deflateEnd : inflateEnd) (&s);
-                      return 1;
-                    }
-                  p += w;
-                  left -= (size_t) w;
-                }
             }
         }
       while (s.avail_out == 0 && ret != Z_STREAM_END);
@@ -631,6 +635,7 @@ char *zlib_doc[] = {
   "",
   "Without -e: decode (default).",
   "With    -e: encode.",
+  "Decoding streams output; bytes emitted before an integrity error remain visible.",
   "",
   "Formats (-f NAME, default gzip):",
   "    gzip      RFC 1952 (the universal default)",

@@ -1,0 +1,13 @@
+--- builtins/fltexpr.c
++++ builtins/fltexpr.c
+@@ -1604,6 +1604,10 @@
+ 	c = GEQ;
+       else if ((c == LT) && (c1 == EQ))
+ 	c = LEQ;
++      else if (c == '&' && c1 == '&')
++        c = LAND;
++      else if (c == '|' && c1 == '|')
++        c = LOR;
+       else if ((c == '*') && (c1 == '*'))
+ 	c = POWER;
+       else if ((c == '-' || c == '+') && c1 == c && curtok == STR)

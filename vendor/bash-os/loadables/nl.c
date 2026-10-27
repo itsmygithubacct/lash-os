@@ -51,6 +51,14 @@
 #include "loadables.h"
 #include "bl-output.h"
 
+#if defined REG_STARTEND && !defined BNL_NO_STARTEND
+#  define BNL_USE_STARTEND 1
+#else
+#  define BNL_USE_STARTEND 0
+/* Private, length-aware BRE engine for libcs without bounded regexec. */
+#  include "nl-regex.h"
+#endif
+
 typedef enum { BNL_ALL = 0, BNL_NONEMPTY, BNL_NONE, BNL_REGEX } bnl_body;
 typedef enum { BNL_RN = 0, BNL_LN, BNL_RZ } bnl_fmt;
 typedef enum { BNL_BODY = 0, BNL_HEADER, BNL_FOOTER } bnl_section;
@@ -100,10 +108,12 @@ static const char bnl_zeros[64] =
     "0000000000000000000000000000000000000000000000000000000000000000";
 
 static void
-bnl_print_help (void)
+bnl_print_help (bl_output *out)
 {
-    for (char **p = nl_doc; *p; p++)
-        puts (*p);
+    for (char **p = nl_doc; *p; p++) {
+        bl_output_write (out, *p, strlen (*p));
+        bl_output_byte (out, '\n');
+    }
 }
 
 static void
@@ -333,24 +343,26 @@ bnl_matches (const char *line, size_t n, bnl_section section, const bnl_opts *o)
        the subject. */
     if (len > 0 && line[len - 1] == '\n')
         len--;
-#ifdef REG_STARTEND
+    /* Never narrow the subject length into a regex offset silently. */
+    if ((regoff_t) len < 0 || (uintmax_t) (regoff_t) len != (uintmax_t) len) {
+        builtin_error ("regular expression subject too long");
+        return -1;
+    }
     {
+        int result;
+#if BNL_USE_STARTEND
         regmatch_t range;
         range.rm_so = 0;
         range.rm_eo = (regoff_t) len;
-        return regexec (re, line, 0, &range, REG_STARTEND) == 0;
-    }
+        result = regexec (re, line, 1, &range, REG_STARTEND);
 #else
-    {
-        char *text = (char *) line;
-        char saved = text[len];
-        int hit;
-        text[len] = '\0';
-        hit = regexec (re, text, 0, NULL, 0) == 0;
-        text[len] = saved;
-        return hit;
-    }
+        result = bnl_regnexec (re, line, len, 0, NULL, 0);
 #endif
+        if (result == 0 || result == REG_NOMATCH)
+            return result == 0;
+        builtin_error ("regular expression matching failed (error %d)", result);
+        return -1;
+    }
 }
 
 /* Input comes from the descriptor, never from the process-wide stdin stream.
@@ -438,9 +450,8 @@ bnl_read_line (bnl_input *in, char **line, size_t *cap)
         if (stop)
             break;
     }
-    /* getline terminated its buffer, and callers that take the line as a C
-       string — the regexec fallback, and any library that measures it — rely
-       on that. The growth above always reserves the extra byte. */
+    /* Keep an extra terminator for regex libraries, while passing the real
+       content length separately. */
     if (*line && used < *cap)
         (*line)[used] = '\0';
     return used;
@@ -489,6 +500,8 @@ bnl_process (bnl_input *in, const char *name, char **line, size_t *cap,
                 break;
             case BNL_REGEX:
                 numbered = bnl_matches (*line, len, st->section, o);
+                if (numbered < 0)
+                    return BNL_FATAL;
                 break;
             case BNL_NONE:
                 numbered = 0;
@@ -618,19 +631,25 @@ nl_builtin (WORD_LIST *list)
                 builtin_error ("option '%s' is ambiguous", w);
                 goto usage;
             }
+            if (!bnl_long[match].arg && eq) {
+                builtin_error ("option '--%s' doesn't allow an argument", bnl_long[match].name);
+                goto usage;
+            }
             if (bnl_long[match].opt == 'H' || bnl_long[match].opt == 'V') {
+                bl_output_init (&out, stdout);
                 if (bnl_long[match].opt == 'H')
-                    bnl_print_help ();
-                else
-                    puts ("bashnl 1.0 (bash-loadable)");
+                    bnl_print_help (&out);
+                else {
+                    const char version[] = "bashnl 1.0 (bash-loadable)\n";
+                    bl_output_write (&out, version, sizeof version - 1);
+                }
+                bl_output_flush (&out);
+                if (out.error)
+                    builtin_error ("write error: %s", strerror (out.error));
                 bnl_release (&o, files);
-                return EXECUTION_SUCCESS;
+                return out.error ? EXECUTION_FAILURE : EXECUTION_SUCCESS;
             }
             if (!bnl_long[match].arg) {
-                if (eq) {
-                    builtin_error ("option '--%s' doesn't allow an argument", bnl_long[match].name);
-                    goto usage;
-                }
                 o.no_reset = 1;         /* the only argument-free option */
                 continue;
             }

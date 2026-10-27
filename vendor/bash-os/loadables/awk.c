@@ -16,13 +16,9 @@
  *     prefix/postfix ++/-- on variables, arrays, and fields,
  *     and ternary ?:
  *   - variables: NR, FNR, NF, FS, OFS, RS, ORS, FILENAME, $0..$N, user
- *     scalars, assoc arrays. FNR is the per-file record number (resets
- *     to 0 at each new input file, then tracks NR within that file);
- *     for a single file or stdin FNR == NR. Like NR, FNR is read-only
- *     in awk (gawk allows assigning FNR; this is an intentional
- *     divergence kept symmetric with NR's treatment — see the
- *     bawk_lref_resolve note for why numeric specials are not routed
- *     to writable slots).
+ *     scalars, assoc arrays. NR and FNR are writable scalar values;
+ *     automatic record reads increment their current integer values. FNR
+ *     resets at startup and when a new named input file is opened.
  *   - builtins: length, substr, index, split, sprintf, gsub, sub,
  *     match, int, sqrt, sin, cos, log, exp, close, fflush, system
  *     (refuses unless BASHAWK_ALLOW_SYSTEM is set — see security
@@ -1583,6 +1579,35 @@ bawk_val_to_num (bawk_val *v)
     return strtod (v->s, NULL);
 }
 
+/* Counter reads copy the scalar value so assignment preserves strings until
+   the next numeric operation, just like other writable awk variables. */
+static bawk_val
+bawk_val_copy (const bawk_val *v)
+{
+    bawk_val r = {0};
+    if (v->s) bawk_val_set_str (&r, v->s);
+    else if (v->have_n) bawk_val_set_num (&r, v->n);
+    return r;
+}
+
+static void
+bawk_counter_advance (bawk_val *v)
+{
+    double n = trunc (bawk_val_to_num (v));
+    bawk_val_set_num (v, n + 1);
+}
+
+/* GNU awk exposes integer counter reads, while an assignment expression
+   still returns its original RHS. Preserve an assigned string's spelling
+   when its numeric value is already integral. No integer cast is needed. */
+static bawk_val
+bawk_counter_read (bawk_val *v)
+{
+    double n = bawk_val_to_num (v), integral = trunc (n);
+    if (n != integral) bawk_val_set_num (v, integral);
+    return bawk_val_copy (v);
+}
+
 /* Active CONVFMT / OFMT formats. bawk_val_to_str takes no ctx, so the
    current CONVFMT is tracked here (reset to "%.6g" at each run start, and
    repointed whenever CONVFMT/OFMT is assigned). Integer-valued numbers are
@@ -1595,7 +1620,7 @@ static const char *bawk_ofmt    = "%.6g";
 static const char *
 bawk_num_to_str (double n, const char *fmt, char *buf, size_t bufsz)
 {
-    if (n == (long long) n)
+    if (isfinite (n) && n >= -0x1p63 && n < 0x1p63 && n == trunc (n))
         snprintf (buf, bufsz, "%lld", (long long) n);
     else
         snprintf (buf, bufsz, fmt ? fmt : "%.6g", n);
@@ -1767,8 +1792,8 @@ typedef struct {
     char    **fld;
     int       nf;
     int       fld_cap;
-    long      NR;
-    long      FNR;          /* per-file record number; reset to 0 at each new file */
+    bawk_val  NR;
+    bawk_val  FNR;          /* writable per-file counter; reset at input open */
     char     *FS;
     char     *OFS;
     char     *ORS;
@@ -1941,6 +1966,11 @@ static void
 bawk_set_scalar_from_getline (bawk_ctx *c, const char *name, const char *line)
 {
     if (!name) return;
+    if (!strcmp (name, "NR") || !strcmp (name, "FNR")) {
+        bawk_val_set_str (!strcmp (name, "NR") ? &c->NR : &c->FNR,
+                          line ? line : "");
+        return;
+    }
     bawk_var *v = bawk_lookup_or_create (c, name);
     bawk_val_free (&v->val);
     bawk_val_set_str (&v->val, line ? line : "");
@@ -2262,11 +2292,11 @@ bawk_eval_getline (bawk_ctx *c, bawk_node *n)
     if (line[rd - 1] == '\n') line[rd - 1] = '\0';
 
     if (source != BAWK_GETLINE_PIPE) {
-        c->NR++;
-        /* Existing awk/gawk-compatible rule: main-input getline
-           advances both counters; getline from an explicit file advances
+        bawk_counter_advance (&c->NR);
+        /* Retain the existing subset rule: main-input getline advances
+           both counters; getline from an explicit file advances
            NR only and leaves the current input file's FNR alone. */
-        if (source == BAWK_GETLINE_MAIN) c->FNR++;
+        if (source == BAWK_GETLINE_MAIN) bawk_counter_advance (&c->FNR);
     }
 
     if (target == BAWK_GETLINE_TARGET_SCALAR) {
@@ -2277,8 +2307,8 @@ bawk_eval_getline (bawk_ctx *c, bawk_node *n)
             /* Preserve awk's existing measured divergence: record-form
                command-pipe getline advances both counters; scalar target
                command-pipe getline does not. */
-            c->NR++;
-            c->FNR++;
+            bawk_counter_advance (&c->NR);
+            bawk_counter_advance (&c->FNR);
         }
     }
 
@@ -2343,14 +2373,11 @@ bawk_lref_resolve (bawk_ctx *c, bawk_node *lhs)
             ref.kind = BAWK_LREF_NF;
             return ref;
         }
-        /* The numeric specials NR/FNR are intentionally NOT routed to
-           writable slots here. They fall through to the regular user-scalar
-           slot below, so assigning e.g. `FNR=5` only creates a shadow user
-           var that the read resolver in bawk_eval_inner ignores (it always
-           returns c->NR / c->FNR). They are therefore effectively
-           read-only. gawk permits assigning NR and FNR; keeping them
-           read-only is an intentional divergence, and FNR mirrors NR's
-           treatment to stay symmetric. */
+        if (!strcmp (lhs->sval, "NR") || !strcmp (lhs->sval, "FNR")) {
+            ref.kind = BAWK_LREF_SLOT;
+            ref.slot = !strcmp (lhs->sval, "NR") ? &c->NR : &c->FNR;
+            return ref;
+        }
         bawk_var *v = bawk_lookup_or_create (c, lhs->sval);
         ref.kind = BAWK_LREF_SLOT;
         ref.slot = &v->val;
@@ -2417,6 +2444,8 @@ bawk_lref_get (bawk_ctx *c, bawk_lref *ref)
         return r;
     }
     if (ref->kind == BAWK_LREF_SLOT) {
+        if (!ref->special && (ref->slot == &c->NR || ref->slot == &c->FNR))
+            return bawk_counter_read (ref->slot);
         if (ref->special) {
             bawk_val_set_str (&r, *ref->special ? *ref->special : "");
             return r;
@@ -2515,8 +2544,8 @@ bawk_eval_ident (bawk_ctx *c, bawk_node *n)
 {
     bawk_val r = {0};
     switch ((bawk_special_id) bawk_n_op (n)) {
-        case BAWK_SPECIAL_NR: bawk_val_set_num (&r, (double) c->NR); return r;
-        case BAWK_SPECIAL_FNR: bawk_val_set_num (&r, (double) c->FNR); return r;
+        case BAWK_SPECIAL_NR: return bawk_counter_read (&c->NR);
+        case BAWK_SPECIAL_FNR: return bawk_counter_read (&c->FNR);
         case BAWK_SPECIAL_NF: bawk_val_set_num (&r, (double) c->nf); return r;
         case BAWK_SPECIAL_FS: bawk_val_set_str (&r, c->FS ? c->FS : " "); return r;
         case BAWK_SPECIAL_OFS: bawk_val_set_str (&r, c->OFS ? c->OFS : " "); return r;
@@ -2529,8 +2558,8 @@ bawk_eval_ident (bawk_ctx *c, bawk_node *n)
         case BAWK_SPECIAL_RLENGTH: bawk_val_set_num (&r, (double) c->RLENGTH); return r;
         case BAWK_SPECIAL_NONE: break;
     }
-    if      (!strcmp (n->sval, "NR")) bawk_val_set_num (&r, (double) c->NR);
-    else if (!strcmp (n->sval, "FNR")) bawk_val_set_num (&r, (double) c->FNR);
+    if      (!strcmp (n->sval, "NR")) return bawk_counter_read (&c->NR);
+    else if (!strcmp (n->sval, "FNR")) return bawk_counter_read (&c->FNR);
     else if (!strcmp (n->sval, "NF")) bawk_val_set_num (&r, (double) c->nf);
     else if (!strcmp (n->sval, "FS")) bawk_val_set_str (&r, c->FS ? c->FS : " ");
     else if (!strcmp (n->sval, "OFS")) bawk_val_set_str (&r, c->OFS ? c->OFS : " ");
@@ -2596,8 +2625,12 @@ bawk_eval_assign (bawk_ctx *c, bawk_node *n)
     int op = (int) n->nval;
     bawk_lref ref = bawk_lref_resolve (c, bawk_n_lhs (n));
     if (op == T_ASSIGN) {
+        int counter = ref.kind == BAWK_LREF_SLOT && !ref.special
+                      && (ref.slot == &c->NR || ref.slot == &c->FNR);
+        bawk_val assigned = {0};
+        if (counter) assigned = bawk_val_copy (&rhs);
         bawk_lref_set (c, &ref, rhs);
-        return bawk_lref_get (c, &ref);
+        return counter ? assigned : bawk_lref_get (c, &ref);
     }
     bawk_val cur = bawk_lref_get (c, &ref);
     double a = bawk_val_to_num (&cur);
@@ -3619,6 +3652,7 @@ bawk_free_all (bawk_parser *P, bawk_ctx *c)
             free (v);
             v = nx;
         }
+        bawk_val_free (&c->NR); bawk_val_free (&c->FNR);
         free (c->FS); free (c->OFS); free (c->ORS); free (c->SUBSEP); free (c->FILENAME);
         free (c->CONVFMT); free (c->OFMT);
         /* Drop the active-format pointers (they aliased freed ctx storage). */
@@ -3691,6 +3725,7 @@ awk_builtin (WORD_LIST *list)
     char *fs_override = NULL;
 
     bawk_ctx ctx = {0};
+    bawk_val_set_num (&ctx.NR, 0); bawk_val_set_num (&ctx.FNR, 0);
     ctx.out = stdout;
     ctx.max_stack = BAWK_DEFAULT_MAX_STACK;
     ctx.FS = bawk_strdup (" "); ctx.OFS = bawk_strdup (" "); ctx.ORS = bawk_strdup ("\n");
@@ -3889,6 +3924,9 @@ awk_builtin (WORD_LIST *list)
         bawk_assign_lhs (&ctx, &lhs, pv);
     }
 
+    /* GNU awk initializes the per-file counter after command-line presets. */
+    bawk_val_set_num (&ctx.FNR, 0);
+
     /* Pre-register all user-defined functions BEFORE any rule runs, so
        BEGIN/per-line/END blocks can call functions regardless of source
        order. */
@@ -3931,8 +3969,8 @@ awk_builtin (WORD_LIST *list)
                 char *line = NULL; size_t cap = 0; ssize_t rd;
                 while ((rd = getline (&line, &cap, stdin)) != -1) {
                     if (rd > 0 && line[rd - 1] == '\n') line[rd - 1] = '\0';
-                    ctx.NR++;
-                    ctx.FNR++;   /* single stdin stream: FNR == NR */
+                    bawk_counter_advance (&ctx.NR);
+                    bawk_counter_advance (&ctx.FNR);
                     bawk_run_line (&ctx, prog, line);
                     if (ctx.exit_flag) break;
                 }
@@ -3945,12 +3983,12 @@ awk_builtin (WORD_LIST *list)
                 if (!f) { builtin_error ("%s: %s", files[i], strerror (errno)); ctx.exit_code = 2; ctx.fatal_flag = ctx.exit_flag = 1; break; }
                 free (ctx.FILENAME);
                 ctx.FILENAME = bawk_strdup (files[i]);
-                ctx.FNR = 0;        /* gawk: FNR resets to 0 at each new input file */
+                bawk_val_set_num (&ctx.FNR, 0);        /* gawk: FNR resets to 0 at each new input file */
                 char *line = NULL; size_t cap = 0; ssize_t rd;
                 while ((rd = getline (&line, &cap, f)) != -1) {
                     if (rd > 0 && line[rd - 1] == '\n') line[rd - 1] = '\0';
-                    ctx.NR++;
-                    ctx.FNR++;
+                    bawk_counter_advance (&ctx.NR);
+                    bawk_counter_advance (&ctx.FNR);
                     bawk_run_line (&ctx, prog, line);
                     if (ctx.exit_flag) break;
                     /* `nextfile` abandons the current input file; clear the
@@ -4002,7 +4040,7 @@ awk_builtin (WORD_LIST *list)
 	    free (script); free ((void *) files); free (fs_override);
 	    for (int i = 0; i < n_pre; i++) { free (pre_vars[i].name); free (pre_vars[i].val); }
 	    free (pre_vars);
-	    return EX_USAGE;
+	    return EXECUTION_FAILURE;
 }
 
 char *awk_doc[] = {
@@ -4012,6 +4050,7 @@ char *awk_doc[] = {
     "",
     "Supports BEGIN/END, pattern { action }, regex /…/, fields $0..$NF,",
     "NR/FNR/NF/FS/OFS/ORS/FILENAME, assoc arrays (incl. SUBSEP multi-dim),",
+    "NR/FNR are writable; FNR resets at startup and for each named input file.",
     "if/else/while/for/for-in/do-while, break/continue/next/nextfile/exit,",
     "+-*/%^ ** == != < <= > >= ~ !~ && || ! ?:, string concat (juxtaposition),",
     "length/substr/index/split/sprintf/gsub/sub/match/int/sqrt/sin/cos/",

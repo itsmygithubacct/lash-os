@@ -8,6 +8,7 @@ from pathlib import Path
 import shutil
 import subprocess
 from source_tree import sync_tree
+from release_version import release_metadata
 
 from workspace import ROOT, BUILD, DOWNLOADS, PATHS
 SOURCE = BUILD / "native-pure/source"
@@ -38,6 +39,7 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--profile', choices=['pure','full'], default='pure')
     args=parser.parse_args()
+    release_metadata(ROOT)
     configuration=CONFIGURE if args.profile=='pure' else '--disable-nls'
     SOURCE = BUILD / ("native-" + args.profile) / "source"
     sync_tree(ROOT / 'vendor/bash-os', SOURCE)

@@ -184,6 +184,17 @@ static void bssh_child_guard_child_end (struct bssh_child_guard *g)
   sigprocmask (SIG_SETMASK, &g->old_mask, NULL);
 }
 
+/* bash hands a loadable one buffer for a variable set for a single command
+   (VAR=x ssh ...) and frees it when the next one is asked for, so a value has
+   to be taken away before another is read. */
+static const char *bssh_env (const char *name, char *out, size_t outsz)
+{
+  const char *value = getenv (name);
+  if (!value || !*value) return NULL;
+  snprintf (out, outsz, "%s", value);
+  return out;
+}
+
 static const char *next_word (WORD_LIST **p)
 {
   if (!p || !*p) return NULL;
@@ -663,10 +674,11 @@ static int libssh_connect_session (const char *host, const char *port,
   /* F06 item 5: client crypto allow-lists from env (fail-closed — a rejected
      set aborts the connect, never silently falls back to defaults). */
   {
-    const char *c = getenv ("BASHSSH_CIPHERS");
-    const char *m = getenv ("BASHSSH_MACS");
-    const char *k = getenv ("BASHSSH_KEX");
-    const char *rk = getenv ("BASHSSH_REKEY");
+    char c_held[512], m_held[512], k_held[512], rk_held[64];
+    const char *c = bssh_env ("BASHSSH_CIPHERS", c_held, sizeof c_held);
+    const char *m = bssh_env ("BASHSSH_MACS", m_held, sizeof m_held);
+    const char *k = bssh_env ("BASHSSH_KEX", k_held, sizeof k_held);
+    const char *rk = bssh_env ("BASHSSH_REKEY", rk_held, sizeof rk_held);
     if ((c && *c && (ssh_options_set (session, SSH_OPTIONS_CIPHERS_C_S, c) != SSH_OK
                   || ssh_options_set (session, SSH_OPTIONS_CIPHERS_S_C, c) != SSH_OK))
         || (m && *m && (ssh_options_set (session, SSH_OPTIONS_HMAC_C_S, m) != SSH_OK
@@ -834,6 +846,26 @@ static int libssh_connect_session (const char *host, const char *port,
       ssh_free (session);
       if (jump_pid > 0) { kill (jump_pid, SIGTERM); waitpid (jump_pid, NULL, 0); }
       return -1;
+    }
+
+  /* With no identity named, the files ssh would look in: the usual ones
+     under ~/.ssh, in the order ssh tries them. The agent still stays out of
+     it — this transport uses the key it was given and nothing else, and
+     without one there would otherwise be nothing to offer at all. */
+  char usual_identity[512] = "";
+  if (!(key && key[0]))
+    {
+      static const char *const usual[] = { "id_ed25519", "id_ecdsa", "id_rsa",
+                                           NULL };
+      const char *home = getenv ("HOME");
+      for (int i = 0; home && usual[i] && !usual_identity[0]; i++)
+        {
+          char path[512];
+          snprintf (path, sizeof path, "%s/.ssh/%s", home, usual[i]);
+          if (access (path, R_OK) == 0)
+            snprintf (usual_identity, sizeof usual_identity, "%s", path);
+        }
+      if (usual_identity[0]) key = usual_identity;
     }
 
   if (key && key[0])
@@ -1169,6 +1201,154 @@ static int run_libssh_exec (const ssh_handle *h, const char *cmd,
     }
   ssh_channel_close (channel);
   ssh_channel_free (channel);
+  if (rc < 0) rc = 255;
+  return rc;
+}
+
+/* One command with this process's own input and output on it: what arrives
+   on stdin goes over as it arrives, what comes back is written out at once,
+   and neither side is held in memory. A protocol between two programs needs
+   exactly that — the far end answers what it has been told so far — which is
+   what run_libssh_exec, collecting both sides into blobs before anything is
+   written, cannot do. Returns the remote command's status. */
+static int run_libssh_stream (const ssh_handle *h, const char *cmd)
+{
+  libssh_slot *slot = libssh_find_slot (h->id);
+  if (!slot)
+    {
+      builtin_error ("libssh: unknown or closed handle: %d", h->id);
+      return -1;
+    }
+
+  ssh_channel channel = ssh_channel_new (slot->session);
+  if (!channel)
+    {
+      builtin_error ("libssh: channel allocation failed: %s",
+                     ssh_get_error (slot->session));
+      return -1;
+    }
+  if (ssh_channel_open_session (channel) != SSH_OK)
+    {
+      builtin_error ("libssh: channel open failed: %s",
+                     ssh_get_error (slot->session));
+      ssh_channel_free (channel);
+      return -1;
+    }
+  if (slot->forward_agent && ssh_channel_request_auth_agent (channel) != SSH_OK)
+    {
+      builtin_error ("libssh: agent forwarding request failed: %s",
+                     ssh_get_error (slot->session));
+      ssh_channel_close (channel);
+      ssh_channel_free (channel);
+      return -1;
+    }
+  bashssh_send_env (channel);                 /* SendEnv (best-effort) */
+  if (ssh_channel_request_exec (channel, cmd) != SSH_OK)
+    {
+      builtin_error ("libssh: exec failed: %s", ssh_get_error (slot->session));
+      ssh_channel_close (channel);
+      ssh_channel_free (channel);
+      return -1;
+    }
+
+  char buf[16384];
+  int sending = 1;                            /* stdin is still open here */
+  int done[2] = { 0, 0 };                     /* stdout, then stderr */
+  int failed = 0;
+  for (;;)
+    {
+      int moved = 0;
+      libssh_agent_pump (slot);
+
+      /* Anything waiting on stdin goes over first, and without waiting: a
+         side sending a pack should not be held up a tick at a time. */
+      if (sending)
+        {
+          fd_set readers;
+          struct timeval now = { 0, 0 };
+          FD_ZERO (&readers);
+          FD_SET (STDIN_FILENO, &readers);
+          int ready = select (STDIN_FILENO + 1, &readers, NULL, NULL, &now);
+          if (ready < 0 && errno != EINTR) { failed = 1; break; }
+          if (ready > 0)
+            {
+              ssize_t n = read (STDIN_FILENO, buf, sizeof buf);
+              if (n > 0)
+                {
+                  if (ssh_channel_write (channel, buf, (uint32_t) n)
+                      == SSH_ERROR)
+                    {
+                      builtin_error ("libssh: write failed: %s",
+                                     ssh_get_error (slot->session));
+                      failed = 1;
+                      break;
+                    }
+                  moved = 1;
+                }
+              else if (n == 0)
+                {
+                  ssh_channel_send_eof (channel);   /* nothing more from here */
+                  sending = 0;
+                }
+              else if (errno != EINTR)
+                { failed = 1; break; }
+            }
+        }
+
+      /* Then whatever the far end has said, on both its streams. The wait
+         belongs here and nowhere else: this is the call that reads the
+         socket, so a poll that does not wait can only ever see what is
+         already in hand — and while there is something to move there is no
+         waiting at all. */
+      for (int is_err = 0; is_err < 2 && !failed; is_err++)
+        {
+          if (done[is_err]) continue;
+          int avail = ssh_channel_poll_timeout (channel, moved ? 0 : 10,
+                                                is_err);
+          if (avail == SSH_EOF) { done[is_err] = 1; continue; }
+          if (avail == SSH_ERROR)
+            {
+              builtin_error ("libssh: poll failed: %s",
+                             ssh_get_error (slot->session));
+              failed = 1;
+              break;
+            }
+          while (avail > 0)
+            {
+              uint32_t chunk = (uint32_t) (avail < (int) sizeof buf
+                                           ? avail : (int) sizeof buf);
+              int r = ssh_channel_read (channel, buf, chunk, is_err);
+              if (r == SSH_ERROR)
+                {
+                  builtin_error ("libssh: read failed: %s",
+                                 ssh_get_error (slot->session));
+                  failed = 1;
+                  break;
+                }
+              if (r <= 0) { done[is_err] = 1; break; }
+              if (write_all (is_err ? STDERR_FILENO : STDOUT_FILENO, buf,
+                             (size_t) r) < 0)
+                { failed = 1; break; }
+              moved = 1;
+              avail -= r;
+            }
+        }
+      if (failed) break;
+      if (done[0] && done[1]) break;          /* the far end has said it all */
+      if (!moved && !ssh_channel_is_open (channel)) break;
+    }
+
+  /* The status comes in its own message, which may still be on its way. */
+  int rc = ssh_channel_get_exit_status (channel);
+  for (int i = 0; i < 300 && rc < 0; i++)
+    {
+      if (slot->agent_channel) libssh_agent_pump (slot);
+      ssh_channel_poll_timeout (channel, 10, 0);
+      rc = ssh_channel_get_exit_status (channel);
+    }
+  ssh_channel_close (channel);
+  ssh_channel_free (channel);
+  if (failed) return -1;
   if (rc < 0) rc = 255;
   return rc;
 }
@@ -2841,6 +3021,13 @@ static int run_libssh_exec (const ssh_handle *h, const char *cmd,
   return -1;
 }
 
+static int run_libssh_stream (const ssh_handle *h, const char *cmd)
+{
+  (void) h; (void) cmd;
+  builtin_error ("libssh transport is not compiled in");
+  return -1;
+}
+
 static int run_libssh_shell (const ssh_handle *h)
 {
   (void) h;
@@ -3339,6 +3526,39 @@ keyscan_cmd (WORD_LIST *args)
   return EXECUTION_SUCCESS;
 }
 
+/* Local file lookup supports hashed host fields and comma-separated literal
+ * aliases. Preserve the original line when isolating its host field. Marker
+ * records and wildcard/negated host patterns are outside this bounded helper. */
+static int
+bssh_known_line_matches (char *line, const char *host)
+{
+  char *field = line;
+  while (*field == ' ' || *field == '\t') field++;
+  if (!*field || *field == '\n' || *field == '#' || *field == '@') return 0;
+  char *end = field;
+  while (*end && !isspace ((unsigned char) *end)) end++;
+  if (!*end) return 0;
+  char saved = *end;
+  *end = '\0';
+  int matched = 0;
+  if (!strncmp (field, "|1|", 3))
+    matched = bk_hashed_match (field, host);
+  else
+    {
+      size_t len = strlen (host);
+      for (char *alias = field; *alias;)
+        {
+          char *comma = strchr (alias, ',');
+          size_t n = comma ? (size_t) (comma - alias) : strlen (alias);
+          if (n == len && strncasecmp (alias, host, n) == 0) matched = 1;
+          if (!comma) break;
+          alias = comma + 1;
+        }
+    }
+  *end = saved;
+  return matched;
+}
+
 /* known-hosts verify rc parity with OpenSSH-style trust prompts:
  *   0 = host matches recorded key (or recorded with no expected key supplied)
  *   1 = host recorded but key differs (mismatch — TOFU break, the dangerous case)
@@ -3349,10 +3569,12 @@ static int known_hosts_cmd (WORD_LIST *args)
   const char *sub = next_word (&args);
   if (!sub) { builtin_error ("known-hosts add|verify HOST [KEY] [-V RC]"); return EX_USAGE; }
 
-  const char *home = getenv ("HOME");
+  char home_held[512], configured_held[512];
+  const char *home = bssh_env ("HOME", home_held, sizeof home_held);
   if (!home) home = "/root";
   char dir[512], path[512];
-  const char *configured = getenv ("BASHSSH_KNOWN_HOSTS");
+  const char *configured = bssh_env ("BASHSSH_KNOWN_HOSTS", configured_held,
+                                     sizeof configured_held);
   if (snprintf (dir, sizeof dir, "%s/.ssh", home) >= (int) sizeof dir ||
       (configured && *configured
        ? snprintf (path, sizeof path, "%s", configured)
@@ -3435,13 +3657,9 @@ static int known_hosts_cmd (WORD_LIST *args)
       return rc;
     }
 
-  /* `ssh-keygen -F HOST` parity: print matching entries, rc 0 if any matched
-   * (or any printed when no filter is given), rc 1 if a filter was supplied
-   * but matched nothing.  Missing file is treated as empty: rc 1 with filter,
-   * rc 0 without.  Hashed entries (|1|salt|hash) are HMAC-matched against
-   * the filter via `bk_hashed_match`, matching `ssh-keygen -F HOST`
-   * behavior — pre-fix code did a literal `strncmp(field, filter)` so
-   * hashed entries were silently invisible to filtered list. */
+  /* Filtered list follows ssh-keygen -q -F for the bounded local host-field
+   * grammar above. Unfiltered list retains the custom records-only surface;
+   * a missing file remains empty for this existing list contract. */
   if (!strcmp (sub, "list"))
     {
       const char *filter = NULL, *w;
@@ -3452,94 +3670,96 @@ static int known_hosts_cmd (WORD_LIST *args)
         }
       FILE *f = fopen (path, "r");
       if (!f) return filter ? EXECUTION_FAILURE : EXECUTION_SUCCESS;
-      char line[1024];
-      size_t flen = filter ? strlen (filter) : 0;
+      char *line = NULL;
+      size_t cap = 0;
+      ssize_t len;
       int matched = 0;
-      while (fgets (line, sizeof line, f))
+      while ((len = getline (&line, &cap, f)) >= 0)
         {
-          char *p = line;
-          while (*p == ' ' || *p == '\t') p++;
-          if (*p == '\0' || *p == '\n' || *p == '#') continue;
-          if (filter)
-            {
-              /* Isolate the first whitespace-delimited field so we can
-                 branch on `|1|`-prefix without re-scanning. */
-              char *field_end = p;
-              while (*field_end && *field_end != ' ' && *field_end != '\t')
-                field_end++;
-              if (*field_end != ' ' && *field_end != '\t') continue;
-              char saved = *field_end;
-              *field_end = '\0';
-              int host_matches;
-              if (p[0] == '|' && p[1] == '1' && p[2] == '|')
-                host_matches = bk_hashed_match (p, filter);
-              else
-                host_matches = (strlen (p) == flen
-                                && strncmp (p, filter, flen) == 0);
-              *field_end = saved;
-              if (!host_matches) continue;
-            }
-          fputs (p, stdout);
+          char *record = line;
+          while (*record == ' ' || *record == '\t') record++;
+          if (!*record || *record == '\n' || *record == '#') continue;
+          if (filter && !bssh_known_line_matches (line, filter)) continue;
+          fwrite (line, 1, (size_t) len, stdout);
           matched = 1;
         }
-      fclose (f);
-      if (filter && !matched) return EXECUTION_FAILURE;
-      return EXECUTION_SUCCESS;
+      int failed = !feof (f);
+      free (line);
+      if (fclose (f) != 0) failed = 1;
+      if (failed) builtin_error ("known-hosts: cannot read %s", path);
+      return sh_chkwrite (failed || (filter && !matched)
+                          ? EXECUTION_FAILURE : EXECUTION_SUCCESS);
     }
 
-  /* `ssh-keygen -R HOST` parity: rewrite the file removing every entry whose
-   * host token equals HOST; comments and blank lines are preserved verbatim.
-   * Always rc 0 (idempotent — missing file and no-match both succeed); the
-   * number of removed entries is reported on stderr. */
+  /* ssh-keygen -R: remove whole matching records, retain the original as
+   * PATH.old, preserve ordinary permission bits, and report found line numbers
+   * and the completed update on stdout. No-match leaves the file untouched. */
   if (!strcmp (sub, "remove"))
     {
       const char *host = next_word (&args);
       if (!host || next_word (&args))
         { builtin_error ("known-hosts remove HOST"); return EX_USAGE; }
       FILE *f = fopen (path, "r");
-      if (!f) { fprintf (stderr, "known-hosts: %s not found, nothing to remove\n", path); return EXECUTION_SUCCESS; }
-      char tmp[600];
-      snprintf (tmp, sizeof tmp, "%s.tmp", path);
-      FILE *t = fopen (tmp, "w");
-      if (!t) { fclose (f); builtin_error ("%s: %s", tmp, strerror (errno)); return EXECUTION_FAILURE; }
-      char line[1024];
-      size_t hlen = strlen (host);
-      size_t removed = 0;
-      while (fgets (line, sizeof line, f))
+      if (!f) {
+        builtin_error ("known-hosts: %s: %s", path, strerror (errno));
+        return 255;
+      }
+      struct stat st;
+      if (fstat (fileno (f), &st) < 0) {
+        builtin_error ("known-hosts: %s: %s", path, strerror (errno));
+        fclose (f); return EXECUTION_FAILURE;
+      }
+      char tmp[600], backup[600];
+      snprintf (tmp, sizeof tmp, "%s.XXXXXX", path);
+      snprintf (backup, sizeof backup, "%s.old", path);
+      int fd = mkstemp (tmp);
+      if (fd < 0) {
+        builtin_error ("known-hosts: %s: %s", path, strerror (errno));
+        fclose (f); return EXECUTION_FAILURE;
+      }
+      FILE *t = fdopen (fd, "w");
+      if (!t || fchmod (fd, st.st_mode & 0777) < 0) {
+        builtin_error ("known-hosts: %s: %s", path, strerror (errno));
+        if (t) fclose (t); else close (fd);
+        fclose (f); unlink (tmp); return EXECUTION_FAILURE;
+      }
+      char *line = NULL;
+      size_t cap = 0, lineno = 0, removed = 0;
+      ssize_t len;
+      int failed = 0;
+      while ((len = getline (&line, &cap, f)) >= 0)
         {
-          char *p = line;
-          while (*p == ' ' || *p == '\t') p++;
-          if (*p == '\0' || *p == '\n' || *p == '#')
-            { fputs (line, t); continue; }
-          /* Isolate the first whitespace-delimited field so hashed
-             `|1|salt|hash` entries can be HMAC-matched against the
-             literal host argument (matching `ssh-keygen -R HOST`).
-             Pre-fix code did a literal `strncmp(field, host)` so
-             hashed entries were immune to remove. */
-          char *field_end = p;
-          while (*field_end && *field_end != ' ' && *field_end != '\t')
-            field_end++;
-          if (*field_end != ' ' && *field_end != '\t')
-            { fputs (line, t); continue; }
-          char saved = *field_end;
-          *field_end = '\0';
-          int host_matches;
-          if (p[0] == '|' && p[1] == '1' && p[2] == '|')
-            host_matches = bk_hashed_match (p, host);
-          else
-            host_matches = (strlen (p) == hlen
-                            && strncmp (p, host, hlen) == 0);
-          *field_end = saved;
-          if (host_matches) { removed++; continue; }
-          fputs (line, t);
+          lineno++;
+          if (bssh_known_line_matches (line, host)) {
+            printf ("# Host %s found: line %zu\n", host, lineno);
+            removed++;
+          } else if (fwrite (line, 1, (size_t) len, t) != (size_t) len) {
+            failed = 1; break;
+          }
         }
-      fclose (f); fclose (t);
-      if (rename (tmp, path) < 0)
-        { unlink (tmp); builtin_error ("rename %s: %s", path, strerror (errno)); return EXECUTION_FAILURE; }
-      chmod (path, 0644);
-      fprintf (stderr, "known-hosts: removed %zu entr%s for %s\n",
-               removed, removed == 1 ? "y" : "ies", host);
-      return EXECUTION_SUCCESS;
+      if (!feof (f)) failed = 1;
+      free (line);
+      if (fclose (f) != 0) failed = 1;
+      if (fclose (t) != 0) failed = 1;
+      if (failed) {
+        unlink (tmp);
+        builtin_error ("known-hosts: cannot rewrite %s", path);
+        return sh_chkwrite (EXECUTION_FAILURE);
+      }
+      if (!removed) {
+        unlink (tmp);
+        fprintf (stderr, "Host %s not found in %s\n", host, path);
+        return EXECUTION_SUCCESS;
+      }
+      /* Keep the source pathname intact until the replacement is complete.
+       * The backup links the original inode before atomic replacement. */
+      if ((unlink (backup) < 0 && errno != ENOENT)
+          || link (path, backup) < 0 || rename (tmp, path) < 0) {
+        builtin_error ("known-hosts: cannot update %s: %s", path, strerror (errno));
+        unlink (tmp); return sh_chkwrite (EXECUTION_FAILURE);
+      }
+      printf ("%s updated.\nOriginal contents retained as %s\n", path, backup);
+      return sh_chkwrite (EXECUTION_SUCCESS);
     }
 
   builtin_error ("known-hosts: unknown subcommand: %s", sub);
@@ -4340,6 +4560,90 @@ static int exec_cmd (WORD_LIST *args)
   return rc == 0 ? EXECUTION_SUCCESS : EXECUTION_FAILURE;
 }
 
+/* One command on another machine, start to finish, with this process's own
+   input and output on it: connect, run, hand the streams through, close. A
+   handle is for a conversation held over several calls; this is for one
+   command that talks back while it runs, which is what a protocol like
+   git's needs and what `ssh HOST CMD` does everywhere else. The status is
+   the remote command's own. */
+static int run_cmd (WORD_LIST *args)
+{
+  const char *host = NULL, *cmd = NULL, *port = NULL, *user = NULL;
+  const char *key = NULL, *jump = NULL, *w;
+  int forward_agent = 0;
+  g_sendenv_n = 0;                            /* SendEnv is per run */
+  while ((w = next_word (&args)))
+    {
+      if (!strcmp (w, "-p") && args) port = next_word (&args);
+      else if (!strcmp (w, "-i") && args) key = next_word (&args);
+      else if (!strcmp (w, "-l") && args) user = next_word (&args);
+      else if ((!strcmp (w, "-J") || !strcmp (w, "--jump")) && args)
+        jump = next_word (&args);
+      else if (!strcmp (w, "-A") || !strcmp (w, "--forward-agent"))
+        forward_agent = 1;
+      else if (!strcmp (w, "--setenv") && args)
+        {
+          const char *kv = next_word (&args);
+          if (!kv || !strchr (kv, '='))
+            { builtin_error ("run: --setenv needs NAME=VALUE"); return EX_USAGE; }
+          if (g_sendenv_n < BASHSSH_MAX_SENDENV)
+            g_sendenv[g_sendenv_n++] = (char *) kv;
+        }
+      else if (!strcmp (w, "--help"))
+        {
+          puts ("run [user@]HOST CMD [-p PORT] [-l USER] [-i KEY] [-J jump] [-A] [--setenv NAME=VALUE]");
+          puts ("  runs CMD on HOST with this process's stdin, stdout and stderr on it");
+          puts ("  and leaves with the remote command's own status (encrypted transport)");
+          return EXECUTION_SUCCESS;
+        }
+      else if (w[0] == '-' && w[1])
+        { builtin_error ("run: unknown option: %s", w); return EX_USAGE; }
+      else if (!host) host = w;
+      else if (!cmd) cmd = w;
+      else { builtin_error ("run: unknown arg: %s", w); return EX_USAGE; }
+    }
+  if (!host || !cmd)
+    {
+      builtin_error ("run [user@]HOST CMD [-p PORT] [-l USER] [-i KEY] [-J jump] [-A] [--setenv NAME=VALUE]");
+      return EX_USAGE;
+    }
+
+  /* user@host, which is how everyone writes it. -l wins, as ssh's does. */
+  char named[128];
+  const char *at = strrchr (host, '@');
+  if (at)
+    {
+      size_t len = (size_t) (at - host);
+      if (len >= sizeof named)
+        { builtin_error ("run: user name is too long"); return EX_USAGE; }
+      memcpy (named, host, len);
+      named[len] = '\0';
+      if (!user) user = named;
+      host = at + 1;
+    }
+
+  int id = libssh_connect_session (host, port, user, key, forward_agent, jump);
+  if (id < 0)
+    return EXECUTION_FAILURE;                 /* it has said why already */
+  ssh_handle sh;
+  memset (&sh, 0, sizeof sh);
+  sh.libssh = 1;
+  sh.id = id;
+  snprintf (sh.host, sizeof sh.host, "%s", host);
+  int rc = run_libssh_stream (&sh, cmd);
+#if BASHSSH_HAVE_LIBSSH
+  {
+    libssh_slot *slot = libssh_find_slot (id);
+    if (slot)
+      {
+        bssh_forward_cancel_handle (id);
+        libssh_clear_slot (slot);
+      }
+  }
+#endif
+  return rc < 0 ? EXECUTION_FAILURE : rc;
+}
+
 /* Interactive PTY shell on an established (libssh) handle. F06 item 3 slice 3.
    `ssh.sh`'s no-command path calls `ssh shell "$HANDLE" -h SSH_FD`; the
    trailing `-h VAR` is a vestigial fd-bind and is tolerated/ignored. */
@@ -4603,6 +4907,7 @@ int ssh_builtin (WORD_LIST *list)
   if (!strcmp (cmd, "known-hosts")) return known_hosts_cmd (list);
   if (!strcmp (cmd, "connect")) return connect_cmd (list);
   if (!strcmp (cmd, "exec")) return exec_cmd (list);
+  if (!strcmp (cmd, "run")) return run_cmd (list);
   if (!strcmp (cmd, "sftp")) return sftp_cmd (list);
   if (!strcmp (cmd, "forward")) return forward_cmd (list);
   if (!strcmp (cmd, "shell")) return shell_cmd (list);
@@ -4625,9 +4930,12 @@ int ssh_builtin (WORD_LIST *list)
 char *ssh_doc[] = {
   "ssh command-stream, libssh, and OpenSSH-backed client",
   "connect HOST [-p PORT] [-l USER] [-i KEY] [--native|--encrypted|--openssh] [-h VAR]",
+  "  (with no -i, the usual keys under ~/.ssh are tried, in ssh's order)",
   "connect HOST ... [-A|--forward-agent]  request agent forwarding on encrypted exec channels",
   "keyscan HOST [-p PORT] [-t TYPES] [-T TIMEOUT] [-H]",
   "exec HANDLE CMD [-i INFILE] [-o OUTFILE] [-e ERRFILE] [-V OUT] [-V ERR] [-V RC]",
+  "run [user@]HOST CMD [-p PORT] [-l USER] [-i KEY] [-J jump] [-A] [--setenv NAME=VALUE]",
+  "  (one command, this process's own stdin/stdout/stderr on it, remote status)",
   "sftp HANDLE put LOCAL REMOTE [--mode 0NNN] [-V PROGRESS]",
   "sftp HANDLE get REMOTE LOCAL",
   "forward HANDLE -L LADDR:LPORT:RADDR:RPORT | -R RADDR:RPORT:LADDR:LPORT | --list | --cancel ID",
@@ -4641,7 +4949,8 @@ char *ssh_doc[] = {
   "known-hosts add HOST KEY",
   "known-hosts verify HOST [KEY] [-V RC]   (rc 0 match, 1 mismatch, 2 unknown)",
   "known-hosts list [HOST]                  (rc 0 if any matched / no filter, 1 if filtered no-match)",
-  "known-hosts remove HOST                  (idempotent; rewrites file, preserves comments/blanks)",
+  "known-hosts remove HOST                  (preserves comments/mode; backs up to FILE.old)",
+  "  remove reports updates on stdout; no-match succeeds, missing file returns 255.",
   NULL
 };
 struct builtin ssh_struct = {

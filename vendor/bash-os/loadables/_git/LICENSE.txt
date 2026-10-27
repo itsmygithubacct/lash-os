@@ -1,0 +1,10 @@
+The _git helper library is part of bash-os and is covered by the project's
+MIT licence, in LICENSE at the top of this repository. It contains no
+third-party code.
+
+Its formats — loose objects, the index, packfiles and the wire protocol —
+are implemented from their published descriptions. No code is copied or
+translated from git, which is licensed under GPL-2.0.
+
+The collision-detecting SHA-1 it calls lives in ../_sha1dc/, with its own
+notice.

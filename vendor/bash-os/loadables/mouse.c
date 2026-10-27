@@ -3,7 +3,7 @@
  *
  * Phase 3 slice from PROPOSAL_NCURSES_INPUT.md. Supports the terminal
  * encodings bash-os needs before consumer cutover: SGR 1006
- * ("\033[<b;x;yM/m"), urxvt 1015 ("\033[b;x;yM/m"), and legacy X10
+ * ("\033[<b;x;yM/m"), urxvt 1015 ("\033[b;x;yM"), and legacy X10
  * ("\033[M Cb Cx Cy"). Decoded events are printed as stable records.
  *
  * Surface:
@@ -144,6 +144,11 @@ bm_decode_1015 (const unsigned char *buf, size_t len)
     return -1;
   if (p != len - 1 || buf[p] != 'M')
     return -1;
+  /* 1015 prints the X10 button byte as decimal, including its +32
+     offset.  SGR omits it; decimal coordinates are already 1-based. */
+  if (b < 32)
+    return -1;
+  b -= 32;
   bm_print ("1015", b, x, y, (b & 3) == 3);
   return 0;
 }

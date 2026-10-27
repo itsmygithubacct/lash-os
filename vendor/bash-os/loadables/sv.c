@@ -68,6 +68,7 @@
 #include <fcntl.h>
 #include <ctype.h>
 #include <netdb.h>
+#include <limits.h>
 #include <pwd.h>
 #include <poll.h>
 #include <signal.h>
@@ -102,6 +103,18 @@ struct bsv_log_policy {
   int generations;
   int timestamp;
 };
+
+/* bash hands a loadable one buffer for a variable set for a single command
+   (VAR=x sv ...) and frees it when the next one is asked for, so a value has
+   to be taken away before another is read. */
+static const char *
+bsv_env (const char *name, char *out, size_t outsz)
+{
+  const char *value = getenv (name);
+  if (!value || !*value) return NULL;
+  snprintf (out, outsz, "%s", value);
+  return out;
+}
 
 static int
 bsv_clamp_log_generations (long n)
@@ -228,7 +241,8 @@ bsv_mkdir_p (const char *path, mode_t mode)
 static int
 bsv_valid_name (const char *s)
 {
-  if (!s || !*s || strlen (s) > 96) return 0;
+  if (!s || !*s || strlen (s) > 96 ||
+      strcmp (s, ".") == 0 || strcmp (s, "..") == 0) return 0;
   for (; *s; s++)
     if (!(('A' <= *s && *s <= 'Z') || ('a' <= *s && *s <= 'z') ||
           ('0' <= *s && *s <= '9') || *s == '_' || *s == '-' || *s == '.'))
@@ -1000,6 +1014,19 @@ bsv_resolve_user (const char *name, uid_t *uid, gid_t *gid,
 
 extern char **environ;
 
+/* The supervisor ignores SIGHUP. A service, finish script, or readiness
+   command is given the disposition from before that ignore. Exec turns a
+   caught handler into the default and keeps an ignore. */
+static struct sigaction bsv_caller_hup;
+static int bsv_caller_hup_saved;
+
+static void
+bsv_restore_caller_hup (void)
+{
+  if (bsv_caller_hup_saved)
+    sigaction (SIGHUP, &bsv_caller_hup, NULL);
+}
+
 /* execve the run script with an explicitly assembled envp: bash's exported
    environment minus any stale SV_NAME/NOTIFY_SOCKET, plus the supervisor's
    per-service values.  setenv() in a forked loadable child does NOT survive
@@ -1008,11 +1035,11 @@ extern char **environ;
    bsv_execve_with_listen_env already works around for LISTEN_*. */
 static void
 bsv_execve_service (const char *run_script, const char *name,
-                    const char *notify_socket)
+                    const char *notify_socket, const char *arg)
 {
   size_t nenv = 0, out = 0;
   char svbuf[160], nfbuf[192];
-  char *argv[2];
+  char *argv[3];
   char **envp;
 
   while (environ && environ[nenv])
@@ -1039,7 +1066,9 @@ bsv_execve_service (const char *run_script, const char *name,
   envp[out] = NULL;
 
   argv[0] = (char *) run_script;
-  argv[1] = NULL;
+  argv[1] = (char *) arg;
+  argv[2] = NULL;
+  bsv_restore_caller_hup ();
   execve (run_script, argv, envp);
   fprintf (stderr, "sv: exec %s: %s\n", run_script, strerror (errno));
   _exit (127);
@@ -1111,13 +1140,16 @@ bsv_exec_service (const char *name, const char *run_script, const char *ns,
           _exit (1);
         }
       if (ns && *ns)
-        execl ("/bin/bash", "bash", "-c",
-               "export SV_NAME=\"$1\"; "
-               "[ -n \"$3\" ] && export NOTIFY_SOCKET=\"$3\"; exec \"$2\"",
-               "sv-service", name, run_script,
-               notify_socket ? notify_socket : "", (char *) NULL);
+        {
+          bsv_restore_caller_hup ();
+          execl ("/bin/bash", "bash", "-c",
+                 "export SV_NAME=\"$1\"; "
+                 "[ -n \"$3\" ] && export NOTIFY_SOCKET=\"$3\"; exec \"$2\"",
+                 "sv-service", name, run_script,
+                 notify_socket ? notify_socket : "", (char *) NULL);
+        }
       else
-        bsv_execve_service (run_script, name, notify_socket);
+        bsv_execve_service (run_script, name, notify_socket, NULL);
       fprintf (stderr, "sv: exec %s: %s\n", run_script, strerror (errno));
       _exit (127);
     }
@@ -1132,15 +1164,18 @@ bsv_exec_service (const char *name, const char *run_script, const char *ns,
     }
 
   if (ns && *ns)
-    execl ("/bin/bash", "bash", "-c",
-           "export SV_NAME=\"$3\"; "
-           "[ -n \"$4\" ] && export NOTIFY_SOCKET=\"$4\"; "
-           "if [[ $(type -t ns 2>/dev/null) == builtin ]]; then "
-           "ns spawn --no-new-privs \"$1\" \"$2\"; exit $?; fi; exec \"$2\"",
-           "sv-service", ns, run_script, name,
-           notify_socket ? notify_socket : "", (char *) NULL);
+    {
+      bsv_restore_caller_hup ();
+      execl ("/bin/bash", "bash", "-c",
+             "export SV_NAME=\"$3\"; "
+             "[ -n \"$4\" ] && export NOTIFY_SOCKET=\"$4\"; "
+             "if [[ $(type -t ns 2>/dev/null) == builtin ]]; then "
+             "ns spawn --no-new-privs \"$1\" \"$2\"; exit $?; fi; exec \"$2\"",
+             "sv-service", ns, run_script, name,
+             notify_socket ? notify_socket : "", (char *) NULL);
+    }
   else
-    bsv_execve_service (run_script, name, notify_socket);
+    bsv_execve_service (run_script, name, notify_socket, NULL);
   _exit (127);
 }
 
@@ -1213,44 +1248,65 @@ bsv_log_policy_for (const char *name, struct bsv_log_policy *pol)
   pol->generations = bsv_clamp_log_generations (pol->generations);
 }
 
-static void
-bsv_write_timestamp_prefix (int fd)
+/* Regular log files can short-write (or be interrupted). Preserve every byte
+   and report the first error rather than silently accepting a partial record. */
+static int
+bsv_log_write_all (int fd, const char *buf, size_t n)
 {
-  char ts[64];
-  struct timespec tv;
-  struct tm tm;
-  clock_gettime (CLOCK_REALTIME, &tv);
-  gmtime_r (&tv.tv_sec, &tm);
-  int n = snprintf (ts, sizeof ts, "%04d-%02d-%02dT%02d:%02d:%02d.%09ldZ ",
-                    tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
-                    tm.tm_hour, tm.tm_min, tm.tm_sec, tv.tv_nsec);
-  if (n > 0)
-    write (fd, ts, (size_t) n);
+  while (n)
+    {
+      ssize_t written = write (fd, buf, n);
+      if (written < 0 && errno == EINTR) continue;
+      if (written <= 0)
+        { if (written == 0) errno = EIO; return -1; }
+      buf += written;
+      n -= (size_t) written;
+    }
+  return 0;
 }
 
-static void
+static int
 bsv_write_timestamped_chunk (int fd, const char *buf, ssize_t n, int *line_start)
 {
-  ssize_t i = 0;
-  while (i < n)
+  char out[16384];
+  size_t used = 0;
+  while (n > 0)
     {
       if (*line_start)
         {
-          bsv_write_timestamp_prefix (fd);
+          if (sizeof out - used < 64)
+            {
+              if (bsv_log_write_all (fd, out, used) < 0) return -1;
+              used = 0;
+            }
+          struct timespec tv;
+          struct tm tm;
+          clock_gettime (CLOCK_REALTIME, &tv);
+          gmtime_r (&tv.tv_sec, &tm);
+          int len = snprintf (out + used, sizeof out - used,
+                              "%04d-%02d-%02dT%02d:%02d:%02d.%09ldZ ",
+                              tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+                              tm.tm_hour, tm.tm_min, tm.tm_sec, tv.tv_nsec);
+          if (len < 0 || (size_t) len >= sizeof out - used)
+            { errno = EIO; return -1; }
+          used += (size_t) len;
           *line_start = 0;
         }
-      ssize_t j = i;
-      while (j < n && buf[j] != '\n') j++;
-      if (j > i)
-        write (fd, buf + i, (size_t) (j - i));
-      if (j < n && buf[j] == '\n')
+      const char *nl = memchr (buf, '\n', (size_t) n);
+      size_t take = nl ? (size_t) (nl - buf) + 1 : (size_t) n;
+      if (take > sizeof out - used) take = sizeof out - used;
+      memcpy (out + used, buf, take);
+      used += take;
+      *line_start = take > 0 && buf[take - 1] == '\n';
+      buf += take;
+      n -= (ssize_t) take;
+      if (used == sizeof out)
         {
-          write (fd, "\n", 1);
-          *line_start = 1;
-          j++;
+          if (bsv_log_write_all (fd, out, used) < 0) return -1;
+          used = 0;
         }
-      i = j;
     }
+  return bsv_log_write_all (fd, out, used);
 }
 
 static int
@@ -1319,8 +1375,9 @@ bsv_run_finish (const char *name, int st, const char *logfile)
           dup2 (fd, STDERR_FILENO);
           if (fd > STDERR_FILENO) close (fd);
         }
-      execl (finish, finish, arg, (char *) NULL);
-      fprintf (stderr, "sv: exec %s: %s\n", finish, strerror (errno));
+      /* Use the explicit environment builder, as for run scripts: Bash's
+         exec interposition can otherwise discard libc-only SV_NAME. */
+      bsv_execve_service (finish, name, NULL, arg);
       _exit (127);
     }
   while (waitpid (pid, NULL, 0) < 0 && errno == EINTR)
@@ -1337,17 +1394,14 @@ bsv_fork_service_logged (const char *name, const char *run_script,
 {
   int pfd[2] = { -1, -1 };
   *pipe_read = -1;
-  *log_fd = -1;
+  *log_fd = bsv_open_log (logfile, policy);
+  if (*log_fd < 0) return -1;
   if (policy && policy->timestamp)
     {
       if (pipe (pfd) < 0)
-        return -1;
-      *log_fd = bsv_open_log (logfile, policy);
-      if (*log_fd < 0)
-        {
-          close (pfd[0]); close (pfd[1]);
-          return -1;
-        }
+        { int saved = errno; close (*log_fd); errno = saved; return -1; }
+      fcntl (pfd[0], F_SETFD, FD_CLOEXEC);
+      fcntl (pfd[1], F_SETFD, FD_CLOEXEC);
     }
   pid_t pid = fork ();
   if (pid < 0)
@@ -1372,13 +1426,9 @@ bsv_fork_service_logged (const char *name, const char *run_script,
         }
       else
         {
-          int fd = bsv_open_log (logfile, policy);
-          if (fd >= 0)
-            {
-              dup2 (fd, STDOUT_FILENO);
-              dup2 (fd, STDERR_FILENO);
-              if (fd > STDERR_FILENO) close (fd);
-            }
+          dup2 (*log_fd, STDOUT_FILENO);
+          dup2 (*log_fd, STDERR_FILENO);
+          if (*log_fd > STDERR_FILENO) close (*log_fd);
         }
       setpgid (0, 0);
       bsv_exec_service (name, run_script, ns_flags, run_user, caps_drop,
@@ -1390,20 +1440,69 @@ bsv_fork_service_logged (const char *name, const char *run_script,
       fcntl (pfd[0], F_SETFL, fcntl (pfd[0], F_GETFL, 0) | O_NONBLOCK);
       *pipe_read = pfd[0];
     }
+  if (pfd[0] < 0)
+    { close (*log_fd); *log_fd = -1; }
   return pid;
 }
 
 static void
-bsv_drain_log_pipe_once (int rfd, int lfd, int *line_start)
+bsv_drain_log_pipe_once (int rfd, int lfd, int *line_start, int *log_error)
 {
-  char buf[512];
-  while (1)
+  char buf[16384];
+  /* Bound each turn so a continuously writing child cannot starve stop,
+     waitpid or readiness handling. After a sink error keep draining the
+     pipe: the child must be able to finish and be reaped. */
+  for (size_t total = 0; total < 262144; )
     {
       ssize_t n = read (rfd, buf, sizeof buf);
-      if (n > 0)
-        bsv_write_timestamped_chunk (lfd, buf, n, line_start);
-      else
-        break;
+      if (n < 0 && errno == EINTR) continue;
+      if (n <= 0)
+        {
+          if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && !*log_error)
+            *log_error = errno;
+          break;
+        }
+      total += (size_t) n;
+      if (!*log_error && bsv_write_timestamped_chunk (lfd, buf, n, line_start) < 0)
+        *log_error = errno ? errno : EIO;
+    }
+}
+
+static void
+bsv_log_wait (int rfd)
+{
+  if (rfd >= 0)
+    {
+      struct pollfd pfd = { rfd, POLLIN, 0 };
+      poll (&pfd, 1, 100);
+    }
+  else
+    usleep (100000);
+}
+
+/* Stop while still servicing the child's log pipe. A blocking wait before
+   draining can deadlock a TERM handler that writes more than pipe capacity. */
+static void
+bsv_stop_child (pid_t pid, int *st, int rfd, int lfd,
+                int *line_start, int *log_error)
+{
+  struct timespec start, now;
+  clock_gettime (CLOCK_MONOTONIC, &start);
+  kill (-pid, SIGTERM);
+  kill (pid, SIGTERM);
+  while (1)
+    {
+      if (rfd >= 0) bsv_drain_log_pipe_once (rfd, lfd, line_start, log_error);
+      pid_t w = waitpid (pid, st, WNOHANG);
+      if (w == pid || (w < 0 && errno != EINTR)) break;
+      clock_gettime (CLOCK_MONOTONIC, &now);
+      if (now.tv_sec - start.tv_sec > 2 ||
+          (now.tv_sec - start.tv_sec == 2 && now.tv_nsec >= start.tv_nsec))
+        {
+          kill (-pid, SIGKILL);
+          kill (pid, SIGKILL);
+        }
+      bsv_log_wait (rfd);
     }
 }
 
@@ -1416,17 +1515,14 @@ bsv_fork_readiness_logged (const char *name,
 {
   int pfd[2] = { -1, -1 };
   *pipe_read = -1;
-  *log_fd = -1;
+  *log_fd = bsv_open_log (logfile, policy);
+  if (*log_fd < 0) return -1;
   if (policy && policy->timestamp)
     {
       if (pipe (pfd) < 0)
-        return -1;
-      *log_fd = bsv_open_log (logfile, policy);
-      if (*log_fd < 0)
-        {
-          close (pfd[0]); close (pfd[1]);
-          return -1;
-        }
+        { int saved = errno; close (*log_fd); errno = saved; return -1; }
+      fcntl (pfd[0], F_SETFD, FD_CLOEXEC);
+      fcntl (pfd[1], F_SETFD, FD_CLOEXEC);
     }
 
   pid_t pid = fork ();
@@ -1454,14 +1550,11 @@ bsv_fork_readiness_logged (const char *name,
         }
       else
         {
-          int fd = bsv_open_log (logfile, policy);
-          if (fd >= 0)
-            {
-              dup2 (fd, STDOUT_FILENO);
-              dup2 (fd, STDERR_FILENO);
-              if (fd > STDERR_FILENO) close (fd);
-            }
+          dup2 (*log_fd, STDOUT_FILENO);
+          dup2 (*log_fd, STDERR_FILENO);
+          if (*log_fd > STDERR_FILENO) close (*log_fd);
         }
+      bsv_restore_caller_hup ();
       if (ready->use_shell)
         execl ("/bin/bash", "bash", "-c", ready->command, (char *) NULL);
       else
@@ -1476,6 +1569,8 @@ bsv_fork_readiness_logged (const char *name,
       fcntl (pfd[0], F_SETFL, fcntl (pfd[0], F_GETFL, 0) | O_NONBLOCK);
       *pipe_read = pfd[0];
     }
+  if (pfd[0] < 0)
+    { close (*log_fd); *log_fd = -1; }
   return pid;
 }
 
@@ -1486,9 +1581,11 @@ bsv_run_readiness_probe (const char *name,
                          const char *status,
                          const char *transition,
                          const char *logfile,
-                         const struct bsv_log_policy *policy)
+                         const struct bsv_log_policy *policy,
+                         int svc_rfd, int svc_lfd,
+                         int *svc_line_start, int *svc_log_error)
 {
-  int pipe_read = -1, log_fd = -1, line_start = 1;
+  int pipe_read = -1, log_fd = -1, line_start = 1, log_error = 0;
   int st = 0;
   time_t deadline;
   pid_t w;
@@ -1513,8 +1610,12 @@ bsv_run_readiness_probe (const char *name,
   deadline = time (NULL) + ready->timeout;
   while (1)
     {
+      /* The probe may wait for work that the service performs after writing
+         its startup log. Drain both pipes while readiness is pending. */
+      if (svc_rfd >= 0)
+        bsv_drain_log_pipe_once (svc_rfd, svc_lfd, svc_line_start, svc_log_error);
       if (pipe_read >= 0)
-        bsv_drain_log_pipe_once (pipe_read, log_fd, &line_start);
+        bsv_drain_log_pipe_once (pipe_read, log_fd, &line_start, &log_error);
       pid_t got = waitpid (w, &st, WNOHANG);
       if (got == w)
         break;
@@ -1543,7 +1644,7 @@ bsv_run_readiness_probe (const char *name,
               waitpid (w, &st, 0);
             }
           if (pipe_read >= 0)
-            bsv_drain_log_pipe_once (pipe_read, log_fd, &line_start);
+            bsv_drain_log_pipe_once (pipe_read, log_fd, &line_start, &log_error);
           bsv_writef (transition, "readiness-failed timeout\n");
           bsv_writef (status, "readiness-failed timeout pid=%ld\n",
                       (long) svc_pid);
@@ -1557,16 +1658,22 @@ bsv_run_readiness_probe (const char *name,
             }
           return EXECUTION_FAILURE;
         }
-      usleep (100000);
+      bsv_log_wait (pipe_read);
     }
 
   if (pipe_read >= 0)
     {
-      bsv_drain_log_pipe_once (pipe_read, log_fd, &line_start);
+      bsv_drain_log_pipe_once (pipe_read, log_fd, &line_start, &log_error);
       close (pipe_read);
       close (log_fd);
     }
 
+  if (log_error)
+    {
+      bsv_writef (transition, "readiness-failed log errno=%d\n", log_error);
+      bsv_writef (status, "readiness-failed log errno=%d\n", log_error);
+      return EXECUTION_FAILURE;
+    }
   if (WIFEXITED (st) && WEXITSTATUS (st) == 0)
     {
       bsv_writef (transition, "ready\n");
@@ -2043,7 +2150,14 @@ bsv_supervise (const char *name)
 
   signal (SIGTERM, bsv_on_term);
   signal (SIGINT, bsv_on_term);
-  signal (SIGHUP, SIG_IGN);
+  {
+    struct sigaction ignore;
+    memset (&ignore, 0, sizeof ignore);
+    ignore.sa_handler = SIG_IGN;
+    sigemptyset (&ignore.sa_mask);
+    if (sigaction (SIGHUP, &ignore, &bsv_caller_hup) == 0)
+      bsv_caller_hup_saved = 1;
+  }
   /* The supervisor was forked from bash, which installs a SIGCHLD
      handler that opportunistically reaps children for job control.
      Inheriting that handler here breaks our waitpid(WNOHANG) loop:
@@ -2118,7 +2232,7 @@ bsv_supervise (const char *name)
 
       bsv_writef (transition, "starting\n");
       bsv_writef (status, "starting\n");
-      int pipe_read = -1, log_fd = -1, line_start = 1;
+      int pipe_read = -1, log_fd = -1, line_start = 1, log_error = 0;
       pid_t pid = bsv_fork_service_logged (name, run_script, ns_flags, run_user,
                                            caps_drop, logfile, &log_policy,
                                            notify_mode ? notify_env : NULL,
@@ -2139,12 +2253,19 @@ bsv_supervise (const char *name)
           if (nstate.fd >= 0) { close (nstate.fd); nstate.fd = -1; }
           if (pipe_read >= 0)
             {
-              bsv_drain_log_pipe_once (pipe_read, log_fd, &line_start);
+              bsv_drain_log_pipe_once (pipe_read, log_fd, &line_start, &log_error);
               close (pipe_read);
               close (log_fd);
             }
+          unlink (pidfile);
           bsv_write_exit_status_pair (status, transition, st);
           bsv_run_finish (name, st, logfile);
+          if (log_error)
+            {
+              bsv_writef (transition, "log-failed errno=%d\n", log_error);
+              bsv_writef (status, "log-failed errno=%d\n", log_error);
+              break;
+            }
           if (oneshot)
             {
               bsv_writef (transition, (WIFEXITED (st) && WEXITSTATUS (st) == 0)
@@ -2186,7 +2307,8 @@ bsv_supervise (const char *name)
       if (!oneshot && (ready_policy.mode == BSV_READY_PROBE ||
                        ready_policy.mode == BSV_READY_COMMAND))
         bsv_run_readiness_probe (name, &ready_policy, pid, status, transition,
-                                 logfile, &log_policy);
+                                 logfile, &log_policy, pipe_read, log_fd,
+                                 &line_start, &log_error);
       time_t notify_deadline = 0;
       if (notify_mode)
         {
@@ -2197,7 +2319,7 @@ bsv_supervise (const char *name)
       while (!bsv_stop)
         {
           if (pipe_read >= 0)
-            bsv_drain_log_pipe_once (pipe_read, log_fd, &line_start);
+            bsv_drain_log_pipe_once (pipe_read, log_fd, &line_start, &log_error);
           if (notify_mode && nstate.fd >= 0)
             {
               bsv_notify_drain (&nstate, pid, status, transition, pidfile);
@@ -2220,20 +2342,32 @@ bsv_supervise (const char *name)
             }
           pid_t w = waitpid (pid, &st, WNOHANG);
           if (w == pid) break;
-          if (access (down, F_OK) == 0) { kill (-pid, SIGTERM); kill (pid, SIGTERM); }
-          usleep (100000);
+          if (access (down, F_OK) == 0)
+            {
+              bsv_stop_child (pid, &st, pipe_read, log_fd, &line_start, &log_error);
+              break;
+            }
+          bsv_log_wait (pipe_read);
         }
-      if (bsv_stop) { kill (-pid, SIGTERM); kill (pid, SIGTERM); waitpid (pid, &st, 0); }
+      if (bsv_stop)
+        bsv_stop_child (pid, &st, pipe_read, log_fd, &line_start, &log_error);
       if (nstate.fd >= 0) { close (nstate.fd); nstate.fd = -1; }
       if (pipe_read >= 0)
         {
-          bsv_drain_log_pipe_once (pipe_read, log_fd, &line_start);
+          bsv_drain_log_pipe_once (pipe_read, log_fd, &line_start, &log_error);
           close (pipe_read);
           close (log_fd);
         }
 
+      unlink (pidfile);
       bsv_write_exit_status_pair (status, transition, st);
       bsv_run_finish (name, st, logfile);
+      if (log_error)
+        {
+          bsv_writef (transition, "log-failed errno=%d\n", log_error);
+          bsv_writef (status, "log-failed errno=%d\n", log_error);
+          break;
+        }
 
       if (oneshot)
         {
@@ -2256,6 +2390,8 @@ bsv_supervise (const char *name)
         break;
       bsv_restart_sleep (&restart_policy, &backoff, started);
     }
+  unlink (pidfile);
+  unlink (spidfile);
   _exit (0);
 }
 
@@ -2367,6 +2503,13 @@ bsv_up (const char *name)
     bsv_writef (down, "up\n");
 
   bsv_stale_pid_cleanup (name);
+  /* Publish the new attempt before returning to readiness/oneshot barriers;
+     a previous instance's terminal status must not satisfy or fail them. */
+  char state[512];
+  bsv_path (state, sizeof state, bsv_run_dir, name, "transition");
+  bsv_writef (state, "starting\n");
+  bsv_path (state, sizeof state, bsv_run_dir, name, "status");
+  bsv_writef (state, "starting\n");
 
   pid_t pid = fork ();
   if (pid < 0) { builtin_error ("fork: %s", strerror (errno)); return EXECUTION_FAILURE; }
@@ -2429,7 +2572,7 @@ bsv_once (const char *name)
         return EXECUTION_FAILURE;
       }
 
-    int pipe_read = -1, log_fd = -1, line_start = 1;
+    int pipe_read = -1, log_fd = -1, line_start = 1, log_error = 0;
     pid_t pid = bsv_fork_service_logged (name, run_script, ns_flags, run_user,
                                          caps_drop, logfile, &log_policy,
                                          NULL, &pipe_read, &log_fd);
@@ -2446,19 +2589,27 @@ bsv_once (const char *name)
     while (1)
       {
         if (pipe_read >= 0)
-          bsv_drain_log_pipe_once (pipe_read, log_fd, &line_start);
+          bsv_drain_log_pipe_once (pipe_read, log_fd, &line_start, &log_error);
         w = waitpid (pid, &st, WNOHANG);
         if (w == pid || (w < 0 && errno != EINTR))
           break;
-        usleep (100000);
+        bsv_log_wait (pipe_read);
       }
     if (pipe_read >= 0)
       {
-        bsv_drain_log_pipe_once (pipe_read, log_fd, &line_start);
+        bsv_drain_log_pipe_once (pipe_read, log_fd, &line_start, &log_error);
         close (pipe_read);
         close (log_fd);
       }
 
+    if (log_error)
+      {
+        bsv_run_finish (name, st, logfile);
+        sigprocmask (SIG_SETMASK, &old_set, NULL);
+        sigaction (SIGCHLD, &chld_save, NULL);
+        builtin_error ("log: write/read error: %s", strerror (log_error));
+        return EXECUTION_FAILURE;
+      }
     if (w < 0)
       {
         sigprocmask (SIG_SETMASK, &old_set, NULL);
@@ -2940,6 +3091,39 @@ bsv_stop_enabled_ordered (void)
   return EXECUTION_SUCCESS;
 }
 
+/* Restart must wait for the old supervisor, including its finish hook. A
+   fixed one-second sleep races a slow stop (or TERM-to-KILL escalation) and
+   makes up report "already up" just before the old instance goes down. */
+static int
+bsv_restart_target (const char *name)
+{
+  if (bsv_down_target (name) != EXECUTION_SUCCESS)
+    return EXECUTION_FAILURE;
+  if (!bsv_service_is_bundle_name (name))
+    {
+      bsv_wait_stopped (name);
+      if (bsv_super_running (name))
+        { builtin_error ("restart: stop timed out: %s", name); return EXECUTION_FAILURE; }
+    }
+  else
+    {
+      struct bsv_service_meta svcs[BSV_SERVICE_MAX];
+      const char *ordered[BSV_SERVICE_MAX];
+      unsigned char selected[BSV_SERVICE_MAX];
+      int nsvcs = 0, nordered = 0;
+      if (bsv_order_selected_target (name, svcs, &nsvcs, ordered, &nordered,
+                                     selected) != EXECUTION_SUCCESS)
+        return EXECUTION_FAILURE;
+      for (int i = nordered - 1; i >= 0; i--)
+        {
+          bsv_wait_stopped (ordered[i]);
+          if (bsv_super_running (ordered[i]))
+            { builtin_error ("restart: stop timed out: %s", ordered[i]); return EXECUTION_FAILURE; }
+        }
+    }
+  return bsv_up_target (name);
+}
+
 static int
 bsv_each_service (int (*fn)(const char *), int skip_disabled)
 {
@@ -2978,50 +3162,140 @@ bsv_run_foreground (void)
   return EXECUTION_SUCCESS;
 }
 
+/* Seek through a regular log from the end so a short tail does not require
+   allocating and replacing a ring entry for every line in the file. */
+static int
+bsv_log_regular (FILE *f, off_t end, int nlines)
+{
+  unsigned char buf[32768];
+  off_t pos = end, start = 0;
+  int remaining = nlines;
+  unsigned int retries = 0;
+restart:
+  pos = end;
+  start = 0;
+  remaining = nlines;
+  while (pos > 0)
+    {
+      size_t want = pos < (off_t) sizeof buf ? (size_t) pos : sizeof buf;
+      pos -= (off_t) want;
+      if (fseeko (f, pos, SEEK_SET) != 0)
+        goto read_error;
+      size_t got = fread (buf, 1, want, f);
+      if (ferror (f))
+        goto read_error;
+      if (got != want)
+        {
+          /* A truncation invalidates both the saved end and the trailing
+             newline test. Retry a bounded number of times before any output. */
+          struct stat current;
+          if (++retries > 3 || fstat (fileno (f), &current) != 0)
+            goto read_error;
+          end = current.st_size;
+          clearerr (f);
+          goto restart;
+        }
+      while (got > 0)
+        {
+          --got;
+          if (buf[got] == '\n' && pos + (off_t) got != end - 1 &&
+              --remaining == 0)
+            {
+              start = pos + (off_t) got + 1;
+              goto emit;
+            }
+        }
+    }
+emit:
+  if (fseeko (f, start, SEEK_SET) != 0)
+    goto read_error;
+  while (start < end)
+    {
+      /* Appends belong to the next invocation. Bound this one to the end
+         used to select its lines so an active writer cannot extend it. */
+      size_t want = end - start < (off_t) sizeof buf ?
+                    (size_t) (end - start) : sizeof buf;
+      size_t got = fread (buf, 1, want, f);
+      if (got && fwrite (buf, 1, got, stdout) != got)
+        {
+          builtin_error ("log: write error: %s", strerror (errno ? errno : EIO));
+          return EXECUTION_FAILURE;
+        }
+      if (ferror (f))
+        goto read_error;
+      if (got == 0)
+        break;
+      start += (off_t) got;
+    }
+  if (fflush (stdout) == EOF || ferror (stdout))
+    {
+      builtin_error ("log: write error: %s", strerror (errno ? errno : EIO));
+      return EXECUTION_FAILURE;
+    }
+  return EXECUTION_SUCCESS;
+read_error:
+  builtin_error ("log: read error: %s", strerror (errno ? errno : EIO));
+  return EXECUTION_FAILURE;
+}
+
 static int
 bsv_log (const char *name, int nlines)
 {
   char p[512];
-  FILE *f;
-  char **ring = NULL;
-  int idx = 0, count = 0;
   if (!bsv_valid_name (name)) { builtin_error ("bad service name"); return EX_USAGE; }
-  if (nlines < 1) nlines = 20;
-  ring = calloc ((size_t) nlines, sizeof *ring);
-  if (!ring) return EXECUTION_FAILURE;
-  bsv_path (p, sizeof p, bsv_log_dir, name, NULL);
-  f = fopen (p, "r");
-  if (!f) { free (ring); return EXECUTION_FAILURE; }
-  char line[512];
-  while (fgets (line, sizeof line, f))
+  if (bsv_path (p, sizeof p, bsv_log_dir, name, NULL) < 0)
+    return EXECUTION_FAILURE;
+  FILE *f = fopen (p, "r");
+  if (!f) return EXECUTION_FAILURE;
+  if (nlines == 0) { fclose (f); return EXECUTION_SUCCESS; }
+  struct stat st;
+  if (fstat (fileno (f), &st) == 0 && S_ISREG (st.st_mode))
     {
-      free (ring[idx]);
-      ring[idx] = strdup (line);
+      int rc = bsv_log_regular (f, st.st_size, nlines);
+      fclose (f);
+      return rc;
+    }
+  struct bsv_record { char *data; size_t size; };
+  struct bsv_record *ring = calloc ((size_t) nlines, sizeof *ring);
+  if (!ring) { fclose (f); return EXECUTION_FAILURE; }
+  int idx = 0, count = 0, rc = EXECUTION_SUCCESS;
+  char *line = NULL;
+  size_t capacity = 0;
+  ssize_t n;
+  while ((n = getline (&line, &capacity, f)) >= 0)
+    {
+      free (ring[idx].data);
+      ring[idx].data = line;
+      ring[idx].size = (size_t) n;
+      line = NULL;
+      capacity = 0;
       idx = (idx + 1) % nlines;
       if (count < nlines) count++;
     }
+  free (line);
+  if (ferror (f)) rc = EXECUTION_FAILURE;
   fclose (f);
-  /* Earliest entry is at idx - count (mod nlines): when the buffer
-     hasn't wrapped (count < nlines) that's plain 0; once it wraps
-     it's idx (the next-write slot, which holds the oldest entry).
-     The naive `(idx + i) % nlines` is only correct when count ==
-     nlines and emits zero output for short logs. */
   int start = (idx - count + nlines) % nlines;
   for (int i = 0; i < count; i++)
     {
       int j = (start + i) % nlines;
-      if (ring[j]) fputs (ring[j], stdout);
-      free (ring[j]);
+      if (rc == EXECUTION_SUCCESS &&
+          fwrite (ring[j].data, 1, ring[j].size, stdout) != ring[j].size)
+        rc = EXECUTION_FAILURE;
+      free (ring[j].data);
     }
   free (ring);
-  return EXECUTION_SUCCESS;
+  if (fflush (stdout) == EOF || ferror (stdout)) rc = EXECUTION_FAILURE;
+  if (rc != EXECUTION_SUCCESS) builtin_error ("log: read/write error");
+  return rc;
 }
 
 static const char *
 bsv_cron_root (void)
 {
-  const char *s = getenv ("BASHCRON_SPOOL_DIR");
-  return (s && *s) ? s : "/var/spool/cron";
+  static char held[512];
+  const char *s = bsv_env ("BASHCRON_SPOOL_DIR", held, sizeof held);
+  return s ? s : "/var/spool/cron";
 }
 
 static int
@@ -3039,9 +3313,9 @@ bsv_safe_tab_user (const char *s)
 static const char *
 bsv_timer_user (char *buf, size_t bufsz)
 {
-  const char *u = getenv ("USER");
+  const char *u = bsv_env ("USER", buf, bufsz);
   if (bsv_safe_tab_user (u))
-    return u;
+    return buf;
   struct passwd *pw = getpwuid (getuid ());
   if (pw && bsv_safe_tab_user (pw->pw_name))
     return pw->pw_name;
@@ -3114,12 +3388,13 @@ bsv_timer_collect_schedule (WORD_LIST *list, char *out, size_t out_sz)
 static int
 bsv_timer_build_command (char *out, size_t out_sz, const char *name)
 {
+  char max_held[32], gen_held[32];
   const char *envs[][2] = {
     { "BASHSV_DIR", bsv_sv_dir },
     { "BASHSV_RUNDIR", bsv_run_dir },
     { "BASHSV_LOGDIR", bsv_log_dir },
-    { "BASHSV_LOG_MAX_BYTES", getenv ("BASHSV_LOG_MAX_BYTES") },
-    { "BASHSV_LOG_GENERATIONS", getenv ("BASHSV_LOG_GENERATIONS") },
+    { "BASHSV_LOG_MAX_BYTES", bsv_env ("BASHSV_LOG_MAX_BYTES", max_held, sizeof max_held) },
+    { "BASHSV_LOG_GENERATIONS", bsv_env ("BASHSV_LOG_GENERATIONS", gen_held, sizeof gen_held) },
   };
   size_t pos = 0;
   out[0] = '\0';
@@ -3672,20 +3947,28 @@ sv_builtin (WORD_LIST *list)
   bsv_log_max_bytes = 1048576;
   bsv_log_generations = 1;
 
-  bsv_sv_dir = getenv ("BASHSV_DIR") && *getenv ("BASHSV_DIR") ? getenv ("BASHSV_DIR") : bsv_sv_dir;
-  bsv_run_dir = getenv ("BASHSV_RUNDIR") && *getenv ("BASHSV_RUNDIR") ? getenv ("BASHSV_RUNDIR") : bsv_run_dir;
-  bsv_log_dir = getenv ("BASHSV_LOGDIR") && *getenv ("BASHSV_LOGDIR") ? getenv ("BASHSV_LOGDIR") : bsv_log_dir;
-  if (getenv ("BASHSV_LOG_MAX_BYTES") && *getenv ("BASHSV_LOG_MAX_BYTES"))
+  /* Each of these is kept for the rest of the call, so it is copied into a
+     buffer of its own rather than left pointing at the one bash reuses. */
+  static char sv_dir_held[512], run_dir_held[512], log_dir_held[512];
+  const char *v;
+  if ((v = bsv_env ("BASHSV_DIR", sv_dir_held, sizeof sv_dir_held)))
+    bsv_sv_dir = v;
+  if ((v = bsv_env ("BASHSV_RUNDIR", run_dir_held, sizeof run_dir_held)))
+    bsv_run_dir = v;
+  if ((v = bsv_env ("BASHSV_LOGDIR", log_dir_held, sizeof log_dir_held)))
+    bsv_log_dir = v;
+  char num_held[32];
+  if ((v = bsv_env ("BASHSV_LOG_MAX_BYTES", num_held, sizeof num_held)))
     {
       char *end = NULL;
-      long long n = strtoll (getenv ("BASHSV_LOG_MAX_BYTES"), &end, 10);
+      long long n = strtoll (v, &end, 10);
       if (end && *end == '\0' && n >= 0)
         bsv_log_max_bytes = (off_t) n;
     }
-  if (getenv ("BASHSV_LOG_GENERATIONS") && *getenv ("BASHSV_LOG_GENERATIONS"))
+  if ((v = bsv_env ("BASHSV_LOG_GENERATIONS", num_held, sizeof num_held)))
     {
       char *end = NULL;
-      long n = strtol (getenv ("BASHSV_LOG_GENERATIONS"), &end, 10);
+      long n = strtol (v, &end, 10);
       if (end && *end == '\0')
         bsv_log_generations = bsv_clamp_log_generations (n);
     }
@@ -3697,7 +3980,7 @@ sv_builtin (WORD_LIST *list)
   if (strcmp (cmd, "down") == 0)
     { const char *n = word (list->next); if (!n) { builtin_error ("down needs NAME"); return EX_USAGE; } return bsv_down_target (n); }
   if (strcmp (cmd, "restart") == 0)
-    { const char *n = word (list->next); if (!n) { builtin_error ("restart needs NAME"); return EX_USAGE; } bsv_down_target (n); sleep (1); return bsv_up_target (n); }
+    { const char *n = word (list->next); if (!n) { builtin_error ("restart needs NAME"); return EX_USAGE; } return bsv_restart_target (n); }
   if (strcmp (cmd, "once") == 0)
     { const char *n = word (list->next); if (!n) { builtin_error ("once needs NAME"); return EX_USAGE; } return bsv_once (n); }
   if (strcmp (cmd, "timer") == 0)
@@ -3747,8 +4030,17 @@ sv_builtin (WORD_LIST *list)
       int lines = 20;
       if (!n) { builtin_error ("log needs NAME"); return EX_USAGE; }
       for (WORD_LIST *p = list->next->next; p; p = p->next)
-        if (strcmp (p->word->word, "-n") == 0 && p->next)
-          { p = p->next; lines = atoi (p->word->word); }
+        {
+          if (strcmp (p->word->word, "-n") != 0 || !p->next)
+            { builtin_error ("log: expected -n N"); return EX_USAGE; }
+          p = p->next;
+          char *end;
+          errno = 0;
+          long value = strtol (p->word->word, &end, 10);
+          if (errno || end == p->word->word || *end || value < 0 || value > INT_MAX)
+            { builtin_error ("log: invalid line count"); return EX_USAGE; }
+          lines = (int) value;
+        }
       return bsv_log (n, lines);
     }
   builtin_error ("unknown command: %s", cmd);

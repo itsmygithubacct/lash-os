@@ -23,6 +23,8 @@ source config/versions.sh
 source config/loadables.sh
 
 die(){ echo "build.sh: $*" >&2; exit 1; }
+BASHOS_VERSION=$(<VERSION)
+[[ $BASHOS_VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "VERSION must be MAJOR.MINOR.PATCH"
 say(){ echo "build.sh: $*"; }
 usage(){
   cat <<'HELP'
@@ -49,14 +51,18 @@ Customized outputs receive a content-derived name unless --name is supplied.
 Build options:
   --static             link a static executable
   --deps-prefix DIR    use target headers and libraries prepared by build-deps.sh
+  --perl-prefix DIR    use an existing static Perl installation for bashperl
+  --python-prefix DIR  use an existing static CPython installation for bashpython
   --no-strip           retain symbols
   --clean              force rebuilding
   --help               show this help
+Selecting bashperl builds pinned static libperl automatically on native builds.
+Selecting bashpython builds pinned static libpython automatically on native builds.
 Environment: CC, JOBS, CFLAGS, CPPFLAGS, LOCAL_LIBS, LDFLAGS_EXTRA,
 CONFIGURE_EXTRA, BASH_TARBALL, EXTRA_LOADABLES (space-separated source directories).
 HELP
 }
-STATIC=0; STRIP=1; CLEAN=0; DEPS_PREFIX=""; INFO=""; SELECT_ARGS=()
+STATIC=0; STRIP=1; CLEAN=0; DEPS_PREFIX=""; PERL_PREFIX=""; PYTHON_PREFIX=""; INFO=""; SELECT_ARGS=()
 while [[ $# -gt 0 ]]; do case "$1" in
   --*=*) set -- "${1%%=*}" "${1#*=}" "${@:2}" ;;
   --profile|--level|--list|--include|--include-list|--exclude|--name)
@@ -65,6 +71,12 @@ while [[ $# -gt 0 ]]; do case "$1" in
   --deps-prefix)
     [[ $# -ge 2 && -n $2 && $2 != --* ]] || die "$1 requires a directory"
     DEPS_PREFIX=$(cd "$2" && pwd); shift 2 ;;
+  --perl-prefix)
+    [[ $# -ge 2 && -n $2 && $2 != --* ]] || die "$1 requires a directory"
+    PERL_PREFIX=$(cd "$2" && pwd); shift 2 ;;
+  --python-prefix)
+    [[ $# -ge 2 && -n $2 && $2 != --* ]] || die "$1 requires a directory"
+    PYTHON_PREFIX=$(cd "$2" && pwd); shift 2 ;;
   --list-profiles|--list-loadables)
     [[ -z $INFO ]] || die "choose one reporting option"
     SELECT_ARGS+=("$1"); INFO="$1"; shift ;;
@@ -95,6 +107,10 @@ PYINFO
 fi
 NAMES_TEXT=$(python3 -c 'import json,os; print("\n".join(json.loads(os.environ["SELECTION"])["names"]))')
 NAMES=(); [[ -z $NAMES_TEXT ]] || mapfile -t NAMES <<< "$NAMES_TEXT"
+EXTRA_DIRS=()
+for directory in ${EXTRA_LOADABLES:-}; do
+  EXTRA_DIRS+=("$(cd "$directory" && pwd)")
+done
 LISTTAG=$(python3 -c 'import json,os; print(json.loads(os.environ["SELECTION"])["tag"])')
 LIST_DESCRIPTION=$(python3 -c 'import json,os; print(json.loads(os.environ["SELECTION"])["base"])')
 CC="${CC:-cc}"; JOBS="${JOBS:-$(nproc)}"
@@ -113,6 +129,7 @@ STRIPTOOL=strip; [[ "$CC" == *-gcc ]] && STRIPTOOL="${CC%-gcc}-strip"
 CFLAGS="${CFLAGS:--O2 -fstack-protector-strong -D_FORTIFY_SOURCE=2}"
 LDFLAGS="-Wl,--build-id=none -Wl,-z,relro -Wl,-z,now ${LDFLAGS_EXTRA:-}"; [[ $STATIC == 1 ]] && LDFLAGS="-static $LDFLAGS"
 CPPFLAGS="${CPPFLAGS:-}"
+[[ $STATIC == 0 ]] || CPPFLAGS="$CPPFLAGS -DBASHOS_STATIC=1"
 if [[ -n $DEPS_PREFIX ]]; then
   [[ $DEPS_PREFIX != *[[:space:]]* ]] || die "--deps-prefix cannot contain whitespace"
   [[ -d $DEPS_PREFIX/include && -d $DEPS_PREFIX/lib ]] || die "dependency prefix needs include/ and lib/"
@@ -122,6 +139,30 @@ fi
 # LOCAL_LIBS is bash's own hook for libraries the injected builtins pull in:
 # fltexpr needs libm, so -lm by default (a consumer adds e.g. -lz).
 LOCAL_LIBS="${LOCAL_LIBS:--lm} $(python3 config/stage-helpers.py --libs "$HERE" - "${NAMES[@]}")"
+PERL_CONFIG=""
+if [[ " ${NAMES[*]} " == *" bashperl "* ]]; then
+  if [[ -z $PERL_PREFIX ]]; then
+    [[ $CROSS == 0 ]] || die "cross bashperl builds need a prepared target --perl-prefix"
+    CC="$CC" JOBS="$JOBS" ./build-perl.sh
+    PERL_PREFIX="$HERE/out/perl/$TARGET"
+  fi
+  PERL_CONFIG=$(CC="$CC" python3 config/build-perl.py --prefix "$PERL_PREFIX" --flags) || exit $?
+  LDFLAGS+=" $(python3 -c 'import json,sys; print(json.load(sys.stdin)["flags"]["ldflags"])' <<< "$PERL_CONFIG")"
+  LOCAL_LIBS+=" $(python3 -c 'import json,sys; print(json.load(sys.stdin)["flags"]["libraries"])' <<< "$PERL_CONFIG")"
+fi
+export PERL_CONFIG
+PYTHON_CONFIG=""
+if [[ " ${NAMES[*]} " == *" bashpython "* ]]; then
+  if [[ -z $PYTHON_PREFIX ]]; then
+    [[ $CROSS == 0 ]] || die "cross bashpython builds need a prepared target --python-prefix"
+    CC="$CC" JOBS="$JOBS" ./build-python.sh ${DEPS_PREFIX:+--deps-prefix "$DEPS_PREFIX"}
+    PYTHON_PREFIX="$HERE/out/python/$TARGET"
+  fi
+  PYTHON_CONFIG=$(CC="$CC" python3 config/build-python.py --prefix "$PYTHON_PREFIX" --flags) || exit $?
+  LDFLAGS+=" $(python3 -c 'import json,sys; print(json.load(sys.stdin)["flags"]["ldflags"])' <<< "$PYTHON_CONFIG")"
+  LOCAL_LIBS+=" $(python3 -c 'import json,sys; print(json.load(sys.stdin)["flags"]["libraries"])' <<< "$PYTHON_CONFIG")"
+fi
+export PYTHON_CONFIG
 # A cross configure cannot run test programs; these are the Linux answers.
 CROSS_CACHE=(bash_cv_getcwd_malloc=yes bash_cv_job_control_missing=present
   bash_cv_sys_named_pipes=present bash_cv_func_sigsetjmp=present bash_cv_printf_a_format=yes
@@ -133,27 +174,45 @@ CFGX=(); if [[ $CROSS == 1 ]]; then CFGX=("${CROSS_CACHE[@]}"); [[ "${CONFIGURE_
 mkdir -p "$OUTDIR" "$DL" build
 exec {BUILD_LOCK}> "$HERE/build/.lock"
 flock "$BUILD_LOCK"
+PATCHES_TEXT=$(python3 -c 'import json; print("\n".join(name + " " + patch for name, patch in json.load(open("config/stock-patches.json")).items()))')
+declare -A STOCK_PATCHES=()
+while read -r stock_name stock_patch; do
+  STOCK_PATCHES["$stock_name"]=$stock_patch
+done <<< "$PATCHES_TEXT"
 STAMP=$( { echo "$BASH_SRC_SHA256 ${BASH_PATCHES[*]} $BASH_PATCHLEVEL static=$STATIC strip=$STRIP cc=$CC target=$TARGET cflags=$CFLAGS cppflags=$CPPFLAGS ldflags=$LDFLAGS local_libs=$LOCAL_LIBS extra=${CONFIGURE_EXTRA:-}";
            printf '%s\n' "$SELECTION"; "$CC" --version;
-           cat config/helpers.json config/profiles.json config/loadables.py config/stage-helpers.py config/publish-binary.py build.sh patches/head-stdin.patch patches/tee-io.patch;
+           cat VERSION config/versions.sh config/helpers.json config/profiles.json config/loadables.py config/bash-loadables-optional.list config/stage-helpers.py config/build-cache.py config/relocate-build.py config/publish-binary.py config/stock-patches.json build.sh patches/*.patch;
+           printf '%s\n' "$PERL_CONFIG";
+           printf '%s\n' "$PYTHON_CONFIG";
            [[ -z $DEPS_PREFIX ]] || find "$DEPS_PREFIX/include" "$DEPS_PREFIX/lib" -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum;
-           find loadables ${EXTRA_LOADABLES:-} -type f \( -name '*.c' -o -name '*.h' -o -name '*.data' \) -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum; } | sha256sum | cut -c1-64)
-if [[ "$CLEAN" != 1 && -f "$OUTBIN" && -f "$STAMPFILE" && "$(cat "$STAMPFILE")" == "$STAMP" ]]; then
+           find -L loadables "${EXTRA_DIRS[@]}" -type f \( -name '*.c' -o -name '*.h' -o -name '*.data' \) -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum; } | sha256sum | cut -c1-64)
+if [[ "$CLEAN" != 1 ]] && python3 config/build-cache.py "$OUTBIN" "$SRC" "$STAMP"; then
   say "up to date — $OUTBIN (pass --clean to force)"; exit 0
 fi
 : > "$LOG"
 
 # --- 1. bash source and its patch set, pinned by sha256 --------------------
+# Every file here is checked against its pin, so a download that fails on
+# the way — a host that will not answer today — is worth asking again for.
+# ftp.gnu.org can stay unreachable for longer than the retries, and the pins
+# make GNU's mirror redirector an equally trustworthy second source.
+CURL_FETCH=(-fL --connect-timeout 30 --retry 3 --retry-delay 2 --retry-connrefused)
+fetch(){
+  local mirror=${2/#https:\/\/ftp.gnu.org\/gnu\//https://ftpmirror.gnu.org/}
+  curl "${CURL_FETCH[@]}" -o "$1" "$2" && return
+  [[ "$mirror" != "$2" ]] || return 1
+  say "trying $mirror"; curl "${CURL_FETCH[@]}" -o "$1" "$mirror"
+}
 TARBALL="$DL/bash-$BASH_SRC_VERSION.tar.gz"
 if [[ ! -f "$TARBALL" ]]; then
   if [[ -n "${BASH_TARBALL:-}" ]]; then cp "$BASH_TARBALL" "$TARBALL"
-  else say "downloading $BASH_URL"; curl -fL -o "$TARBALL" "$BASH_URL"; fi
+  else say "downloading $BASH_URL"; fetch "$TARBALL" "$BASH_URL"; fi
 fi
 echo "$BASH_SRC_SHA256  $TARBALL" | sha256sum -c - >/dev/null || die "bash tarball sha256 mismatch"
 mkdir -p "$DL/patches"
 for entry in "${BASH_PATCHES[@]}"; do
   pname=${entry%% *}; psha=${entry##* }; pfile="$DL/patches/$pname"
-  [[ -f "$pfile" ]] || { say "downloading $pname"; curl -fL -o "$pfile" "$BASH_PATCH_URL/$pname"; }
+  [[ -f "$pfile" ]] || { say "downloading $pname"; fetch "$pfile" "$BASH_PATCH_URL/$pname"; }
   echo "$psha  $pfile" | sha256sum -c - >/dev/null || die "$pname sha256 mismatch"
 done
 
@@ -169,14 +228,19 @@ done
 pl=$(awk '$1=="#define" && $2=="PATCHLEVEL" {print $3}' patchlevel.h)
 [[ "$pl" == "$BASH_PATCHLEVEL" ]] || die "patchlevel $pl after patching, expected $BASH_PATCHLEVEL"
 
+# Shell repair applied after the pinned official set. waitchld() queues a
+# SIGCHLD trap instead of running it in that frame. Non-POSIX wait_for runs
+# the trap after waitchld returns and before it blocks again.
+patch -p0 -s < "$HERE/patches/bash-sigchld-malloc.patch" >>"$LOG" 2>&1 \
+  || die "bash-sigchld-malloc.patch did not apply (see $LOG)"
+
 # --- 3. stage the loadable sources + helper headers ------------------------
 say "staging loadables"
 cp "$HERE/loadables"/*.c examples/loadables/
 shopt -s nullglob
 for h in "$HERE"/loadables/common/*.h; do cp "$h" builtins/; cp "$h" examples/loadables/; done
 python3 "$HERE/config/stage-helpers.py" --stage "$HERE" "$STAGE" "${NAMES[@]}" >>"$LOG" 2>&1 || die "helper staging failed (see $LOG)"
-for d in ${EXTRA_LOADABLES:-}; do
-  d=$(cd "$OLDPWD" 2>/dev/null && cd "$HERE" && cd "$d" && pwd) || die "EXTRA_LOADABLES: no such directory: $d"
+for d in "${EXTRA_DIRS[@]}"; do
   for f in "$d"/*.c; do cp "$f" examples/loadables/; done
   for f in "$d"/*.h; do cp "$f" builtins/; cp "$f" examples/loadables/; done
 done
@@ -187,7 +251,7 @@ cp examples/loadables/*.h builtins/ 2>/dev/null || true
 # The per-name fixups below patch bash's OWN example loadables (mkdir,
 # fltexpr). A source this repo or EXTRA_LOADABLES supplies under the same
 # name replaces the stock file whole and must not be patched.
-is_stock() { [[ ! -f "$HERE/loadables/$1.c" ]] || return 1; local d; for d in ${EXTRA_LOADABLES:-}; do [[ -f "$d/$1.c" ]] && return 1; done; return 0; }
+is_stock() { [[ ! -f "$HERE/loadables/$1.c" ]] || return 1; local d; for d in "${EXTRA_DIRS[@]}"; do [[ -f "$d/$1.c" ]] && return 1; done; return 0; }
 say "injecting ${#NAMES[@]} loadables ($NAME, $TARGET)"
 for n in "${NAMES[@]}"; do
   src="examples/loadables/$n.c"; [[ -f "$src" ]] || die "no source for '$n' ($src) — neither loadables/$n.c nor a stock example"
@@ -200,11 +264,10 @@ for n in "${NAMES[@]}"; do
       -e "s|^static \\(char \\*${n}_doc\\)|\\1|" \
       "$src" > "builtins/$n.c"
   is_stock "$n" || continue
+  if [[ -n ${STOCK_PATCHES[$n]:-} ]]; then
+    patch --batch --fuzz=0 -s "builtins/$n.c" < "$HERE/patches/${STOCK_PATCHES[$n]}" >>"$LOG" 2>&1 || die "$n fixup did not apply (see $LOG)"
+  fi
   case "$n" in
-    head)
-      patch --batch -s builtins/head.c < "$HERE/patches/head-stdin.patch" >>"$LOG" 2>&1 || die "head fixup did not apply (see $LOG)" ;;
-    tee)
-      patch --batch -s builtins/tee.c < "$HERE/patches/tee-io.patch" >>"$LOG" 2>&1 || die "tee fixup did not apply (see $LOG)" ;;
     fltexpr)
       sed -i 's|^static sh_float_t nanval, infval;$|static sh_float_t nanval = NAN, infval = INFINITY;|' builtins/fltexpr.c
       grep -q 'nanval = NAN' builtins/fltexpr.c || die "fltexpr fixup did not match" ;;
@@ -229,6 +292,24 @@ p = Path("builtins/Makefile.in"); s = p.read_text()
 old = "OFILES = builtins.o \\\n"
 assert s.count(old) == 1, "OFILES anchor not found"
 p.write_text(s.replace(old, "OFILES = builtins.o " + ''.join(n+'.o ' for n in json.loads(os.environ['SELECTION'])['names']) + Path("builtins/.helper-objs").read_text() + "\\\n", 1))
+objects = [n+'.o' for n in json.loads(os.environ['SELECTION'])['names']]
+objects += Path('builtins/.helper-objs').read_text().split()
+if objects:
+    with p.open('a') as output:
+        output.write('\n# Recompile injected objects when their staged headers change.\n'
+                     + ' '.join(objects) + ': $(wildcard *.h *.data)\n')
+    with Path('Makefile.in').open('a') as output:
+        output.write('\n# Descend into builtins for changes outside Bash\'s stock source list.\n'
+                     '$(BUILTINS_LIBRARY): $(wildcard $(DEFDIR)/*.c $(DEFDIR)/*.h $(DEFDIR)/*.data)\n')
+if os.environ.get('PERL_CONFIG'):
+    flags = json.loads(os.environ['PERL_CONFIG'])['flags']['cppflags']
+    with p.open('a') as output:
+        output.write('\n_perl_engine.o: CPPFLAGS += '+flags+'\n')
+if os.environ.get('PYTHON_CONFIG'):
+    python = json.loads(os.environ['PYTHON_CONFIG'])['flags']
+    with p.open('a') as output:
+        output.write('\n_python_engine.o: CPPFLAGS += '+python['cppflags']+'\n')
+        output.write('bashpython.o: CPPFLAGS += -DBASHOS_PYTHON_HOME=\\"'+python['home']+'\\"\n')
 PY
 
 # --- 6. configure ----------------------------------------------------------
@@ -252,7 +333,7 @@ entries = json.loads(os.environ['SELECTION'])['entries']
 p = Path('builtins/builtins.c'); text = p.read_text()
 anchor = '  { (char *)0x0,'
 assert text.count(anchor) == 1, 'builtin table anchor not found'
-rows = ''.join('  { '+json.dumps(n)+', '+n+'_builtin, BUILTIN_ENABLED, '+n+'_doc, '
+rows = ''.join('  { '+json.dumps(n)+', '+n+'_builtin, BUILTIN_ENABLED | STATIC_BUILTIN, '+n+'_doc, '
                +json.dumps(doc, ensure_ascii=False)+', 0 },\n' for n, doc in entries.items())
 p.write_text(text.replace(anchor, rows+anchor))
 PYTABLE
@@ -267,6 +348,7 @@ STRIP_ARGS=(); [[ $STRIP != 1 ]] || STRIP_ARGS=("$STRIPTOOL")
 python3 "$HERE/config/publish-binary.py" bash "$OUTBIN" "${STRIP_ARGS[@]}"
 {
   echo "# bash-os manifest  $(date -u +%FT%TZ)"
+  echo "bash-os $BASHOS_VERSION"
   echo "bash $BASH_SRC_VERSION patchlevel $BASH_PATCHLEVEL  target=$TARGET static=$STATIC stripped=$STRIP"
   echo "cc=$($CC --version | head -1)"
   echo "cflags=$CFLAGS"
@@ -274,17 +356,22 @@ python3 "$HERE/config/publish-binary.py" bash "$OUTBIN" "${STRIP_ARGS[@]}"
   echo "injected builtins (${#NAMES[@]}): ${NAMES[*]}"
   ( cd "$OUTDIR" && sha256sum "$NAME" && wc -c "$NAME" )
 } | tee "$MANIFEST"
-python3 - "$OUTBIN" "$TARGET" "$STATIC" "$STRIP" <<'PYMANIFEST'
+python3 - "$OUTBIN" "$TARGET" "$STATIC" "$STRIP" "$BASHOS_VERSION" <<'PYMANIFEST'
 import hashlib, json, os, sys
 from pathlib import Path
 p = Path(sys.argv[1]); selection = json.loads(os.environ['SELECTION'])
-selection.update(target=sys.argv[2], static=sys.argv[3]=='1', stripped=sys.argv[4]=='1',
+selection.update(bashos_version=sys.argv[5], target=sys.argv[2], static=sys.argv[3]=='1', stripped=sys.argv[4]=='1',
                  binary_sha256=hashlib.sha256(p.read_bytes()).hexdigest(), bytes=p.stat().st_size)
+if os.environ.get('PERL_CONFIG'):
+    selection['perl'] = json.loads(os.environ['PERL_CONFIG'])
+if os.environ.get('PYTHON_CONFIG'):
+    selection['python'] = json.loads(os.environ['PYTHON_CONFIG'])
 p.with_name(p.name+'.loadables.list').write_text(selection['list'])
 p.with_name(p.name+'.manifest.json').write_text(json.dumps(selection, indent=2)+'\n')
 PYMANIFEST
-echo "$STAMP" > "$STAMPFILE"
-
-# --- 10. swap the finished tree into place: two renames, no gap ------------
+# --- 10. swap the finished tree into place under the build lock ------------
+python3 "$HERE/config/relocate-build.py" "$STAGE" "$SRC"
+echo "$STAMP" > "$STAGE/.bash-os-stamp"
 cd "$HERE"; rm -rf "$SRC.old"; [[ -d "$SRC" ]] && mv "$SRC" "$SRC.old"; mv "$STAGE" "$SRC"; rm -rf "$SRC.old"
+echo "$STAMP" > "$STAMPFILE"
 say "done: ${OUTBIN#$HERE/}  ($(wc -c < "$OUTBIN") bytes, ${#NAMES[@]} injected builtins)"

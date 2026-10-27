@@ -1,0 +1,65 @@
+--- builtins/unlink.c
++++ builtins/unlink.c
+@@ -41,25 +41,52 @@
+ int
+ unlink_builtin (WORD_LIST *list)
+ {
+-  if (list == 0)
++  const char *arg, *file = 0, *extra = 0;
++  size_t length;
++  int options = 1;
++  SHELL_VAR *posix_var = find_variable ("POSIXLY_CORRECT");
++  int posix = posix_var && exported_p (posix_var);
++
++  for (; list; list = list->next)
+     {
+-      builtin_usage ();
+-      return (EX_USAGE);
++      arg = list->word->word;
++      if (options && STREQ (arg, "--")) { options = 0; continue; }
++      if (options && arg[0] == '-' && arg[1])
++        {
++          length = strlen (arg + 2);
++          if (arg[1] == '-' && length && length <= 4 &&
++              strncmp ("help", arg + 2, length) == 0)
++            { builtin_help (); return sh_chkwrite (EXECUTION_SUCCESS); }
++          if (arg[1] == '-' && length && length <= 7 &&
++              strncmp ("version", arg + 2, length) == 0)
++            { printf ("unlink (bash-os builtin)\n"); return sh_chkwrite (EXECUTION_SUCCESS); }
++          builtin_error ("invalid option: %s", arg);
++          return EXECUTION_FAILURE;
++        }
++      if (file) extra = arg;
++      else file = arg;
++      if (posix) options = 0;
+     }
+-
+-  if (unlink (list->word->word) != 0)
++  /* Validate every operand before removing anything. */
++  if (file == 0 || extra)
+     {
+-      builtin_error ("%s: cannot unlink: %s", list->word->word, strerror (errno));
+-      return (EXECUTION_FAILURE);
++      if (extra) builtin_error ("extra operand: %s", extra);
++      else builtin_error ("missing operand");
++      return EXECUTION_FAILURE;
+     }
+-
+-  return (EXECUTION_SUCCESS);
++  if (unlink (file) != 0)
++    {
++      builtin_error ("%s: cannot unlink: %s", file, strerror (errno));
++      return EXECUTION_FAILURE;
++    }
++  return EXECUTION_SUCCESS;
+ }
+ 
+ char *unlink_doc[] = {
+ 	"Remove a directory entry.",
+ 	"",
+-	"Forcibly remove a directory entry, even if it's a directory.",
++	"Remove exactly one file name or symbolic link, without following links.",
++	"Directories are rejected. Use -- before a name beginning with a dash.",
+ 	(char *)NULL
+ };
+ 

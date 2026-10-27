@@ -109,7 +109,7 @@ typedef struct {
     int      root_dev_valid;   /* root_dev is set once per starting path */
     dev_t    root_dev;
     int      postorder;        /* set by -delete: evaluate after children */
-    int      exit_status;      /* 1 if any non-ENOENT stat/opendir/etc. failed */
+    int      exit_status;      /* 1 if any search operation failed */
     const char *start_path;    /* current command-line starting point (depth 0); for -printf %P */
 } bf_ctx;
 
@@ -1187,16 +1187,10 @@ bf_walk (const char *path, int depth, bf_ctx *ctx, bf_seen *seen)
         }
         else
         {
-            /* Surface real errors (permission denied, broken symlink target).
-               ENOENT is silenced because find is regularly run on transient
-               paths and `find /tmp` complaining about every gone-by-now file
-               is noise. Anything else flips the find-level exit status to 1
-               so callers can distinguish a partial walk from a clean walk,
-               matching GNU/BSD find. */
-            if (errno != ENOENT) {
-                builtin_warning ("%s: %s", path, strerror (errno));
-                ctx->exit_status = 1;
-            }
+            /* Missing paths are search errors too. A dangling symlink
+               successfully handled by lstat above is still searchable. */
+            builtin_warning ("%s: %s", path, strerror (errno));
+            ctx->exit_status = 1;
             return;
         }
     }
@@ -1220,11 +1214,17 @@ bf_walk (const char *path, int depth, bf_ctx *ctx, bf_seen *seen)
     int pushed = 0;
     if (is_dir && ctx->follow == BF_FOLLOW_ALL)
     {
-        if (bf_chain_contains (seen, &st)) return;
+        if (bf_chain_contains (seen, &st)) {
+            builtin_warning ("%s: filesystem loop detected", path);
+            ctx->exit_status = 1;
+            return;
+        }
         pushed = bf_chain_push (seen, &st);
-        /* On push-fail (OOM) we fall through; the worst case is the
-           caller sees infinite recursion on a truly cyclic tree, which
-           is no worse than skipping the check entirely. */
+        if (!pushed) {
+            builtin_error ("%s: cannot allocate directory traversal state", path);
+            ctx->exit_status = 1;
+            return;
+        }
     }
 
     /* Find the basename. */
@@ -1247,6 +1247,7 @@ bf_walk (const char *path, int depth, bf_ctx *ctx, bf_seen *seen)
     }
 
     if (is_dir && !ctx->pruned
+        && (ctx->maxdepth < 0 || depth < ctx->maxdepth)
         && (!ctx->xdev || depth == 0 || !ctx->root_dev_valid
             || st.st_dev == ctx->root_dev))
     {

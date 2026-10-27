@@ -3,6 +3,12 @@ _Static_assert(sizeof(struct timespec) == 16, "Linux ABI layout: struct timespec
 _Static_assert(sizeof(((struct timespec *)0)->tv_nsec) == 8, "Linux ABI layout: struct timespec");
 _Static_assert(sizeof(gid_t) == 4, "Linux ABI layout: gid_t");
 _Static_assert(sizeof(struct tms) == 32, "Linux ABI layout: struct tms");
+_Static_assert(sizeof(off_t) == 8, "Linux ABI layout: off_t");
+_Static_assert(sizeof(struct mq_attr) == 64, "Linux ABI layout: struct mq_attr");
+_Static_assert(offsetof(struct mq_attr, mq_curmsgs) == 24, "Linux ABI layout: struct mq_attr");
+_Static_assert(sizeof(struct statfs) == 120, "Linux ABI layout: struct statfs");
+_Static_assert(offsetof(struct statfs, f_fsid) == 56, "Linux ABI layout: struct statfs");
+_Static_assert(offsetof(struct statfs, f_flags) == 80, "Linux ABI layout: struct statfs");
 int chown(const char *path, uid_t owner, gid_t group) {
     return posix_bridge(PX_CHOWN, (uintptr_t)path, (uint64_t)owner, (uint64_t)group, 0, 0, 0);
 }
@@ -296,4 +302,35 @@ ssize_t flistxattr(int descriptor, char *list, size_t size) {
 }
 int fremovexattr(int descriptor, const char *name) {
     return posix_bridge(PX_FREMOVEXATTR, (uint64_t)descriptor, (uintptr_t)name, 0, 0, 0, 0);
+}
+int renameat(int old_directory, const char *old_path, int new_directory, const char *new_path) {
+    return posix_bridge(PX_RENAMEAT, (uint64_t)old_directory, (uintptr_t)old_path,
+                        (uint64_t)new_directory, (uintptr_t)new_path, 0, 0);
+}
+ssize_t copy_file_range(int input, off_t *input_offset, int output, off_t *output_offset,
+                        size_t length, unsigned flags) {
+    return posix_bridge(PX_COPY_FILE_RANGE, (uint64_t)input, (uintptr_t)input_offset,
+                        (uint64_t)output, (uintptr_t)output_offset, (uint64_t)length,
+                        (uint64_t)flags);
+}
+int mq_unlink(const char *name) {
+    return posix_bridge(PX_MQ_UNLINK, (uintptr_t)name, 0, 0, 0, 0, 0);
+}
+int linkat(int old_directory, const char *old_path, int new_directory, const char *new_path,
+           int flags) {
+    return posix_bridge(PX_LINKAT, (uint64_t)old_directory, (uintptr_t)old_path,
+                        (uint64_t)new_directory, (uintptr_t)new_path, (uint64_t)flags, 0);
+}
+int statfs(const char *path, struct statfs *out) {
+    return posix_bridge(PX_STATFS, (uintptr_t)path, (uintptr_t)out, 0, 0, 0, 0);
+}
+int mkfifoat(int directory, const char *path, mode_t mode) {
+    return posix_bridge(PX_MKFIFOAT, (uint64_t)directory, (uintptr_t)path, (uint64_t)mode, 0, 0, 0);
+}
+int mkdirat(int directory, const char *path, mode_t mode) {
+    return posix_bridge(PX_MKDIRAT, (uint64_t)directory, (uintptr_t)path, (uint64_t)mode, 0, 0, 0);
+}
+int symlinkat(const char *target, int directory, const char *path) {
+    return posix_bridge(PX_SYMLINKAT, (uintptr_t)target, (uint64_t)directory, (uintptr_t)path, 0, 0,
+                        0);
 }

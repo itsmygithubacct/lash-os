@@ -196,9 +196,16 @@ bc_state_load (time_t *out)
     const char *path = bc_state_file_path ();
     if (!path || !out)
         return -1;
-    FILE *fp = fopen (path, "r");
-    if (!fp)
+    int fd = open (path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0)
         return -1;
+    FILE *fp = fdopen (fd, "r");
+    if (!fp) {
+        int saved = errno;
+        close (fd);
+        errno = saved;
+        return -1;
+    }
     char line[64];
     int ok = 0;
     if (fgets (line, sizeof line, fp)) {
@@ -222,16 +229,23 @@ bc_state_save (time_t v)
     const char *path = bc_state_file_path ();
     if (!path)
         return;
+    struct stat st;
+    if (lstat (path, &st) == 0 && S_ISLNK (st.st_mode))
+        return;
     char tmp[PATH_MAX];
     if (snprintf (tmp, sizeof tmp, "%s.tmp", path) >= (int) sizeof tmp)
         return;
-    int fd = open (tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    int fd = open (tmp, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0600);
     if (fd < 0)
         return;
     char buf[64];
     int n = snprintf (buf, sizeof buf, "%lld\n", (long long) v);
     if (n > 0 && (int) write (fd, buf, (size_t) n) == n) {
         close (fd);
+        if (lstat (path, &st) == 0 && S_ISLNK (st.st_mode)) {
+            unlink (tmp);
+            return;
+        }
         if (rename (tmp, path) != 0)
             unlink (tmp);
     } else {
@@ -305,6 +319,36 @@ bc_crontab_secure (const char *path)
     if ((st.st_mode & (S_IXUSR | S_IXGRP | S_IXOTH | S_IWGRP | S_IWOTH)) != 0)
         return 0;
     return 1;
+}
+
+/* Open PATH without following a final symlink. The directory must be
+   owned by this user and not writable by group or other, matching the
+   lpr spool rule: another writer could plant a job or a link. */
+static int
+bc_open_private_dir (const char *path, int create)
+{
+    if (!path || !*path) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (create && mkdir (path, 0700) < 0 && errno != EEXIST)
+        return -1;
+    int dfd = open (path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (dfd < 0)
+        return -1;
+    struct stat st;
+    if (fstat (dfd, &st) < 0) {
+        int saved = errno;
+        close (dfd);
+        errno = saved;
+        return -1;
+    }
+    if (st.st_uid != geteuid () || (st.st_mode & (S_IWGRP | S_IWOTH))) {
+        close (dfd);
+        errno = EPERM;
+        return -1;
+    }
+    return dfd;
 }
 
 static int
@@ -465,9 +509,16 @@ static void
 bc_sweep_output_dir (void)
 {
     const char *dir = bc_output_dir ();
-    DIR *d = opendir (dir);
-    if (!d)
+    /* Follow the configured directory. job.* entries are still removed
+       only when lstat says they are regular files. */
+    int dfd = open (dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dfd < 0)
         return;
+    DIR *d = fdopendir (dfd);
+    if (!d) {
+        close (dfd);
+        return;
+    }
     struct dirent *de;
     while ((de = readdir (d)) != NULL) {
         if (strncmp (de->d_name, "job.", 4) != 0)
@@ -801,12 +852,16 @@ static void
 bc_poll_atjobs (time_t now)
 {
     char dir[PATH_MAX];
-    if (snprintf (dir, sizeof dir, "%s/atjobs", bc_spool_root ()) >= (int) sizeof dir ||
-        bc_mkdir_p (dir) < 0)
+    if (snprintf (dir, sizeof dir, "%s/atjobs", bc_spool_root ()) >= (int) sizeof dir)
         return;
-    DIR *d = opendir (dir);
-    if (!d)
+    int dfd = bc_open_private_dir (dir, 1);
+    if (dfd < 0)
         return;
+    DIR *d = fdopendir (dfd);
+    if (!d) {
+        close (dfd);
+        return;
+    }
     /* Collect job filenames first, then sort lexicographically so the
        processing order matches submission order. batch uses jobids
        of the shape <sec>.<pid>.<seq>; lexicographic sort = submission
@@ -1358,9 +1413,16 @@ bc_poll_crond_dir_path (const struct tm *tm, int repeated_civil_minute,
                         int reboot_pass)
 {
     const char *dir = bc_crond_dir ();
-    DIR *d = opendir (dir);
-    if (!d)
+    /* Follow the configured cron.d directory. Each file is still named
+       and mode-checked before it is read. */
+    int dfd = open (dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dfd < 0)
         return;
+    DIR *d = fdopendir (dfd);
+    if (!d) {
+        close (dfd);
+        return;
+    }
     struct dirent *de;
     while ((de = readdir (d)) != NULL) {
         if (!bc_crond_name_ok (de->d_name))
@@ -1382,12 +1444,16 @@ bc_poll_reboot_crontabs (void)
     bc_poll_crond_dir_path (NULL, 0, 1);
 
     char dir[PATH_MAX];
-    if (snprintf (dir, sizeof dir, "%s/tabs", bc_spool_root ()) >= (int) sizeof dir ||
-        bc_mkdir_p (dir) < 0)
+    if (snprintf (dir, sizeof dir, "%s/tabs", bc_spool_root ()) >= (int) sizeof dir)
         return;
-    DIR *d = opendir (dir);
-    if (!d)
+    int tabs_fd = bc_open_private_dir (dir, 1);
+    if (tabs_fd < 0)
         return;
+    DIR *d = fdopendir (tabs_fd);
+    if (!d) {
+        close (tabs_fd);
+        return;
+    }
     struct dirent *de;
     while ((de = readdir (d)) != NULL) {
         if (de->d_name[0] == '.' || strchr (de->d_name, '/'))
@@ -1415,12 +1481,16 @@ bc_poll_crontabs (time_t now)
     bc_poll_crond_dir_path (&tm, repeated_civil_minute, 0);
 
     char dir[PATH_MAX];
-    if (snprintf (dir, sizeof dir, "%s/tabs", bc_spool_root ()) >= (int) sizeof dir ||
-        bc_mkdir_p (dir) < 0)
+    if (snprintf (dir, sizeof dir, "%s/tabs", bc_spool_root ()) >= (int) sizeof dir)
         return;
-    DIR *d = opendir (dir);
-    if (!d)
+    int tabs_fd = bc_open_private_dir (dir, 1);
+    if (tabs_fd < 0)
         return;
+    DIR *d = fdopendir (tabs_fd);
+    if (!d) {
+        close (tabs_fd);
+        return;
+    }
     struct dirent *de;
     while ((de = readdir (d)) != NULL) {
         if (de->d_name[0] == '.' || strchr (de->d_name, '/'))
@@ -1547,11 +1617,16 @@ cron_builtin (WORD_LIST *list)
     }
 
     char root[PATH_MAX];
-    if (snprintf (root, sizeof root, "%s", bc_spool_root ()) >= (int) sizeof root ||
-        bc_mkdir_p (root) < 0) {
-        builtin_error ("mkdir spool: %s", strerror (errno));
+    if (snprintf (root, sizeof root, "%s", bc_spool_root ()) >= (int) sizeof root) {
+        builtin_error ("spool path too long");
         return EXECUTION_FAILURE;
     }
+    int spool_fd = bc_open_private_dir (root, 1);
+    if (spool_fd < 0) {
+        builtin_error ("spool %s is not private: %s", root, strerror (errno));
+        return EXECUTION_FAILURE;
+    }
+    close (spool_fd);
     bc_prepare_output_dir ();
 
     if (once) {

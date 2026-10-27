@@ -28,6 +28,7 @@
 #include <termios.h>
 
 #include "loadables.h"
+#include "child-wait.h"
 
 extern char *setsid_doc[];
 
@@ -48,13 +49,13 @@ setsid_builtin (WORD_LIST *list)
         if (!strcmp (w, "-c") || !strcmp (w, "--ctty")) { set_ctty = 1; list = list->next; continue; }
         builtin_error ("unknown option: %s", w);
         builtin_usage ();
-        return EX_USAGE;
+        return EXECUTION_FAILURE;
     }
 
     if (!list) {
         builtin_error ("no program specified");
         builtin_usage ();
-        return EX_USAGE;
+        return EXECUTION_FAILURE;
     }
 
     int argc = 0;
@@ -65,20 +66,24 @@ setsid_builtin (WORD_LIST *list)
     for (WORD_LIST *p = list; p; p = p->next) argv[i++] = p->word->word;
     argv[argc] = NULL;
 
-    struct sigaction chld_dfl, chld_save;
-    memset (&chld_dfl, 0, sizeof chld_dfl);
-    chld_dfl.sa_handler = SIG_DFL;
-    sigemptyset (&chld_dfl.sa_mask);
-    sigaction (SIGCHLD, &chld_dfl, &chld_save);
+    bos_child_wait child_wait;
+    if (bos_child_wait_begin (&child_wait) < 0) {
+        builtin_error ("SIGCHLD setup: %s", strerror (errno));
+        free (argv); return EXECUTION_FAILURE;
+    }
 
+    maybe_make_export_env ();
+    fflush (stdout);
+    fflush (stderr);
     pid_t pid = fork ();
     if (pid < 0) {
         builtin_error ("fork: %s", strerror (errno));
-        sigaction (SIGCHLD, &chld_save, NULL);
+        bos_child_wait_end (&child_wait);
         free (argv);
         return EXECUTION_FAILURE;
     }
     if (pid == 0) {
+        bos_child_wait_child (&child_wait);
         if (setsid () < 0) {
             fprintf (stderr, "setsid: %s\n", strerror (errno));
             _exit (126);
@@ -86,12 +91,13 @@ setsid_builtin (WORD_LIST *list)
         if (set_ctty) {
             if (ioctl (STDIN_FILENO, TIOCSCTTY, 0) < 0) {
                 fprintf (stderr, "setsid: TIOCSCTTY: %s\n", strerror (errno));
-                /* non-fatal */
+                _exit (EXECUTION_FAILURE);
             }
         }
         execvp (argv[0], argv);
-        fprintf (stderr, "setsid: %s: %s\n", argv[0], strerror (errno));
-        _exit (errno == ENOENT ? 127 : 126);
+        int saved = errno;
+        fprintf (stderr, "setsid: %s: %s\n", argv[0], strerror (saved));
+        _exit (saved == ENOENT ? 127 : 126);
     }
 
     free (argv);
@@ -103,7 +109,7 @@ setsid_builtin (WORD_LIST *list)
         else if (WIFEXITED (wst))   status = WEXITSTATUS (wst);
         else if (WIFSIGNALED (wst)) status = 128 + WTERMSIG (wst);
     }
-    sigaction (SIGCHLD, &chld_save, NULL);
+    bos_child_wait_end (&child_wait);
     return status;
 }
 

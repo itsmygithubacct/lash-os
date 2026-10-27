@@ -41,15 +41,16 @@
  *   /var/lib/pkg/installed/<name>/files     — legacy newline path list
  *
  * Trust: install requires a sibling <PKGFILE>.sig by default and refuses
- * to proceed unless bashsignify verification succeeds. download verifies
+ * to proceed unless its signify-format Ed25519 signature verifies against a
+ * trusted key (see bp_verify_signature_with_sig). download verifies
  * indexed package SHA-256 and caches the indexed signature sidecar for the
  * install gate. Delta upgrade reconstructs a full candidate blob and feeds it
  * back through this same signed install path. Unsigned bootstrap/development
  * installs require the explicit -A override; legacy rootfs packages
  * additionally require the explicit compatibility opt-in.
  * For multi-arch repositories, each <repo>/<arch>/INDEX is independently
- * verified against its own sibling INDEX.sig by the same bashsignify path.
- * The operator-supplied bashsignify trust anchor authorizes those signatures:
+ * verified against its own sibling INDEX.sig by the same signature check.
+ * The operator's trusted keys directory authorizes those signatures:
  * publishers may use one key for all arch INDEXes or distinct per-arch keys,
  * but key trust is operator-managed, not embedded in INDEX records.
  *
@@ -100,6 +101,8 @@
 
 #include "loadables.h"
 #include "_mbedtls_sha256.h"
+#include "_monocypher_monocypher-ed25519.h"
+#include "command-run.h"
 
 /* gcc's -Wformat-truncation flags every "%s/suffix" composition where
  * the source could theoretically fill BPKG_PATH_MAX, even though the
@@ -118,6 +121,8 @@
 #define BPKG_SOURCES_LIST  "/etc/pkg/sources.list"
 #define BPKG_INSTALL_ROOT  "/"
 #define BPKG_LOADABLES_DIR "/usr/lib/bash-os/loadables"
+/* A loadable package's own libexec/NAME/ and share/NAME/ trees install here. */
+#define BPKG_DATA_ROOT     "/usr/lib/bash-os"
 
 #define BPKG_TAR_BLOCK     512
 #define BPKG_PATH_MAX      4096
@@ -241,66 +246,448 @@ bp_read_all_fd (int fd, bp_buf *out)
     return n < 0 ? -1 : 0;
 }
 
+#ifndef AT_SYMLINK_NOFOLLOW
+#  define AT_SYMLINK_NOFOLLOW 0x100
+#endif
+
+/* --root for the builtin now running. NULL for pack and the delta verbs,
+   which only touch paths the user named. pkg_builtin saves and restores
+   this around dispatch. */
+static const char *bp_contain_root;
+
+/* REL receives the path strictly below ROOT. The root string itself is
+   not below it: open() follows links in the path the user gave for --root.
+   A lexical ".." is still below the string, and the walk rejects it. */
 static int
-bp_read_file (const char *path, bp_buf *out)
+bp_below_root (const char *root, const char *path, const char **rel)
+{
+    if (!root || !*root || !path || !*path)
+        return 0;
+    if (strcmp (root, "/") == 0) {
+        if (path[1] == '\0')
+            return 0;
+        *rel = path + 1;
+        return 1;
+    }
+    size_t n = strlen (root);
+    while (n > 1 && root[n - 1] == '/')
+        n--;
+    if (strncmp (path, root, n) != 0 || path[n] != '/')
+        return 0;
+    const char *r = path + n + 1;
+    while (*r == '/')
+        r++;
+    if (!*r)
+        return 0;
+    *rel = r;
+    return 1;
+}
+
+/* Open ROOT following every symlink in that path, then walk REL without
+   following. ".." is refused so a files/ member cannot step back out.
+   CREATE makes missing directories. When STOP_BEFORE_FINAL is set, *LEAF
+   receives the last component and the returned fd is its parent. */
+static int
+bp_open_below (const char *root, const char *rel, int create,
+               int stop_before_final, char *leaf, size_t leaf_sz)
+{
+    if (!root || !*root) {
+        errno = EINVAL;
+        return -1;
+    }
+    int dfd = open (root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dfd < 0)
+        return -1;
+    if (!rel || !*rel) {
+        if (stop_before_final) {
+            close (dfd);
+            errno = EINVAL;
+            return -1;
+        }
+        return dfd;
+    }
+    char buf[BPKG_PATH_MAX];
+    size_t n = strlen (rel);
+    if (n >= sizeof buf) {
+        close (dfd);
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    memcpy (buf, rel, n + 1);
+    while (n > 0 && buf[n - 1] == '/')
+        buf[--n] = 0;
+    char *p = buf;
+    while (*p) {
+        while (*p == '/')
+            p++;
+        if (!*p)
+            break;
+        char *slash = strchr (p, '/');
+        if (slash)
+            *slash = 0;
+        int last = slash == NULL;
+        if (stop_before_final && last) {
+            if (strlen (p) >= leaf_sz) {
+                close (dfd);
+                errno = ENAMETOOLONG;
+                return -1;
+            }
+            memcpy (leaf, p, strlen (p) + 1);
+            return dfd;
+        }
+        if (!strcmp (p, "..")) {
+            close (dfd);
+            errno = ELOOP;
+            return -1;
+        }
+        if (!strcmp (p, ".")) {
+            if (!slash)
+                break;
+            p = slash + 1;
+            continue;
+        }
+        struct stat st;
+        if (fstatat (dfd, p, &st, AT_SYMLINK_NOFOLLOW) < 0) {
+            if (errno != ENOENT || !create) {
+                int saved = errno;
+                close (dfd);
+                errno = saved;
+                return -1;
+            }
+            if (mkdirat (dfd, p, 0755) < 0 && errno != EEXIST) {
+                int saved = errno;
+                close (dfd);
+                errno = saved;
+                return -1;
+            }
+            if (fstatat (dfd, p, &st, AT_SYMLINK_NOFOLLOW) < 0) {
+                int saved = errno;
+                close (dfd);
+                errno = saved;
+                return -1;
+            }
+        }
+        if (S_ISLNK (st.st_mode)) {
+            close (dfd);
+            errno = ELOOP;
+            return -1;
+        }
+        if (!S_ISDIR (st.st_mode)) {
+            close (dfd);
+            errno = ENOTDIR;
+            return -1;
+        }
+        int nfd = openat (dfd, p,
+                          O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        int saved = errno;
+        close (dfd);
+        if (nfd < 0) {
+            errno = saved;
+            return -1;
+        }
+        dfd = nfd;
+        if (!slash)
+            break;
+        p = slash + 1;
+    }
+    if (stop_before_final) {
+        close (dfd);
+        errno = EINVAL;
+        return -1;
+    }
+    return dfd;
+}
+
+static int
+bp_read_user_file (const char *path, bp_buf *out)
 {
     int fd = open (path, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return -1;
+    if (fd < 0)
+        return -1;
     int rc = bp_read_all_fd (fd, out);
     close (fd);
     return rc;
 }
 
 static int
-bp_write_file_atomic (const char *path, const void *data, size_t n,
-                      mode_t mode)
+bp_read_below (const char *root, const char *rel, bp_buf *out)
+{
+    char leaf[256];
+    int dfd = bp_open_below (root, rel, 0, 1, leaf, sizeof leaf);
+    if (dfd < 0)
+        return -1;
+    if (!strcmp (leaf, "..") || !strcmp (leaf, ".")) {
+        close (dfd);
+        errno = ELOOP;
+        return -1;
+    }
+    int fd = openat (dfd, leaf, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    int saved = errno;
+    close (dfd);
+    if (fd < 0) {
+        errno = saved;
+        return -1;
+    }
+    int rc = bp_read_all_fd (fd, out);
+    close (fd);
+    return rc;
+}
+
+/* State, installed files, and package-derived paths below --root are not
+   followed. Anything else, including a package file or a local source the
+   user named, is an ordinary open. */
+static int
+bp_read_file (const char *path, bp_buf *out)
+{
+    const char *rel = NULL;
+    if (bp_contain_root && bp_below_root (bp_contain_root, path, &rel))
+        return bp_read_below (bp_contain_root, rel, out);
+    return bp_read_user_file (path, out);
+}
+
+/* A .pkg the user named, even when that path is lexically below --root
+   (the default root is "/"). A copy under the cache is state. */
+static int
+bp_read_archive (const char *path, bp_buf *out)
+{
+    const char *rel = NULL;
+    if (bp_contain_root && bp_below_root (bp_contain_root, path, &rel) &&
+        strncmp (rel, "var/lib/pkg/", 12) == 0)
+        return bp_read_below (bp_contain_root, rel, out);
+    return bp_read_user_file (path, out);
+}
+
+/* Used when a root has no sources.list: the signed package releases of
+   bash-os. Like any https source, it is fetched only when remote fetching
+   is allowed. */
+#define BPKG_DEFAULT_SOURCE \
+    "https://github.com/itsmygithubacct/bash-os/releases/download/packages\n"
+
+/* Read the sources given with --sources, or ROOT's sources.list. If ROOT has
+   no sources.list and DEFAULT_OK is set, the default source stands in for
+   it. PATH receives the file name, for messages. */
+static int
+bp_read_sources (const char *root, const char *sources, int default_ok,
+                 char *path, size_t pathsz, bp_buf *body)
+{
+    if (sources) {
+        /* --sources is a path the user named. Follow it. */
+        snprintf (path, pathsz, "%s", sources);
+        if (bp_read_user_file (path, body) == 0)
+            return 0;
+    } else {
+        snprintf (path, pathsz, "%s%s",
+                  root[0] && strcmp (root, "/") ? root : "",
+                  BPKG_SOURCES_LIST);
+        if (bp_read_file (path, body) == 0)
+            return 0;
+    }
+    if (sources || errno != ENOENT || !default_ok)
+        return -1;
+    bp_buf_free (body);
+    return bp_buf_append (body, BPKG_DEFAULT_SOURCE,
+                          sizeof BPKG_DEFAULT_SOURCE - 1);
+}
+
+static unsigned bp_tmp_seq;
+
+/* Paths outside --root, including the hook script under /tmp. */
+static int
+bp_write_file_user (const char *path, const void *data, size_t n,
+                    mode_t mode)
 {
     char tmp[BPKG_PATH_MAX];
-    if (snprintf (tmp, sizeof tmp, "%s.tmp.%d", path, (int) getpid ()) >=
-        (int) sizeof tmp) return -1;
-    int fd = open (tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, mode);
+    if (snprintf (tmp, sizeof tmp, "%s.tmp.XXXXXX", path) >=
+        (int) sizeof tmp) { errno = ENAMETOOLONG; return -1; }
+    /* Reserve our own inode. A predictable temporary name can be a symlink
+       or a hard link to a file unrelated to the package. */
+    int fd = mkstemp (tmp);
     if (fd < 0) return -1;
+    mode_t mask = umask (0);
+    umask (mask);
+    if (fcntl (fd, F_SETFD, FD_CLOEXEC) < 0)
+        goto fail;
     const unsigned char *p = data;
     size_t left = n;
     while (left > 0) {
         ssize_t w = write (fd, p, left);
-        if (w < 0) {
-            if (errno == EINTR) continue;
-            close (fd);
-            unlink (tmp);
-            return -1;
+        if (w <= 0) {
+            if (w < 0 && errno == EINTR) continue;
+            if (w == 0) errno = EIO;
+            goto fail;
         }
         p += w; left -= (size_t) w;
     }
-    if (close (fd) < 0) {
-        unlink (tmp);
-        return -1;
-    }
-    if (rename (tmp, path) < 0) {
-        unlink (tmp);
-        return -1;
-    }
+    if (fchmod (fd, mode & ~mask) < 0)
+        goto fail;
+    if (close (fd) < 0) { fd = -1; goto fail; }
+    fd = -1;
+    if (rename (tmp, path) < 0)
+        goto fail;
     return 0;
+fail:
+    {
+        int saved = errno;
+        if (fd >= 0) close (fd);
+        unlink (tmp);
+        errno = saved;
+        return -1;
+    }
 }
 
-/* mkdir -p — accept an absolute or relative path, create every leading
- * directory with mode 0755. EEXIST treated as success. Trailing slash
- * tolerated. */
+/* Write PATH, which is ROOT plus REL, by renaming inside the parent
+   directory. A symlink leaf is replaced, not followed. */
+static int
+bp_write_below (const char *root, const char *rel, const void *data,
+                size_t n, mode_t mode)
+{
+    char leaf[256];
+    int dfd = bp_open_below (root, rel, 0, 1, leaf, sizeof leaf);
+    if (dfd < 0)
+        return -1;
+    if (!strcmp (leaf, "..") || !strcmp (leaf, ".")) {
+        close (dfd);
+        errno = ELOOP;
+        return -1;
+    }
+    char tmp[64];
+    int fd = -1;
+    for (unsigned k = 0; k < 128 && fd < 0; k++) {
+        if (snprintf (tmp, sizeof tmp, ".pkg.%ld.%u", (long) getpid (),
+                      bp_tmp_seq + k) >= (int) sizeof tmp) {
+            close (dfd);
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+        fd = openat (dfd, tmp,
+                     O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+        if (fd < 0 && errno != EEXIST) {
+            int saved = errno;
+            close (dfd);
+            errno = saved;
+            return -1;
+        }
+    }
+    bp_tmp_seq += 128;
+    if (fd < 0) {
+        close (dfd);
+        errno = EEXIST;
+        return -1;
+    }
+    mode_t mask = umask (0);
+    umask (mask);
+    const unsigned char *p = data;
+    size_t left = n;
+    while (left > 0) {
+        ssize_t w = write (fd, p, left);
+        if (w <= 0) {
+            if (w < 0 && errno == EINTR) continue;
+            if (w == 0) errno = EIO;
+            goto fail;
+        }
+        p += w; left -= (size_t) w;
+    }
+    if (fchmod (fd, mode & ~mask) < 0)
+        goto fail;
+    if (close (fd) < 0) { fd = -1; goto fail; }
+    fd = -1;
+    if (renameat (dfd, tmp, dfd, leaf) < 0)
+        goto fail;
+    close (dfd);
+    return 0;
+fail:
+    {
+        int saved = errno;
+        if (fd >= 0) close (fd);
+        unlinkat (dfd, tmp, 0);
+        close (dfd);
+        errno = saved;
+        return -1;
+    }
+}
+
+static int
+bp_write_file_atomic (const char *path, const void *data, size_t n,
+                      mode_t mode)
+{
+    const char *rel = NULL;
+    if (bp_contain_root && bp_below_root (bp_contain_root, path, &rel))
+        return bp_write_below (bp_contain_root, rel, data, n, mode);
+    return bp_write_file_user (path, data, n, mode);
+}
+
+/* chmod of a leaf below --root. openat(O_NOFOLLOW) plus fchmod does not
+   need the fchmodat2 syscall or a mounted /proc. */
+static int
+bp_chmod_nofollow (const char *path, mode_t mode)
+{
+    const char *rel = NULL;
+    if (!(bp_contain_root && bp_below_root (bp_contain_root, path, &rel)))
+        return chmod (path, mode);
+    char leaf[256];
+    int dfd = bp_open_below (bp_contain_root, rel, 0, 1, leaf, sizeof leaf);
+    if (dfd < 0)
+        return -1;
+    if (!strcmp (leaf, "..") || !strcmp (leaf, ".")) {
+        close (dfd);
+        errno = ELOOP;
+        return -1;
+    }
+    int fd = openat (dfd, leaf, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    int saved = errno;
+    close (dfd);
+    if (fd < 0) {
+        errno = saved;
+        return -1;
+    }
+    int rc = fchmod (fd, mode);
+    saved = errno;
+    close (fd);
+    if (rc < 0)
+        errno = saved;
+    return rc;
+}
+
+/* mkdir -p. Below --root a symlink component is ELOOP. Elsewhere this is
+   the ordinary walk, so a prefix the user named may itself be a link. */
 static int
 bp_mkdir_p (const char *path)
 {
-    if (!path || !*path) return -1;
+    if (!path || !*path) {
+        errno = EINVAL;
+        return -1;
+    }
+    const char *rel = NULL;
+    if (bp_contain_root && bp_below_root (bp_contain_root, path, &rel)) {
+        /* Create the root the user named, following links in that prefix,
+           then refuse a symlink only in the components under it. */
+        const char *root = bp_contain_root;
+        bp_contain_root = NULL;
+        int made = bp_mkdir_p (root);
+        bp_contain_root = root;
+        if (made < 0)
+            return -1;
+        int dfd = bp_open_below (root, rel, 1, 0, NULL, 0);
+        if (dfd < 0)
+            return -1;
+        close (dfd);
+        return 0;
+    }
     char buf[BPKG_PATH_MAX];
     size_t n = strlen (path);
-    if (n >= sizeof buf) return -1;
+    if (n >= sizeof buf) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
     memcpy (buf, path, n + 1);
-    /* Trim trailing slashes (but keep leading "/"). */
-    while (n > 1 && buf[n - 1] == '/') buf[--n] = 0;
+    while (n > 1 && buf[n - 1] == '/')
+        buf[--n] = 0;
     for (size_t i = 1; i <= n; i++) {
         if (buf[i] == '/' || buf[i] == 0) {
             int saved = buf[i];
             buf[i] = 0;
-            if (mkdir (buf, 0755) < 0 && errno != EEXIST) return -1;
+            if (mkdir (buf, 0755) < 0 && errno != EEXIST)
+                return -1;
             buf[i] = saved;
         }
     }
@@ -779,6 +1166,15 @@ bp_abi_matches (const char *abi)
 
 /* ---- Path safety ---------------------------------------------------- */
 
+/* Whether S ends in SUFFIX. Deriving the length from SUFFIX keeps a renamed
+   file extension from leaving a stale fixed offset behind. */
+static int
+bp_has_suffix (const char *s, const char *suffix)
+{
+    size_t n = strlen (s), k = strlen (suffix);
+    return n > k && strcmp (s + n - k, suffix) == 0;
+}
+
 static int
 bp_safe_path (const char *p)
 {
@@ -1008,56 +1404,226 @@ bp_run_script (const char *path, const char *pkgname,
 
 /* ---- Signature verification --------------------------------------- */
 
+/* Signatures use OpenBSD signify's two-line format: "untrusted comment: ..."
+   followed by base64 of "Ed", an 8-byte key number and a 64-byte Ed25519
+   signature (a public key file holds a 32-byte key instead). The public key
+   is found by key number among the *.pub files in
+   $BASHSIGNIFY_TRUSTED_KEYS_DIR, and a key number listed in
+   $BASHSIGNIFY_REVOKED_KEYS is refused, keeping the rules of the retired
+   shell helper. The check runs in this process, so it needs nothing on PATH. */
+#define BPKG_TRUSTED_KEYS_DIR "/etc/bashsignify/trusted"
+#define BPKG_REVOKED_KEYS     "/etc/bashsignify/revoked-keys"
+#define BPKG_SIGNIFY_PUB_LEN  42
+
+/* The bash-os package publisher key and its successor, kept for rotation.
+   Both are trusted as if they were in the trusted keys directory, and
+   listing a key number in the revoked-keys file refuses them as well. */
+static const char *const bp_builtin_keys[] = {
+    "RWStSteo0OF2FpFqWx3tKeltHMC2NR2XTmJXU5Whyf3oFH8cubYpO/Ox",   /* bash-os-pkg-2026 */
+    "RWQQhemkz824lHqAEW+JapTMy+ZUWBj5CNGfC/6HX+xPfFAoBdxctsiM",   /* bash-os-pkg-2026-successor */
+};
+#define BPKG_SIGNIFY_SIG_LEN  74
+
+static const char *
+bp_shell_value_or (const char *name, const char *fallback)
+{
+    const char *value = get_string_value (name);
+    return value && *value ? value : fallback;
+}
+
+static long
+bp_base64_decode (const char *in, size_t n, unsigned char *out, size_t outsz)
+{
+    size_t len = 0;
+    unsigned acc = 0;
+    int bits = 0, padding = 0;
+    for (size_t i = 0; i < n; i++) {
+        int c = (unsigned char) in[i], v;
+        if (c == '=') { padding++; continue; }
+        if (padding) return -1;
+        if (c >= 'A' && c <= 'Z') v = c - 'A';
+        else if (c >= 'a' && c <= 'z') v = c - 'a' + 26;
+        else if (c >= '0' && c <= '9') v = c - '0' + 52;
+        else if (c == '+') v = 62;
+        else if (c == '/') v = 63;
+        else return -1;
+        acc = (acc << 6) | (unsigned) v;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            if (len == outsz) return -1;
+            out[len++] = (unsigned char) (acc >> bits);
+        }
+    }
+    return padding > 2 ? -1 : (long) len;
+}
+
+static void
+bp_signify_hex (const unsigned char *in, size_t n, char *out)
+{
+    static const char digits[] = "0123456789abcdef";
+    for (size_t i = 0; i < n; i++) {
+        out[2 * i] = digits[in[i] >> 4];
+        out[2 * i + 1] = digits[in[i] & 15];
+    }
+    out[2 * n] = '\0';
+}
+
+/* Read signify file PATH, which must decode to exactly LEN bytes that start
+   with "Ed". QUIET suppresses diagnostics while scanning the trusted keys. */
 static int
-bp_verify_signature_with_sig (const char *pkgfile, const char *sig)
+bp_signify_read (const char *path, unsigned char *out, size_t len, int quiet)
+{
+    char comment[1024], data[1024];
+    FILE *f = fopen (path, "re");
+    if (!f) {
+        if (!quiet) builtin_error ("cannot read %s: %s", path, strerror (errno));
+        return -1;
+    }
+    int lines = fgets (comment, sizeof comment, f) && fgets (data, sizeof data, f);
+    fclose (f);
+    const char *problem = NULL;
+    if (!lines || strncmp (comment, "untrusted comment: ", 19))
+        problem = "is not in signify format";
+    else if (bp_base64_decode (data, strcspn (data, "\r\n"), out, len) != (long) len)
+        problem = "has the wrong length for a signify key or signature";
+    else if (out[0] != 'E' || out[1] != 'd')
+        problem = "is not an Ed25519 key or signature";
+    if (problem && !quiet) builtin_error ("%s %s", path, problem);
+    return problem ? -1 : 0;
+}
+
+static int
+bp_signify_trusted_key (const unsigned char *keynum, unsigned char key[32])
+{
+    const char *dir = bp_shell_value_or ("BASHSIGNIFY_TRUSTED_KEYS_DIR",
+                                         BPKG_TRUSTED_KEYS_DIR);
+    char id[17];
+    bp_signify_hex (keynum, 8, id);
+    int found = 0;
+    DIR *d = opendir (dir);
+    int dir_errno = d ? 0 : errno;
+    struct dirent *entry;
+    while (d && !found && (entry = readdir (d))) {
+        size_t n = strlen (entry->d_name);
+        char path[BPKG_PATH_MAX];
+        unsigned char pub[BPKG_SIGNIFY_PUB_LEN];
+        if (n < 5 || strcmp (entry->d_name + n - 4, ".pub") ||
+            snprintf (path, sizeof path, "%s/%s", dir, entry->d_name) >= (int) sizeof path ||
+            bp_signify_read (path, pub, sizeof pub, 1) < 0 ||
+            memcmp (pub + 2, keynum, 8))
+            continue;
+        memcpy (key, pub + 10, 32);
+        found = 1;
+    }
+    if (d)
+        closedir (d);
+    for (size_t i = 0; !found && i < sizeof bp_builtin_keys / sizeof *bp_builtin_keys; i++) {
+        unsigned char pub[BPKG_SIGNIFY_PUB_LEN];
+        if (bp_base64_decode (bp_builtin_keys[i], strlen (bp_builtin_keys[i]), pub, sizeof pub)
+                == BPKG_SIGNIFY_PUB_LEN && !memcmp (pub + 2, keynum, 8)) {
+            memcpy (key, pub + 10, 32);
+            found = 1;
+        }
+    }
+    if (!found && d)
+        builtin_error ("no trusted key matching keynum %s (looked in %s and the built-in keys)",
+                       id, dir);
+    else if (!found)
+        builtin_error ("no trusted key matching keynum %s (the built-in keys; %s: %s)",
+                       id, dir, strerror (dir_errno));
+    return found ? 0 : -1;
+}
+
+/* One 16-hex key number per line; '#' comments and blank lines are ignored.
+   A missing list means no key is revoked; an unreadable list cannot authorize
+   a signature. Return -1 on I/O failure, 0 if absent, or 1 if revoked. */
+static int
+bp_signify_revoked (const unsigned char *keynum)
+{
+    const char *path = bp_shell_value_or ("BASHSIGNIFY_REVOKED_KEYS", BPKG_REVOKED_KEYS);
+    char id[17], line[256];
+    bp_signify_hex (keynum, 8, id);
+    FILE *f = fopen (path, "re");
+    if (!f) {
+        if (errno == ENOENT) return 0;
+        builtin_error ("cannot read revocations %s: %s", path, strerror (errno));
+        return -1;
+    }
+    int revoked = 0;
+    errno = 0;
+    while (!revoked && fgets (line, sizeof line, f)) {
+        char entry[sizeof line];
+        size_t n = 0;
+        for (char *p = line; *p && *p != '#'; p++)
+            if (!isspace ((unsigned char) *p)) entry[n++] = *p;
+        entry[n] = '\0';
+        revoked = n && !strcasecmp (entry, id);
+    }
+    int read_errno = ferror (f) ? (errno ? errno : EIO) : 0;
+    if (fclose (f) < 0 && !read_errno)
+        read_errno = errno ? errno : EIO;
+    if (read_errno) {
+        builtin_error ("cannot read revocations %s: %s", path, strerror (read_errno));
+        return -1;
+    }
+    if (revoked)
+        builtin_error ("key id %s has been revoked (per %s)", id, path);
+    return revoked;
+}
+
+/* Check SIG against these bytes. 1 if the signature file is absent, 0 if
+   these bytes verify, -1 on any other failure. Callers that already hold
+   the bytes must use this: reopening the path can verify a different
+   snapshot from the one that is published. */
+static int
+bp_verify_bytes_with_sig (const unsigned char *data, size_t len,
+                          const char *sig, const char *what)
 {
     struct stat st;
     if (stat (sig, &st) < 0) {
-        /* No sig — caller decides whether to allow. */
-        return 1;
-    }
-    /* Use bashsignify if available on PATH. Sync Bash's exported-
-     * variable cache to environ before fork so the child sees env
-     * knobs the caller set via `VAR=val pkg install` (notably
-     * BASHSIGNIFY_TRUSTED_KEYS_DIR and BASHSIGNIFY_REVOKED_KEYS).
-     * Without this, those vars are in Bash's symbol table but not
-     * in environ — the forked execlp child has the stale snapshot. */
-    maybe_make_export_env ();
-    struct bpkg_child_guard guard;
-    if (bpkg_child_guard_begin (&guard) < 0)
-        return -1;
-    pid_t pid = fork ();
-    if (pid < 0) {
-        bpkg_child_guard_parent_end (&guard);
+        /* Only absence permits the caller's explicit unsigned override. */
+        if (errno == ENOENT) return 1;
+        builtin_error ("cannot inspect signature %s: %s", sig, strerror (errno));
         return -1;
     }
-    if (pid == 0) {
-        bpkg_child_guard_child_end (&guard);
-        /* Suppress bashsignify's success-path stdout ("Signature
-         * Verified") so a quiet pkg install stays quiet, but let
-         * stderr pass through so the operator sees revoked-key,
-         * unknown-key, keynum-mismatch, malformed-sig, etc. diagnostics.
-         * Without this, every install-time signature refusal looked
-         * like a generic non-zero rc from pkg with no hint of why. */
-        int devnull = open ("/dev/null", O_WRONLY);
-        if (devnull >= 0) {
-            dup2 (devnull, 1);
-            close (devnull);
+    unsigned char signature[BPKG_SIGNIFY_SIG_LEN], key[32];
+    if (bp_signify_read (sig, signature, sizeof signature, 0) < 0 ||
+        bp_signify_trusted_key (signature + 2, key) < 0 ||
+        bp_signify_revoked (signature + 2))
+        return -1;
+    const unsigned char *message = data ? data : (const unsigned char *) "";
+    int bad = crypto_ed25519_check (signature + 10, key, message, len);
+    if (bad)
+        builtin_error ("%s does not match its signature %s", what, sig);
+    return bad ? -1 : 0;
+}
+
+static int
+bp_verify_signature_with_sig (const char *pkgfile, const char *sig)
+{
+    bp_buf message = {0};
+    int fd = open (pkgfile, O_RDONLY | O_CLOEXEC);
+    if (fd < 0 || bp_read_all_fd (fd, &message) < 0) {
+        /* A missing signature is still "unsigned", even when the package
+           cannot be read. Inspect it before reporting the read error. */
+        struct stat st;
+        int saved = errno;
+        if (stat (sig, &st) < 0 && errno == ENOENT) {
+            if (fd >= 0) close (fd);
+            bp_buf_free (&message);
+            return 1;
         }
-        execlp ("bashsignify", "bashsignify", "verify",
-                "-x", sig, "-m", pkgfile, (char *) NULL);
-        _exit (127);
+        errno = saved;
+        builtin_error ("cannot read %s: %s", pkgfile, strerror (errno));
+        if (fd >= 0) close (fd);
+        bp_buf_free (&message);
+        return -1;
     }
-    int status = 0;
-    while (waitpid (pid, &status, 0) < 0) {
-        if (errno != EINTR) {
-            bpkg_child_guard_parent_end (&guard);
-            return -1;
-        }
-    }
-    bpkg_child_guard_parent_end (&guard);
-    if (WIFEXITED (status) && WEXITSTATUS (status) == 0) return 0;
-    return -1;
+    close (fd);
+    int rc = bp_verify_bytes_with_sig (message.data, message.len, sig, pkgfile);
+    bp_buf_free (&message);
+    return rc;
 }
 
 static int
@@ -1691,6 +2257,278 @@ bp_verify_loadable_mode (const char *root, const bp_buf *manifest,
     return 0;
 }
 
+/* ---- Loadable data files -------------------------------------------- */
+
+/* Besides loadable/NAME.so, a loadable package may carry files of its own
+ * under libexec/NAME/ and share/NAME/, installed beneath BPKG_DATA_ROOT.
+ * MANIFEST declares every regular file with its permission bits and content:
+ *
+ *   data: share/NAME/lib/os.py 0644 SHA256
+ *
+ * Each file member must be declared and each declaration present, with the
+ * same mode and SHA-256. Directories need no declaration; links and other
+ * member types are refused. */
+
+static const char *const bp_data_kinds[2] = { "libexec", "share" };
+
+typedef struct {
+    char  *path;
+    mode_t mode;
+    char   hex[65];
+    int    seen;
+} bp_data_entry;
+
+typedef struct {
+    bp_data_entry *items;
+    size_t         n;
+    size_t         cap;
+} bp_data_list;
+
+static void
+bp_data_list_free (bp_data_list *l)
+{
+    for (size_t i = 0; i < l->n; i++) free (l->items[i].path);
+    free (l->items);
+    memset (l, 0, sizeof *l);
+}
+
+static int
+bp_data_entry_cmp (const void *a, const void *b)
+{
+    return strcmp (((const bp_data_entry *) a)->path,
+                   ((const bp_data_entry *) b)->path);
+}
+
+static bp_data_entry *
+bp_data_find (const bp_data_list *l, const char *path)
+{
+    bp_data_entry key = { .path = (char *) path };
+    return l->n ? bsearch (&key, l->items, l->n, sizeof *l->items,
+                           bp_data_entry_cmp) : NULL;
+}
+
+/* The kind (0 libexec, 1 share) when PATH names something under KIND/NAME/,
+   or with DIR_OK also KIND/NAME itself; -1 otherwise. */
+static int
+bp_data_kind (const char *path, const char *name, int dir_ok)
+{
+    size_t nl = strlen (name);
+    for (int k = 0; k < 2; k++) {
+        size_t kl = strlen (bp_data_kinds[k]);
+        if (strncmp (path, bp_data_kinds[k], kl) != 0 || path[kl] != '/' ||
+            strncmp (path + kl + 1, name, nl) != 0)
+            continue;
+        const char *rest = path + kl + 1 + nl;
+        if (rest[0] == '/' && rest[1])
+            return k;
+        if (dir_ok && (!rest[0] || (rest[0] == '/' && !rest[1])))
+            return k;
+    }
+    return -1;
+}
+
+/* A relative file path with no empty, "." or ".." component and no control
+   bytes. */
+static int
+bp_data_path_ok (const char *path)
+{
+    size_t len = strlen (path);
+    if (!len || path[0] == '/' || path[len - 1] == '/' || !bp_safe_path (path))
+        return 0;
+    for (const char *c = path; ; ) {
+        const char *slash = strchr (c, '/');
+        size_t n = slash ? (size_t) (slash - c) : strlen (c);
+        if (n == 0 || (n == 1 && c[0] == '.') ||
+            (n == 2 && c[0] == '.' && c[1] == '.'))
+            return 0;
+        for (size_t i = 0; i < n; i++)
+            if ((unsigned char) c[i] < 0x20 || c[i] == 0x7f)
+                return 0;
+        if (!slash)
+            return 1;
+        c = slash + 1;
+    }
+}
+
+/* Collect NAME's data: lines from MANIFEST, sorted by path. */
+static int
+bp_parse_data_lines (const bp_buf *manifest, const char *name,
+                     bp_data_list *out)
+{
+    size_t off = 0;
+    while (off < manifest->len) {
+        size_t end = off;
+        while (end < manifest->len && manifest->data[end] != '\n') end++;
+        size_t ll = end - off;
+        const unsigned char *start = manifest->data + off;
+        off = end + 1;
+        char line[4096];
+        if (ll == 0)
+            continue;
+        if (ll >= sizeof line) {
+            if (ll >= 5 && !memcmp (start, "data:", 5)) {
+                builtin_error ("data: line too long");
+                return -1;
+            }
+            continue;
+        }
+        memcpy (line, start, ll);
+        line[ll] = 0;
+        char *p = bp_strip (line);
+        if (strncmp (p, "data", 4) != 0)
+            continue;
+        p += 4;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p != ':')
+            continue;
+        char path[4096], mode_text[16], hex[128], extra[2];
+        if (sscanf (p + 1, " %4095s %15s %127s %1s", path, mode_text, hex,
+                    extra) != 3) {
+            builtin_error ("data: expected PATH MODE SHA256: %s", p + 1);
+            return -1;
+        }
+        if (!bp_data_path_ok (path) || bp_data_kind (path, name, 0) < 0) {
+            builtin_error ("data: %s is not under libexec/%s/ or share/%s/",
+                           path, name, name);
+            return -1;
+        }
+        char *mode_end;
+        unsigned long mode = strtoul (mode_text, &mode_end, 8);
+        if (*mode_end || mode_text[0] < '0' || mode_text[0] > '7' ||
+            (mode & ~0777UL)) {
+            builtin_error ("data: mode for %s must be permission bits only "
+                           "(got %s)", path, mode_text);
+            return -1;
+        }
+        if (!bp_hex64 (hex)) {
+            builtin_error ("data: hash for %s is not 64 hex digits", path);
+            return -1;
+        }
+        if (out->n >= BPKG_MAX_FILES) {
+            builtin_error ("data: more than %d files", BPKG_MAX_FILES);
+            return -1;
+        }
+        if (out->n == out->cap) {
+            size_t cap = out->cap ? out->cap * 2 : 64;
+            bp_data_entry *items = realloc (out->items, cap * sizeof *items);
+            if (!items) {
+                builtin_error ("out of memory");
+                return -1;
+            }
+            out->items = items;
+            out->cap = cap;
+        }
+        bp_data_entry *e = &out->items[out->n];
+        memset (e, 0, sizeof *e);
+        if (!(e->path = strdup (path))) {
+            builtin_error ("out of memory");
+            return -1;
+        }
+        e->mode = (mode_t) mode;
+        for (int i = 0; i < 64; i++)
+            e->hex[i] = (char) tolower ((unsigned char) hex[i]);
+        out->n++;
+    }
+    if (out->n)
+        qsort (out->items, out->n, sizeof *out->items, bp_data_entry_cmp);
+    for (size_t i = 1; i < out->n; i++) {
+        if (!strcmp (out->items[i - 1].path, out->items[i].path)) {
+            builtin_error ("data: %s declared twice", out->items[i].path);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+typedef struct {
+    const char   *name;
+    bp_data_list *list;
+    size_t        files;
+    int           bad;
+} bp_data_check;
+
+static int
+bp_data_check_cb (const bp_tar_hdr *h, const char *path,
+                  const unsigned char *body, size_t body_len, void *opaque)
+{
+    bp_data_check *c = opaque;
+    int top = !strcmp (path, "libexec") || !strcmp (path, "libexec/") ||
+              !strcmp (path, "share") || !strcmp (path, "share/");
+    if (!top && strncmp (path, "libexec/", 8) != 0 &&
+        strncmp (path, "share/", 6) != 0)
+        return 0;
+    if (h->typeflag == '5') {
+        if (!top && bp_data_kind (path, c->name, 1) < 0) {
+            builtin_error ("data directory %s is not under libexec/%s/ or "
+                           "share/%s/", path, c->name, c->name);
+            c->bad = 1;
+        }
+        return 0;
+    }
+    if (h->typeflag != '0' && h->typeflag != 0) {
+        builtin_error ("data member %s is not a regular file or directory",
+                       path);
+        c->bad = 1;
+        return 0;
+    }
+    if (!bp_data_path_ok (path) || bp_data_kind (path, c->name, 0) < 0) {
+        builtin_error ("data file %s is not under libexec/%s/ or share/%s/",
+                       path, c->name, c->name);
+        c->bad = 1;
+        return 0;
+    }
+    bp_data_entry *e = bp_data_find (c->list, path);
+    if (!e) {
+        builtin_error ("data file %s is not declared in MANIFEST", path);
+        c->bad = 1;
+        return 0;
+    }
+    if (e->seen++) {
+        builtin_error ("data file %s appears twice", path);
+        c->bad = 1;
+        return 0;
+    }
+    mode_t mode = (mode_t) (bp_octal (h->mode, sizeof h->mode) & 07777);
+    if (mode != e->mode) {
+        builtin_error ("data file %s has mode 0%o, but MANIFEST declares 0%o",
+                       path, (unsigned) mode, (unsigned) e->mode);
+        c->bad = 1;
+    }
+    char got[65];
+    if (bp_sha256_bytes_hex (body, body_len, got) < 0 ||
+        strcasecmp (got, e->hex) != 0) {
+        builtin_error ("data file %s does not match its MANIFEST sha256", path);
+        c->bad = 1;
+    }
+    c->files++;
+    return 0;
+}
+
+/* Check the data members of a loadable archive for package NAME against
+   MANIFEST. Returns the number of data files, or -1. */
+static long
+bp_check_loadable_data (const unsigned char *tar, size_t len,
+                        const char *name, const bp_buf *manifest)
+{
+    bp_data_list list = {0};
+    if (bp_parse_data_lines (manifest, name, &list) < 0) {
+        bp_data_list_free (&list);
+        return -1;
+    }
+    bp_data_check c = { name, &list, 0, 0 };
+    if (bp_tar_iter (tar, len, bp_data_check_cb, &c) < 0)
+        c.bad = 1;
+    for (size_t i = 0; i < list.n; i++) {
+        if (!list.items[i].seen) {
+            builtin_error ("declared data file %s is missing",
+                           list.items[i].path);
+            c.bad = 1;
+        }
+    }
+    bp_data_list_free (&list);
+    return c.bad ? -1 : (long) c.files;
+}
+
 /* ---- Install: extract ---------------------------------------------- */
 
 typedef struct {
@@ -1717,11 +2555,19 @@ typedef struct {
     char         loadable_name[BPKG_NAME_MAX];
     char         loadable_dest[BPKG_PATH_MAX];
     char         loadable_backup[BPKG_PATH_MAX];
+    int          loadable_dest_active;
     int          loadable_backup_active;
     char         state_dir[BPKG_PATH_MAX];
     char         state_backup[BPKG_PATH_MAX];
     int          state_dir_active;
     int          state_backup_active;
+    int          data_count;  /* libexec/ and share/ members */
+    bp_buf       data_tar;    /* the archive, kept to install data files */
+    char         data_final[2][BPKG_PATH_MAX];
+    char         data_stage[2][BPKG_PATH_MAX];
+    char         data_backup[2][BPKG_PATH_MAX];
+    int          data_final_active[2];
+    int          data_backup_active[2];
 } bp_install_ctx;
 
 static void
@@ -1735,6 +2581,7 @@ bp_install_ctx_free (bp_install_ctx *ctx)
     bp_buf_free (&ctx->hook_prerm);
     bp_buf_free (&ctx->hook_postrm);
     bp_buf_free (&ctx->loadable_body);
+    bp_buf_free (&ctx->data_tar);
 }
 
 static void
@@ -1766,6 +2613,44 @@ bp_remove_tree (const char *path)
 }
 
 static int
+bp_backup_existing (const char *path, char *backup, size_t size)
+{
+    struct stat st;
+    backup[0] = 0;
+    if (lstat (path, &st) < 0)
+        return errno == ENOENT ? 0 : -1;
+    if (snprintf (backup, size, "%s.bak.XXXXXX", path) >= (int) size) {
+        backup[0] = 0;
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    int directory = S_ISDIR (st.st_mode);
+    if (directory) {
+        if (!mkdtemp (backup)) { backup[0] = 0; return -1; }
+    } else {
+        int fd = mkstemp (backup);
+        if (fd < 0) { backup[0] = 0; return -1; }
+        if (close (fd) < 0) {
+            int saved = errno;
+            unlink (backup);
+            backup[0] = 0;
+            errno = saved;
+            return -1;
+        }
+    }
+    /* rename can replace only the empty entry we just reserved. Never
+       overwrite a pre-existing backup or remove it during cleanup. */
+    if (rename (path, backup) < 0) {
+        int saved = errno;
+        if (directory) rmdir (backup); else unlink (backup);
+        backup[0] = 0;
+        errno = saved;
+        return -1;
+    }
+    return 1;
+}
+
+static int
 bp_prepare_state_dir (bp_install_ctx *ctx, const char *dir)
 {
     if (snprintf (ctx->state_dir, sizeof ctx->state_dir, "%s", dir) >=
@@ -1780,17 +2665,13 @@ bp_prepare_state_dir (bp_install_ctx *ctx, const char *dir)
             builtin_error ("state path is not a directory: %s", dir);
             return -1;
         }
-        if (snprintf (ctx->state_backup, sizeof ctx->state_backup,
-                      "%s.bak.%d", dir, (int) getpid ()) >=
-            (int) sizeof ctx->state_backup) {
-            builtin_error ("path too long: %s", dir);
-            return -1;
-        }
-        if (rename (dir, ctx->state_backup) < 0) {
+        int backed = bp_backup_existing (dir, ctx->state_backup,
+                                         sizeof ctx->state_backup);
+        if (backed < 0) {
             builtin_error ("backup state dir %s: %s", dir, strerror (errno));
             return -1;
         }
-        ctx->state_backup_active = 1;
+        ctx->state_backup_active = backed;
     } else if (errno != ENOENT) {
         builtin_error ("stat state dir %s: %s", dir, strerror (errno));
         return -1;
@@ -1804,11 +2685,22 @@ static void
 bp_rollback_install (const char *root, bp_install_ctx *ctx)
 {
     bp_rollback_extracted (root, &ctx->files_list);
-    if (ctx->loadable_dest[0])
+    if (ctx->loadable_dest_active)
         unlink (ctx->loadable_dest);
     if (ctx->loadable_backup_active) {
         if (rename (ctx->loadable_backup, ctx->loadable_dest) == 0)
             ctx->loadable_backup_active = 0;
+    }
+    for (int k = 0; k < 2; k++) {
+        if (ctx->data_final_active[k]) {
+            bp_remove_tree (ctx->data_final[k]);
+            ctx->data_final_active[k] = 0;
+        }
+        if (ctx->data_backup_active[k] &&
+            rename (ctx->data_backup[k], ctx->data_final[k]) == 0)
+            ctx->data_backup_active[k] = 0;
+        if (ctx->data_stage[k][0])
+            bp_remove_tree (ctx->data_stage[k]);
     }
     if (ctx->state_dir_active && ctx->state_dir[0]) {
         bp_remove_tree (ctx->state_dir);
@@ -1833,6 +2725,13 @@ bp_commit_install (bp_install_ctx *ctx)
         ctx->state_backup_active = 0;
     }
     ctx->state_dir_active = 0;
+    for (int k = 0; k < 2; k++) {
+        if (ctx->data_backup_active[k]) {
+            bp_remove_tree (ctx->data_backup[k]);
+            ctx->data_backup_active[k] = 0;
+        }
+        ctx->data_final_active[k] = 0;
+    }
 }
 
 static int
@@ -1862,19 +2761,17 @@ bp_install_staged_loadable (bp_install_ctx *ctx, const char *root)
 
     snprintf (ctx->loadable_dest, sizeof ctx->loadable_dest, "%s", dest);
     struct stat old_st;
-    if (stat (dest, &old_st) == 0) {
-        if (snprintf (ctx->loadable_backup, sizeof ctx->loadable_backup,
-                      "%s.bak.%d", dest, (int) getpid ()) >=
-            (int) sizeof ctx->loadable_backup) {
-            builtin_error ("path too long: %s", dest);
-            return -1;
-        }
-        if (rename (dest, ctx->loadable_backup) < 0) {
-            builtin_error ("backup %s: %s", dest, strerror (errno));
-            return -1;
-        }
-        ctx->loadable_backup_active = 1;
+    if (lstat (dest, &old_st) == 0 && S_ISDIR (old_st.st_mode)) {
+        builtin_error ("loadable path is a directory: %s", dest);
+        return -1;
     }
+    int backed = bp_backup_existing (dest, ctx->loadable_backup,
+                                     sizeof ctx->loadable_backup);
+    if (backed < 0) {
+        builtin_error ("backup %s: %s", dest, strerror (errno));
+        return -1;
+    }
+    ctx->loadable_backup_active = backed;
 
     mode_t mode = ctx->loadable_mode ? ctx->loadable_mode : 0755;
     if (bp_write_file_atomic (dest, ctx->loadable_body.data,
@@ -1882,12 +2779,230 @@ bp_install_staged_loadable (bp_install_ctx *ctx, const char *root)
         builtin_error ("write %s: %s", dest, strerror (errno));
         return -1;
     }
-    if (chmod (dest, mode) < 0) {
+    ctx->loadable_dest_active = 1;
+    if (bp_chmod_nofollow (dest, mode) < 0) {
         builtin_error ("chmod %s: %s", dest, strerror (errno));
         return -1;
     }
 
     return 0;
+}
+
+typedef struct {
+    const char         *name;
+    const char         *stage[2];
+    const bp_data_list *list;
+} bp_data_write;
+
+static int
+bp_data_write_cb (const bp_tar_hdr *h, const char *path,
+                  const unsigned char *body, size_t body_len, void *opaque)
+{
+    bp_data_write *w = opaque;
+    if (h->typeflag != '0' && h->typeflag != 0)
+        return 0;
+    int k = bp_data_kind (path, w->name, 0);
+    if (k < 0)
+        return 0;
+    const bp_data_entry *e = bp_data_find (w->list, path);
+    char got[65];
+    if (!e || !w->stage[k][0] ||
+        bp_sha256_bytes_hex (body, body_len, got) < 0 ||
+        strcasecmp (got, e->hex) != 0) {
+        builtin_error ("data file %s does not match its MANIFEST sha256", path);
+        return -1;
+    }
+    const char *rest = path + strlen (bp_data_kinds[k]) + 1 +
+                       strlen (w->name) + 1;
+    char dest[BPKG_PATH_MAX];
+    if (snprintf (dest, sizeof dest, "%s/%s", w->stage[k], rest) >=
+        (int) sizeof dest) {
+        builtin_error ("path too long: %s", path);
+        return -1;
+    }
+    char parent[BPKG_PATH_MAX];
+    snprintf (parent, sizeof parent, "%s", dest);
+    char *slash = strrchr (parent, '/');
+    if (slash) {
+        *slash = 0;
+        if (bp_mkdir_p (parent) < 0) {
+            builtin_error ("mkdir %s: %s", parent, strerror (errno));
+            return -1;
+        }
+    }
+    if (bp_write_file_atomic (dest, body, body_len, e->mode) < 0 ||
+        bp_chmod_nofollow (dest, e->mode) < 0) {
+        builtin_error ("write %s: %s", dest, strerror (errno));
+        return -1;
+    }
+    return 0;
+}
+
+/* Install NAME's data trees from the archive kept in CTX. Each tree is
+   written to a staging directory beside its final place and swapped in;
+   whatever was there stays as a backup until bp_commit_install. An old tree
+   is moved aside even when the package no longer has one, so an upgrade
+   drops stale files. */
+static int
+bp_install_staged_data (bp_install_ctx *ctx, const char *root,
+                        const char *name)
+{
+    bp_data_list list = {0};
+    if (bp_parse_data_lines (&ctx->manifest, name, &list) < 0)
+        goto fail;
+    int has[2] = { 0, 0 };
+    for (size_t i = 0; i < list.n; i++)
+        has[bp_data_kind (list.items[i].path, name, 0)] = 1;
+    const char *prefix = root[0] && strcmp (root, "/") ? root : "";
+    for (int k = 0; k < 2; k++) {
+        if (snprintf (ctx->data_final[k], sizeof ctx->data_final[k],
+                      "%s%s/%s/%s", prefix, BPKG_DATA_ROOT, bp_data_kinds[k],
+                      name) >= (int) sizeof ctx->data_final[k]) {
+            builtin_error ("path too long: %s", name);
+            goto fail;
+        }
+        if (!has[k]) continue;
+        char parent[BPKG_PATH_MAX];
+        snprintf (parent, sizeof parent, "%s", ctx->data_final[k]);
+        *strrchr (parent, '/') = 0;
+        if (bp_mkdir_p (parent) < 0) {
+            builtin_error ("mkdir %s: %s", parent, strerror (errno));
+            goto fail;
+        }
+        if (snprintf (ctx->data_stage[k], sizeof ctx->data_stage[k],
+                      "%s.new.XXXXXX", ctx->data_final[k]) >=
+            (int) sizeof ctx->data_stage[k]) {
+            ctx->data_stage[k][0] = 0;
+            builtin_error ("path too long: %s", name);
+            goto fail;
+        }
+        if (!mkdtemp (ctx->data_stage[k])) {
+            builtin_error ("mkdir %s: %s", ctx->data_stage[k], strerror (errno));
+            ctx->data_stage[k][0] = 0;
+            goto fail;
+        }
+    }
+    bp_data_write w = { name, { ctx->data_stage[0], ctx->data_stage[1] },
+                        &list };
+    if ((has[0] || has[1]) &&
+        bp_tar_iter (ctx->data_tar.data, ctx->data_tar.len,
+                     bp_data_write_cb, &w) < 0)
+        goto fail;
+    for (int k = 0; k < 2; k++) {
+        if (has[k]) {
+            mode_t mask = umask (0);
+            umask (mask);
+            if (bp_chmod_nofollow (ctx->data_stage[k], 0755 & ~mask) < 0) {
+                builtin_error ("chmod %s: %s", ctx->data_stage[k], strerror (errno));
+                goto fail;
+            }
+        }
+        int backed = bp_backup_existing (ctx->data_final[k], ctx->data_backup[k],
+                                         sizeof ctx->data_backup[k]);
+        if (backed < 0) {
+            builtin_error ("backup %s: %s", ctx->data_final[k], strerror (errno));
+            goto fail;
+        }
+        ctx->data_backup_active[k] = backed;
+        if (has[k]) {
+            if (rename (ctx->data_stage[k], ctx->data_final[k]) < 0) {
+                builtin_error ("install %s: %s", ctx->data_final[k],
+                               strerror (errno));
+                goto fail;
+            }
+            ctx->data_stage[k][0] = 0;
+            ctx->data_final_active[k] = 1;
+        }
+    }
+    bp_data_list_free (&list);
+    return 0;
+fail:
+    bp_data_list_free (&list);
+    return -1;
+}
+
+static void
+bp_verify_data_tree (const char *dir, const char *rel,
+                     const bp_data_list *list, int *bad, size_t *files)
+{
+    DIR *d = opendir (dir);
+    if (!d)
+        return;
+    struct dirent *de;
+    while ((de = readdir (d)) != NULL) {
+        if (!strcmp (de->d_name, ".") || !strcmp (de->d_name, ".."))
+            continue;
+        char path[BPKG_PATH_MAX], sub[BPKG_PATH_MAX];
+        if (snprintf (path, sizeof path, "%s/%s", dir, de->d_name) >=
+                (int) sizeof path ||
+            snprintf (sub, sizeof sub, "%s/%s", rel, de->d_name) >=
+                (int) sizeof sub) {
+            printf ("BAD-DATA-PATH\t%s/%s\n", dir, de->d_name);
+            (*bad)++;
+            continue;
+        }
+        struct stat st;
+        if (lstat (path, &st) < 0) {
+            printf ("MISSING\t%s\n", path);
+            (*bad)++;
+        } else if (S_ISDIR (st.st_mode)) {
+            bp_verify_data_tree (path, sub, list, bad, files);
+        } else {
+            bp_data_entry *e = S_ISREG (st.st_mode)
+                               ? bp_data_find (list, sub) : NULL;
+            char got[65];
+            if (!e) {
+                printf ("EXTRA\t%s\n", path);
+                (*bad)++;
+                continue;
+            }
+            e->seen = 1;
+            (*files)++;
+            if ((st.st_mode & 07777) != e->mode) {
+                printf ("MODE-MISMATCH\t%s\n", path);
+                (*bad)++;
+            }
+            if (bp_sha256_file_hex (path, got) < 0 ||
+                strcasecmp (got, e->hex) != 0) {
+                printf ("SHA256-MISMATCH\t%s\n", path);
+                (*bad)++;
+            }
+        }
+    }
+    closedir (d);
+}
+
+/* Recheck NAME's installed data trees against MANIFEST, printing a line per
+   problem: missing, extra or changed files. Returns the number of problems,
+   or -1 for invalid data: lines, and stores the number of files checked. */
+static int
+bp_verify_installed_data (const char *root, const char *name,
+                          const bp_buf *manifest, size_t *files)
+{
+    bp_data_list list = {0};
+    *files = 0;
+    if (bp_parse_data_lines (manifest, name, &list) < 0) {
+        bp_data_list_free (&list);
+        return -1;
+    }
+    const char *prefix = root[0] && strcmp (root, "/") ? root : "";
+    int bad = 0;
+    for (int k = 0; k < 2; k++) {
+        char dir[BPKG_PATH_MAX], rel[BPKG_PATH_MAX];
+        snprintf (dir, sizeof dir, "%s%s/%s/%s", prefix, BPKG_DATA_ROOT,
+                  bp_data_kinds[k], name);
+        snprintf (rel, sizeof rel, "%s/%s", bp_data_kinds[k], name);
+        bp_verify_data_tree (dir, rel, &list, &bad, files);
+    }
+    for (size_t i = 0; i < list.n; i++) {
+        if (!list.items[i].seen) {
+            printf ("MISSING\t%s%s/%s\n", prefix, BPKG_DATA_ROOT,
+                    list.items[i].path);
+            bad++;
+        }
+    }
+    bp_data_list_free (&list);
+    return bad;
 }
 
 static int
@@ -1922,6 +3037,18 @@ bp_elf64_vaddr_to_offset (const unsigned char *data, size_t len,
         return 0;
     }
     return -1;
+}
+
+/* glibc's own libraries, present beside every dynamic bash. A loadable
+   links against them so that each reference records the symbol version it
+   was built for: unversioned, glibc binds the oldest compatibility version
+   (regexec without REG_STARTEND, the old pthread_cond API). glibc's libm.a
+   also cannot be linked into a shared object. */
+static int
+bp_glibc_library (const char *name)
+{
+    return !strcmp (name, "libc.so.6") || !strcmp (name, "libm.so.6") ||
+           (!strncmp (name, "ld-linux", 8) && strstr (name, ".so.") != NULL);
 }
 
 static int
@@ -2009,6 +3136,8 @@ bp_loadable_reject_nonbundled_needed (const unsigned char *data, size_t len)
             builtin_error ("unterminated ELF shared library dependency");
             return -1;
         }
+        if (bp_glibc_library (needed))
+            continue;
         builtin_error ("loadable has non-bundled shared library dependency: "
                        "%s", needed);
         return -1;
@@ -2131,6 +3260,14 @@ bp_extract_cb (const bp_tar_hdr *h, const char *path,
         return 0;
     }
 
+    /* A loadable package's own files: bp_check_loadable_data checks them,
+       and bp_install_staged_data writes them. */
+    if (!strcmp (path, "libexec") || !strcmp (path, "share") ||
+        !strncmp (path, "libexec/", 8) || !strncmp (path, "share/", 6)) {
+        ctx->data_count++;
+        return 0;
+    }
+
     /* Only files/ entries become rootfs paths for legacy packages. */
     if (strncmp (path, "files/", 6) != 0) {
         ctx->other_payload_count++;
@@ -2216,7 +3353,7 @@ bp_extract_cb (const bp_tar_hdr *h, const char *path,
      * the full 12-bit mode onto the on-disk inode so the Stage A.9
      * mode-bit verifier can catch a tampered header that lifts
      * 0755 → 04755 (the regression 630-pkg-mode-bits.sh pins). */
-    if (chmod (dest, mode) < 0) {
+    if (bp_chmod_nofollow (dest, mode) < 0) {
         builtin_error ("chmod %s: %s", dest, strerror (errno));
         return -1;
     }
@@ -2233,38 +3370,14 @@ bp_extract_cb (const bp_tar_hdr *h, const char *path,
     return 0;
 }
 
+/* bp_validate_loadable_archive's checks, on an archive already in memory. */
 static int
-bp_validate_loadable_archive (const char *pkgfile, const char *expected_name,
-                              int require_loadable,
-                              bp_manifest *out_manifest)
+bp_validate_loadable_tar (const char *pkgfile, const unsigned char *tar_data,
+                          size_t tar_len, const char *expected_name,
+                          int require_loadable, bp_manifest *out_manifest)
 {
-    bp_buf raw = {0};
-    if (bp_read_file (pkgfile, &raw) < 0) {
-        builtin_error ("read %s: %s", pkgfile, strerror (errno));
-        return -1;
-    }
-
-    bp_buf tar = {0};
-    const unsigned char *tar_data;
-    size_t tar_len;
-    if (bp_is_xz (raw.data, raw.len)) {
-        if (bp_xz_decompress (raw.data, raw.len, &tar) < 0) {
-            builtin_error ("xz decode failed: %s", pkgfile);
-            bp_buf_free (&raw);
-            bp_buf_free (&tar);
-            return -1;
-        }
-        tar_data = tar.data;
-        tar_len = tar.len;
-    } else {
-        tar_data = raw.data;
-        tar_len = raw.len;
-    }
-
     bp_install_ctx ctx = {0};
     int rc = bp_tar_iter (tar_data, tar_len, bp_extract_cb, &ctx);
-    bp_buf_free (&raw);
-    bp_buf_free (&tar);
     if (rc < 0) {
         builtin_error ("tar parse failed: %s", pkgfile);
         bp_install_ctx_free (&ctx);
@@ -2331,8 +3444,8 @@ bp_validate_loadable_archive (const char *pkgfile, const char *expected_name,
     if (ctx.files_payload_count || ctx.other_payload_count || ctx.hook_count ||
         ctx.hook_pre.len || ctx.hook_post.len ||
         ctx.hook_prerm.len || ctx.hook_postrm.len) {
-        builtin_error ("loadable package may contain only MANIFEST "
-                       "and loadable/<name>.so");
+        builtin_error ("loadable package may contain only MANIFEST, "
+                       "loadable/<name>.so, libexec/<name>/ and share/<name>/");
         bad = 1;
     }
     if (ctx.loadable_name[0]) {
@@ -2371,6 +3484,9 @@ bp_validate_loadable_archive (const char *pkgfile, const char *expected_name,
         }
     }
 
+    if (bp_check_loadable_data (tar_data, tar_len, m.name, &ctx.manifest) < 0)
+        bad = 1;
+
     if (bad) {
         bp_install_ctx_free (&ctx);
         bp_manifest_free (&m);
@@ -2387,6 +3503,34 @@ bp_validate_loadable_archive (const char *pkgfile, const char *expected_name,
 }
 
 static int
+bp_validate_loadable_archive (const char *pkgfile, const char *expected_name,
+                              int require_loadable,
+                              bp_manifest *out_manifest)
+{
+    bp_buf raw = {0};
+    if (bp_read_archive (pkgfile, &raw) < 0) {
+        builtin_error ("read %s: %s", pkgfile, strerror (errno));
+        bp_buf_free (&raw);
+        return -1;
+    }
+    bp_buf tar = {0};
+    int is_xz = bp_is_xz (raw.data, raw.len);
+    if (is_xz && bp_xz_decompress (raw.data, raw.len, &tar) < 0) {
+        builtin_error ("xz decode failed: %s", pkgfile);
+        bp_buf_free (&raw);
+        bp_buf_free (&tar);
+        return -1;
+    }
+    int rc = bp_validate_loadable_tar (pkgfile, is_xz ? tar.data : raw.data,
+                                       is_xz ? tar.len : raw.len,
+                                       expected_name, require_loadable,
+                                       out_manifest);
+    bp_buf_free (&raw);
+    bp_buf_free (&tar);
+    return rc;
+}
+
+static int
 bp_run_hook_buf (bp_buf *hook, const char *pkgname, const char *version,
                  const char *prefix, const char *tag)
 {
@@ -2394,7 +3538,7 @@ bp_run_hook_buf (bp_buf *hook, const char *pkgname, const char *version,
     char tmp[BPKG_PATH_MAX];
     if (snprintf (tmp, sizeof tmp, "/tmp/pkg.%d.%s.sh",
                   (int) getpid (), tag) >= (int) sizeof tmp) return -1;
-    if (bp_write_file_atomic (tmp, hook->data, hook->len, 0700) < 0) {
+    if (bp_write_file_user (tmp, hook->data, hook->len, 0700) < 0) {
         builtin_error ("write hook %s: %s", tmp, strerror (errno));
         return -1;
     }
@@ -2408,7 +3552,7 @@ bp_install_pkgfile (const char *pkgfile, const char *root,
                     int allow_unsigned, int force,
                     int allow_legacy_rootfs)
 {
-    /* Verify signature (if present + bashsignify on PATH). */
+    /* Verify the signature when a sibling .sig is present. */
     int sigrc = bp_verify_signature (pkgfile);
     if (sigrc < 0) {
         builtin_error ("signature verification failed: %s", pkgfile);
@@ -2422,7 +3566,7 @@ bp_install_pkgfile (const char *pkgfile, const char *root,
 
     /* Read archive. */
     bp_buf raw = {0};
-    if (bp_read_file (pkgfile, &raw) < 0) {
+    if (bp_read_archive (pkgfile, &raw) < 0) {
         builtin_error ("read %s: %s", pkgfile, strerror (errno));
         bp_buf_free (&raw);
         return EXECUTION_FAILURE;
@@ -2544,6 +3688,12 @@ bp_install_pkgfile (const char *pkgfile, const char *root,
             return EXECUTION_FAILURE;
         }
     }
+    if (is_loadable_pkg) {
+        /* Keep the archive: bp_install_staged_data writes data files from it. */
+        bp_buf *archive = tar.data ? &tar : &raw;
+        ctx.data_tar = *archive;
+        memset (archive, 0, sizeof *archive);
+    }
     bp_buf_free (&raw);
     bp_buf_free (&tar);
 
@@ -2606,6 +3756,13 @@ bp_install_pkgfile (const char *pkgfile, const char *root,
         bp_verify_loadable_mode (root, &ctx.manifest, ctx.loadable_dest) < 0)
     {
         builtin_error ("mode-bit check failed: %s", pkgfile);
+        bp_rollback_install (root, &ctx);
+        bp_install_ctx_free (&ctx);
+        bp_manifest_free (&m);
+        return EXECUTION_FAILURE;
+    }
+    if (is_loadable_pkg && bp_install_staged_data (&ctx, root, m.name) < 0) {
+        builtin_error ("data file install failed: %s", pkgfile);
         bp_rollback_install (root, &ctx);
         bp_install_ctx_free (&ctx);
         bp_manifest_free (&m);
@@ -2754,7 +3911,7 @@ bp_find_in_cache (const char *root, const char *name, char *out,
         if (dn <= nlen + 1) continue;
         if (strncmp (de->d_name, name, nlen) != 0) continue;
         if (de->d_name[nlen] != '-' && de->d_name[nlen] != '.') continue;
-        if (dn < 9 || strcmp (de->d_name + dn - 8, ".pkg") != 0)
+        if (!bp_has_suffix (de->d_name, ".pkg"))
             continue;
         char candidate[BPKG_PATH_MAX];
         if (snprintf (candidate, sizeof candidate, "%s/%s", dir,
@@ -2852,7 +4009,7 @@ static int
 bp_manifest_from_pkgfile (const char *pkgfile, bp_manifest *m)
 {
     bp_buf raw = {0};
-    if (bp_read_file (pkgfile, &raw) < 0) {
+    if (bp_read_archive (pkgfile, &raw) < 0) {
         bp_buf_free (&raw);
         return -1;
     }
@@ -3159,8 +4316,7 @@ bp_index_pkg_candidate (const char *line, const char *name,
             return -1;
         }
         if (delta[0] &&
-            (strlen (delta) < 15 ||
-             strcmp (delta + strlen (delta) - 14, ".pkg.delta") != 0)) {
+            !bp_has_suffix (delta, ".pkg.delta")) {
             builtin_error ("loadable index entry for %s has bad delta=REF",
                            name);
             return -1;
@@ -3170,8 +4326,7 @@ bp_index_pkg_candidate (const char *line, const char *name,
                            "delta_from=HEX64 and delta_to=HEX64", name);
             return -1;
         }
-        size_t plen = strlen (pkg);
-        if (plen < 9 || strcmp (pkg + plen - 8, ".pkg") != 0)
+        if (!bp_has_suffix (pkg, ".pkg"))
             return 0;
         if (snprintf (out, outsz, "%s", pkg) >= (int) outsz)
             return -1;
@@ -3297,12 +4452,21 @@ bp_update_copy_index (const char *src_idx, const char *src_pkgdir,
     if (bp_mkdir_p (dest_dir) < 0)
         return -1;
     bp_buf idx_body = {0};
-    if (bp_read_file (src_idx, &idx_body) < 0) {
+    if (bp_read_user_file (src_idx, &idx_body) < 0) {
         builtin_warning ("source %s: %s", src_idx, strerror (errno));
         bp_buf_free (&idx_body);
         return -1;
     }
-    int sigrc = bp_verify_signature (src_idx);
+    /* Verify the bytes just read. bp_verify_signature would open the path
+       again and could accept a different snapshot from the one written. */
+    char sigpath[BPKG_PATH_MAX];
+    if (snprintf (sigpath, sizeof sigpath, "%s.sig", src_idx) >=
+        (int) sizeof sigpath) {
+        bp_buf_free (&idx_body);
+        return -1;
+    }
+    int sigrc = bp_verify_bytes_with_sig (idx_body.data, idx_body.len,
+                                          sigpath, src_idx);
     if (sigrc < 0) {
         builtin_error ("signature verification failed for %s", src_idx);
         bp_buf_free (&idx_body);
@@ -3511,7 +4675,7 @@ bp_copy_tree_into (const char *src, const char *dst)
 
 static int
 bp_fetch_url (const char *url, const char *out_path, const char *cacert,
-              int insecure, int timeout, long *http_code_out)
+              int insecure, int timeout, int quiet, long *http_code_out)
 {
     if (!bp_remote_url (url) || !out_path || !*out_path)
         return -1;
@@ -3547,22 +4711,34 @@ bp_fetch_url (const char *url, const char *out_path, const char *cacert,
         if (dup2 (pipefd[1], STDOUT_FILENO) < 0)
             _exit (126);
         close (pipefd[1]);
-        if (cacert && *cacert && insecure)
-            execlp ("curl", "curl", "-fsS", "-m", timeout_buf,
-                    "--cacert", cacert, "-k", "-o", out_path,
-                    "-w", "%{http_code}", url, (char *) NULL);
-        else if (cacert && *cacert)
-            execlp ("curl", "curl", "-fsS", "-m", timeout_buf,
-                    "--cacert", cacert, "-o", out_path,
-                    "-w", "%{http_code}", url, (char *) NULL);
-        else if (insecure)
-            execlp ("curl", "curl", "-fsS", "-m", timeout_buf,
-                    "-k", "-o", out_path, "-w", "%{http_code}", url,
-                    (char *) NULL);
-        else
-            execlp ("curl", "curl", "-fsS", "-m", timeout_buf,
-                    "-o", out_path, "-w", "%{http_code}", url,
-                    (char *) NULL);
+        char *argv[16];
+        int argc = 0;
+        argv[argc++] = "curl";
+        /* Probes for files a repository may not have stay quiet; the
+           caller reports what it could not find. */
+        argv[argc++] = quiet ? "-fs" : "-fsS";
+        /* Release hosting redirects downloads to a storage host. Following
+           is safe: every INDEX and package is checked against its signature. */
+        argv[argc++] = "-L";
+        argv[argc++] = "-m";
+        argv[argc++] = timeout_buf;
+        if (cacert && *cacert) {
+            argv[argc++] = "--cacert";
+            argv[argc++] = (char *) cacert;
+        }
+        if (insecure)
+            argv[argc++] = "-k";
+        argv[argc++] = "-o";
+        argv[argc++] = (char *) out_path;
+        argv[argc++] = "-w";
+        argv[argc++] = "%{http_code}";
+        argv[argc++] = (char *) url;
+        argv[argc] = NULL;
+        /* Run the curl builtin in this child, which works with an empty PATH.
+           An external curl is used only when the builtin is not enabled. */
+        bos_prepare_child ();
+        bos_run_builtin ("curl", argv, NULL);
+        execvp ("curl", argv);
         _exit (127);
     }
     close (pipefd[1]);
@@ -3732,7 +4908,7 @@ bp_fetch_ref_to_stage (const char *base_url, const char *ref, int is_url,
             (int) outsz)
         return -1;
     long code = 0;
-    if (bp_fetch_url (url, out_path, cacert, insecure, timeout, &code) < 0) {
+    if (bp_fetch_url (url, out_path, cacert, insecure, timeout, 0, &code) < 0) {
         builtin_error ("fetch: failed %s", url);
         return -1;
     }
@@ -3843,11 +5019,87 @@ bp_fetch_index_artifacts (const char *idx, const char *root,
     return 0;
 }
 
+/* A mirror of a remote segment keeps how update reached it in REMOTE, next
+   to ORIGIN, so install and upgrade can fetch packages later with the same
+   TLS options. */
+static int
+bp_remote_options_write (const char *dest_dir, const char *cacert,
+                         int insecure, int timeout)
+{
+    char path[BPKG_PATH_MAX], abs[BPKG_PATH_MAX], body[BPKG_PATH_MAX + 64];
+    if (cacert && *cacert && realpath (cacert, abs))
+        cacert = abs;
+    if (snprintf (path, sizeof path, "%s/REMOTE", dest_dir) >=
+        (int) sizeof path)
+        return -1;
+    int n = snprintf (body, sizeof body, "insecure %d\ntimeout %d\ncacert %s\n",
+                      insecure ? 1 : 0, timeout, cacert ? cacert : "");
+    if (n < 0 || n >= (int) sizeof body)
+        return -1;
+    return bp_write_file_atomic (path, (const unsigned char *) body,
+                                 (size_t) n, 0644);
+}
+
+static int
+bp_remote_options_read (const char *mirror, char *base, size_t basesz,
+                        char *cacert, size_t cacertsz, int *insecure,
+                        int *timeout)
+{
+    char path[BPKG_PATH_MAX];
+    bp_buf body = {0};
+    base[0] = 0;
+    cacert[0] = 0;
+    *insecure = 0;
+    *timeout = 30;
+    if (snprintf (path, sizeof path, "%s/ORIGIN", mirror) >=
+            (int) sizeof path ||
+        bp_read_file (path, &body) < 0) {
+        bp_buf_free (&body);
+        return -1;
+    }
+    size_t n = body.len < basesz - 1 ? body.len : basesz - 1;
+    memcpy (base, body.data, n);
+    base[n] = 0;
+    char *nl = strchr (base, '\n');
+    if (nl) *nl = 0;
+    bp_buf_free (&body);
+    if (!bp_remote_url (base))
+        return -1;
+    if (snprintf (path, sizeof path, "%s/REMOTE", mirror) >=
+            (int) sizeof path ||
+        bp_read_file (path, &body) < 0) {
+        bp_buf_free (&body);
+        return 0;
+    }
+    size_t off = 0;
+    while (off < body.len) {
+        size_t end = off;
+        while (end < body.len && body.data[end] != '\n') end++;
+        char line[BPKG_PATH_MAX + 64];
+        if (end - off < sizeof line) {
+            memcpy (line, body.data + off, end - off);
+            line[end - off] = 0;
+            if (!strncmp (line, "insecure ", 9))
+                *insecure = atoi (line + 9) != 0;
+            else if (!strncmp (line, "timeout ", 8) && atoi (line + 8) > 0)
+                *timeout = atoi (line + 8);
+            else if (!strncmp (line, "cacert ", 7))
+                snprintf (cacert, cacertsz, "%s", line + 7);
+        }
+        off = end + 1;
+    }
+    bp_buf_free (&body);
+    return 0;
+}
+
+/* With with_artifacts, the segment's packages, signatures and deltas are
+   downloaded too (pkg fetch); otherwise only its signed INDEX (pkg update),
+   and download, install and upgrade fetch what they need. */
 static int
 bp_fetch_remote_segment (const char *source_url, const char *segment,
                          const char *repo_dir, const char *root,
                          const char *selected_arch, const char *cacert,
-                         int insecure, int timeout)
+                         int insecure, int timeout, int with_artifacts)
 {
     char seg_url[BPKG_PATH_MAX];
     char dest_dir[BPKG_PATH_MAX];
@@ -3885,11 +5137,13 @@ bp_fetch_remote_segment (const char *source_url, const char *segment,
         return -1;
     }
     long code = 0;
-    if (bp_fetch_url (idx_url, stage_idx, cacert, insecure, timeout, &code) < 0) {
+    if (bp_fetch_url (idx_url, stage_idx, cacert, insecure, timeout, 1,
+                      &code) < 0) {
         bp_remove_tree (stage_dir);
         return 0;
     }
-    if (bp_fetch_url (sig_url, stage_sig, cacert, insecure, timeout, &code) < 0) {
+    if (bp_fetch_url (sig_url, stage_sig, cacert, insecure, timeout, 0,
+                      &code) < 0) {
         builtin_error ("fetch: missing INDEX.sig for %s", idx_url);
         bp_remove_tree (stage_dir);
         return -1;
@@ -3903,8 +5157,10 @@ bp_fetch_remote_segment (const char *source_url, const char *segment,
     char stage_artifacts[BPKG_PATH_MAX];
     if (snprintf (stage_artifacts, sizeof stage_artifacts, "%s/artifacts",
                   stage_dir) >= (int) sizeof stage_artifacts ||
-        bp_fetch_index_artifacts (stage_idx, root, seg_url, stage_artifacts,
-                                  selected_arch, cacert, insecure, timeout) < 0) {
+        (with_artifacts &&
+         bp_fetch_index_artifacts (stage_idx, root, seg_url, stage_artifacts,
+                                   selected_arch, cacert, insecure,
+                                   timeout) < 0)) {
         bp_remove_tree (stage_dir);
         return -1;
     }
@@ -3912,6 +5168,7 @@ bp_fetch_remote_segment (const char *source_url, const char *segment,
     if (snprintf (dest_sig, sizeof dest_sig, "%s/INDEX.sig", dest_dir) >=
             (int) sizeof dest_sig ||
         bp_update_copy_index (stage_idx, seg_url, dest_dir) < 0 ||
+        bp_remote_options_write (dest_dir, cacert, insecure, timeout) < 0 ||
         bp_copy_file_atomic_mode (stage_sig, dest_sig, 0644) < 0 ||
         bp_copy_tree_into (stage_artifacts, dest_dir) < 0) {
         bp_remove_tree (stage_dir);
@@ -3933,7 +5190,7 @@ bp_fetch_remote_arches (const char *source_url, const char *repo_dir,
             (int) sizeof dest)
         return -1;
     long code = 0;
-    if (bp_fetch_url (url, tmp, cacert, insecure, timeout, &code) == 0) {
+    if (bp_fetch_url (url, tmp, cacert, insecure, timeout, 1, &code) == 0) {
         if (bp_copy_file_atomic_mode (tmp, dest, 0644) < 0) {
             unlink (tmp);
             return -1;
@@ -3946,7 +5203,8 @@ bp_fetch_remote_arches (const char *source_url, const char *repo_dir,
 static int
 bp_fetch_remote_source (const char *url, const char *repo_dir,
                         const char *root, const char *selected_arch,
-                        const char *cacert, int insecure, int timeout)
+                        const char *cacert, int insecure, int timeout,
+                        int with_artifacts)
 {
     if (bp_mkdir_p (repo_dir) < 0)
         return -1;
@@ -3960,7 +5218,7 @@ bp_fetch_remote_source (const char *url, const char *repo_dir,
             continue;
         int rc = bp_fetch_remote_segment (url, segments[i], repo_dir, root,
                                           selected_arch, cacert, insecure,
-                                          timeout);
+                                          timeout, with_artifacts);
         if (rc < 0)
             return -1;
         if (rc > 0)
@@ -4034,6 +5292,14 @@ typedef struct {
     char delta_sig[BPKG_PATH_MAX];
     char delta_from[65];
     char delta_to[65];
+    /* Set when the INDEX came from a remote source: its mirror directory,
+       and the records' own references for fetching on first use. */
+    char mirror[BPKG_PATH_MAX];
+    char pkg_ref[BPKG_PATH_MAX];
+    int pkg_is_url;
+    char sig_ref[BPKG_PATH_MAX];
+    char delta_ref[BPKG_PATH_MAX];
+    char delta_sig_ref[BPKG_PATH_MAX];
 } bp_index_hit;
 
 static void
@@ -4120,11 +5386,60 @@ bp_repo_origin_dir (const char *repo_dir, char *pkgdir, size_t pkgdirsz)
     return 0;
 }
 
+/* update mirrors only a remote repository's signed INDEX files. A package,
+   signature or delta a record names is fetched on first use to the path the
+   record resolved to, and a package is kept only if its SHA-256 matches the
+   record. Signatures and deltas carry no digest of their own, so they are
+   fetched again each time. Returns 1 after fetching, 0 when nothing had to
+   be fetched, -1 on failure. */
+static int
+bp_hit_fetch_lazy (const bp_index_hit *hit, const char *local,
+                   const char *ref, int is_url, const char *sha)
+{
+    if (!hit->mirror[0] || !local[0] || !ref[0] ||
+        !(bp_remote_url (ref) || (!is_url && ref[0] != '/')))
+        return 0;
+    struct stat st;
+    char got[65];
+    if (sha && sha[0] && stat (local, &st) == 0 && S_ISREG (st.st_mode) &&
+        bp_sha256_file_hex (local, got) == 0 && strcasecmp (got, sha) == 0)
+        return 0;
+    char base[BPKG_PATH_MAX], cacert[BPKG_PATH_MAX];
+    char url[BPKG_PATH_MAX], part[BPKG_PATH_MAX];
+    int insecure, timeout;
+    if (bp_remote_options_read (hit->mirror, base, sizeof base, cacert,
+                                sizeof cacert, &insecure, &timeout) < 0 ||
+        bp_url_join (base, ref, url, sizeof url) < 0 ||
+        snprintf (part, sizeof part, "%s.part.%d", local, (int) getpid ()) >=
+            (int) sizeof part) {
+        builtin_error ("fetch: no remote origin for %s in %s", ref,
+                       hit->mirror);
+        return -1;
+    }
+    long code = 0;
+    if (bp_fetch_url (url, part, cacert, insecure, timeout, 0, &code) < 0) {
+        builtin_error ("fetch: failed %s", url);
+        return -1;
+    }
+    if (sha && sha[0] &&
+        (bp_sha256_file_hex (part, got) < 0 || strcasecmp (got, sha) != 0)) {
+        builtin_error ("package sha256 mismatch for %s", url);
+        unlink (part);
+        return -1;
+    }
+    if (rename (part, local) < 0) {
+        builtin_error ("fetch: %s: %s", local, strerror (errno));
+        unlink (part);
+        return -1;
+    }
+    return 1;
+}
+
 static int
 bp_scan_index_for_hit (const char *idx, const char *pkgdir,
                        const char *repo, const char *repo_url,
                        const char *name, const char *selected_arch,
-                       bp_index_hit *best)
+                       const char *mirror, bp_index_hit *best)
 {
     bp_buf idx_body = {0};
     if (bp_read_file (idx, &idx_body) < 0) {
@@ -4231,6 +5546,18 @@ bp_scan_index_for_hit (const char *idx, const char *pkgdir,
                                   "%s", cand_delta_from);
                         snprintf (best->delta_to, sizeof best->delta_to,
                                   "%s", cand_delta_to);
+                        snprintf (best->mirror, sizeof best->mirror, "%s",
+                                  origin_remote ? mirror : "");
+                        snprintf (best->pkg_ref, sizeof best->pkg_ref, "%s",
+                                  cand);
+                        best->pkg_is_url = cand_is_url;
+                        snprintf (best->sig_ref, sizeof best->sig_ref, "%s",
+                                  cand_sig);
+                        snprintf (best->delta_ref, sizeof best->delta_ref,
+                                  "%s", cand_delta);
+                        snprintf (best->delta_sig_ref,
+                                  sizeof best->delta_sig_ref, "%s",
+                                  cand_delta_sig);
                     }
                 }
             }
@@ -4252,15 +5579,9 @@ bp_find_repo_hit (const char *root, const char *sources,
         return -1;
 
     char src_path[BPKG_PATH_MAX];
-    if (sources) {
-        snprintf (src_path, sizeof src_path, "%s", sources);
-    } else {
-        snprintf (src_path, sizeof src_path, "%s%s",
-                  root[0] && strcmp (root, "/") ? root : "",
-                  BPKG_SOURCES_LIST);
-    }
     bp_buf sources_body = {0};
-    if (bp_read_file (src_path, &sources_body) < 0) {
+    if (bp_read_sources (root, sources, 1, src_path, sizeof src_path,
+                         &sources_body) < 0) {
         builtin_error ("no sources configured at %s", src_path);
         bp_buf_free (&sources_body);
         return -1;
@@ -4311,7 +5632,8 @@ bp_find_repo_hit (const char *root, const char *sources,
                     if (bp_repo_origin_dir (idir, pkgdir, sizeof pkgdir) < 0)
                         continue;
                     int rc = bp_scan_index_for_hit (idx, pkgdir, base, url,
-                                                    name, selected_arch, hit);
+                                                    name, selected_arch, idir,
+                                                    hit);
                     if (rc < 0) {
                         bp_buf_free (&sources_body);
                         return -1;
@@ -4431,15 +5753,9 @@ bp_find_payload_repo_dir (const char *root, const char *sources,
         return -1;
 
     char src_path[BPKG_PATH_MAX];
-    if (sources) {
-        snprintf (src_path, sizeof src_path, "%s", sources);
-    } else {
-        snprintf (src_path, sizeof src_path, "%s%s",
-                  root[0] && strcmp (root, "/") ? root : "",
-                  BPKG_SOURCES_LIST);
-    }
     bp_buf sources_body = {0};
-    if (bp_read_file (src_path, &sources_body) < 0) {
+    if (bp_read_sources (root, sources, 1, src_path, sizeof src_path,
+                         &sources_body) < 0) {
         bp_buf_free (&sources_body);
         return 0;
     }
@@ -5036,7 +6352,7 @@ bp_copy_package_to_cache (const char *root, const char *pkgpath,
     }
     bp_manifest_free (&mf);
     bp_buf body = {0};
-    if (bp_read_file (pkgpath, &body) < 0) {
+    if (bp_read_archive (pkgpath, &body) < 0) {
         bp_buf_free (&body);
         return -1;
     }
@@ -5058,7 +6374,7 @@ bp_copy_signature_to_cache (const char *sigpath, const char *cached_pkg)
         (int) sizeof dest)
         return -1;
     bp_buf body = {0};
-    if (bp_read_file (sigpath, &body) < 0) {
+    if (bp_read_archive (sigpath, &body) < 0) {
         bp_buf_free (&body);
         return -1;
     }
@@ -5878,6 +7194,13 @@ verb_remove (WORD_LIST *args)
 
         if (unlink (so_path) < 0 && errno != ENOENT)
             errs++;
+        for (int k = 0; k < 2; k++) {
+            char tree[BPKG_PATH_MAX];
+            snprintf (tree, sizeof tree, "%s%s/%s/%s",
+                      root[0] && strcmp (root, "/") ? root : "",
+                      BPKG_DATA_ROOT, bp_data_kinds[k], name);
+            bp_remove_tree (tree);
+        }
 
         bp_remove_state_dir (dir);
         bp_manifest_free (&mf);
@@ -6348,15 +7671,9 @@ verb_update (WORD_LIST *args)
     if (bp_select_arch (arch_override, selected_arch, sizeof selected_arch) < 0)
         return EX_USAGE;
     char src_path[BPKG_PATH_MAX];
-    if (sources) {
-        snprintf (src_path, sizeof src_path, "%s", sources);
-    } else {
-        snprintf (src_path, sizeof src_path, "%s%s",
-                  root[0] && strcmp (root, "/") ? root : "",
-                  BPKG_SOURCES_LIST);
-    }
     bp_buf body = {0};
-    if (bp_read_file (src_path, &body) < 0) {
+    if (bp_read_sources (root, sources, allow_remote, src_path, sizeof src_path,
+                         &body) < 0) {
         printf ("no sources configured at %s\n", src_path);
         bp_buf_free (&body);
         return EXECUTION_SUCCESS;
@@ -6364,10 +7681,11 @@ verb_update (WORD_LIST *args)
 	    /* Parse one URL per line; for each, ensure the per-repo dir
 	     * exists. H05 local sources (file:// and bare absolute paths) are
 	     * fetched in-process by copying their INDEX into
-	     * BPKG_REPOS_DIR/<repo>/INDEX. Remote sources remain rejected by
-	     * update; pkg fetch materializes them into this local mirror.
+	     * BPKG_REPOS_DIR/<repo>/INDEX. Remote sources need --remote (or a
+	     * remote marker); update mirrors only their signed INDEX files, and
+	     * pkg fetch also mirrors every package.
 	     * Trust mirrors install: a sibling <INDEX>.sig is verified via
-     * bashsignify when present; verification failure refuses
+     * the signature check when present; verification failure refuses
      * to write that source's INDEX. */
     char rdir[BPKG_PATH_MAX];
     snprintf (rdir, sizeof rdir, "%s%s",
@@ -6442,7 +7760,7 @@ verb_update (WORD_LIST *args)
 
                     int rc = bp_fetch_remote_source (url, repo_dir, root,
                                                      selected_arch, cacert,
-                                                     use_insecure, timeout);
+                                                     use_insecure, timeout, 0);
                     if (rc < 0) {
                         failed++;
                         printf ("source\t%s\n", url);
@@ -6496,7 +7814,7 @@ verb_update (WORD_LIST *args)
                     /* Per-arch trust boundary: each arch-scoped INDEX copy
                      * below enters bp_update_copy_index(), which verifies
                      * that <arch>/INDEX against its own sibling INDEX.sig.
-                     * The operator's bashsignify wrapper chooses the trusted
+                     * The operator's trusted keys directory chooses the
                      * pubkey(s); INDEX does not carry per-arch key binding. */
                     const char *arch_segments[3] = {
                         selected_arch, "noarch", "any"
@@ -6597,15 +7915,9 @@ verb_fetch (WORD_LIST *args)
     if (bp_select_arch (arch_override, selected_arch, sizeof selected_arch) < 0)
         return EX_USAGE;
     char src_path[BPKG_PATH_MAX];
-    if (sources) {
-        snprintf (src_path, sizeof src_path, "%s", sources);
-    } else {
-        snprintf (src_path, sizeof src_path, "%s%s",
-                  root[0] && strcmp (root, "/") ? root : "",
-                  BPKG_SOURCES_LIST);
-    }
     bp_buf body = {0};
-    if (bp_read_file (src_path, &body) < 0) {
+    if (bp_read_sources (root, sources, 1, src_path, sizeof src_path,
+                         &body) < 0) {
         printf ("no sources configured at %s\n", src_path);
         bp_buf_free (&body);
         return EXECUTION_SUCCESS;
@@ -6653,7 +7965,7 @@ verb_fetch (WORD_LIST *args)
 	                    rc = bp_fetch_remote_source (url, repo_dir, root,
 	                                                 selected_arch, NULL,
 	                                                 insecure || line_insecure,
-	                                                 timeout);
+	                                                 timeout, 1);
                 } else {
                     char local_buf[BPKG_PATH_MAX];
                     int lrc = bp_source_local_path (url, local_buf,
@@ -6708,6 +8020,11 @@ bp_download_name (const char *root, const char *sources,
                            "local sources (run pkg update)", name);
         return EXECUTION_FAILURE;
     }
+    if (bp_hit_fetch_lazy (&best, best.pkg, best.pkg_ref, best.pkg_is_url,
+                           best.sha) < 0 ||
+        (best.sig[0] &&
+         bp_hit_fetch_lazy (&best, best.sig, best.sig_ref, 0, NULL) < 0))
+        return EXECUTION_FAILURE;
     if (best.sha[0]) {
         char got[65];
         if (bp_sha256_file_hex (best.pkg, got) < 0 ||
@@ -6971,9 +8288,19 @@ verb_upgrade (WORD_LIST *args)
             hit.delta_to[0]) {
             char old_pkg[BPKG_PATH_MAX];
             char old_sha[65];
+            /* From a remote mirror, a delta that cannot be fetched falls
+               back to the full package. */
             if (bp_find_in_cache (root, only, old_pkg, sizeof old_pkg) == 0 &&
                 bp_sha256_file_hex (old_pkg, old_sha) == 0 &&
-                strcasecmp (old_sha, hit.delta_from) == 0) {
+                strcasecmp (old_sha, hit.delta_from) == 0 &&
+                bp_hit_fetch_lazy (&hit, hit.delta, hit.delta_ref, 0,
+                                   NULL) >= 0 &&
+                (!hit.delta_sig[0] ||
+                 bp_hit_fetch_lazy (&hit, hit.delta_sig, hit.delta_sig_ref, 0,
+                                    NULL) >= 0) &&
+                (!hit.sig[0] ||
+                 bp_hit_fetch_lazy (&hit, hit.sig, hit.sig_ref, 0,
+                                    NULL) >= 0)) {
                 if (hit.delta_sig[0]) {
                     int dsig = bp_verify_signature_with_sig (hit.delta,
                                                              hit.delta_sig);
@@ -7262,7 +8589,20 @@ verb_verify (WORD_LIST *args)
                         printf ("SHA256-MISMATCH\t%s\n", so_path);
                         bad = 1;
                     } else {
-                        printf ("verify %s\tloadable=ok\n", name);
+                        size_t data_files = 0;
+                        int data_bad = bp_verify_installed_data (
+                            root, name, &manifest, &data_files);
+                        if (data_bad < 0) {
+                            printf ("BAD-DATA-METADATA\t%s\n", name);
+                            bad = 1;
+                        } else if (data_bad > 0) {
+                            bad = 1;
+                        } else if (data_files) {
+                            printf ("verify %s\tloadable=ok\tdata=%zu\n", name,
+                                    data_files);
+                        } else {
+                            printf ("verify %s\tloadable=ok\n", name);
+                        }
                     }
                 }
             }
@@ -7597,24 +8937,50 @@ pkg_builtin (WORD_LIST *list)
     if (!list) { builtin_usage (); return EX_USAGE; }
     const char *cmd = list->word->word;
     WORD_LIST *args = list->next;
-    if (!strcmp (cmd, "pack"))    return verb_pack (args);
-    if (!strcmp (cmd, "install")) return verb_install (args);
-    if (!strcmp (cmd, "rollback")) return verb_rollback (args);
-    if (!strcmp (cmd, "remove"))  return verb_remove (args);
-    if (!strcmp (cmd, "list"))    return verb_list (args);
-    if (!strcmp (cmd, "info"))    return verb_info (args);
-    if (!strcmp (cmd, "search"))  return verb_search (args);
-    if (!strcmp (cmd, "update"))  return verb_update (args);
-    if (!strcmp (cmd, "fetch"))   return verb_fetch (args);
-    if (!strcmp (cmd, "download")) return verb_download (args);
-    if (!strcmp (cmd, "upgrade")) return verb_upgrade (args);
-    if (!strcmp (cmd, "verify"))  return verb_verify (args);
-    if (!strcmp (cmd, "load"))    return verb_load (args);
-    if (!strcmp (cmd, "unload"))  return verb_unload (args);
-    if (!strcmp (cmd, "delta-make")) return verb_delta_make (args);
-    if (!strcmp (cmd, "delta-apply")) return verb_delta_apply (args);
-    builtin_error ("unknown verb: %s", cmd);
-    return EX_USAGE;
+    /* Pack and the delta verbs only touch paths the caller named.
+       Every other verb publishes or reads state under --root. */
+    const char *contain = NULL;
+    if (strcmp (cmd, "pack") != 0 && strcmp (cmd, "delta-make") != 0 &&
+        strcmp (cmd, "delta-apply") != 0) {
+        contain = BPKG_INSTALL_ROOT;
+        for (WORD_LIST *scan = args; scan; scan = scan->next) {
+            if (!scan->word || strcmp (scan->word->word, "--root") != 0)
+                continue;
+            if (!scan->next || !scan->next->word)
+                break;
+            contain = scan->next->word->word;
+            scan = scan->next;
+        }
+        /* Nothing resolves outside "/", and a package cannot create a
+           link, so every link there is the administrator's: follow it. */
+        if (contain && *contain && !contain[strspn (contain, "/")])
+            contain = NULL;
+    }
+    const char *saved_root = bp_contain_root;
+    bp_contain_root = contain;
+    int rc;
+    if (!strcmp (cmd, "pack"))         rc = verb_pack (args);
+    else if (!strcmp (cmd, "install")) rc = verb_install (args);
+    else if (!strcmp (cmd, "rollback")) rc = verb_rollback (args);
+    else if (!strcmp (cmd, "remove"))  rc = verb_remove (args);
+    else if (!strcmp (cmd, "list"))    rc = verb_list (args);
+    else if (!strcmp (cmd, "info"))    rc = verb_info (args);
+    else if (!strcmp (cmd, "search"))  rc = verb_search (args);
+    else if (!strcmp (cmd, "update"))  rc = verb_update (args);
+    else if (!strcmp (cmd, "fetch"))   rc = verb_fetch (args);
+    else if (!strcmp (cmd, "download")) rc = verb_download (args);
+    else if (!strcmp (cmd, "upgrade")) rc = verb_upgrade (args);
+    else if (!strcmp (cmd, "verify"))  rc = verb_verify (args);
+    else if (!strcmp (cmd, "load"))    rc = verb_load (args);
+    else if (!strcmp (cmd, "unload"))  rc = verb_unload (args);
+    else if (!strcmp (cmd, "delta-make")) rc = verb_delta_make (args);
+    else if (!strcmp (cmd, "delta-apply")) rc = verb_delta_apply (args);
+    else {
+        builtin_error ("unknown verb: %s", cmd);
+        rc = EX_USAGE;
+    }
+    bp_contain_root = saved_root;
+    return rc;
 }
 
 char *pkg_doc[] = {
@@ -7674,8 +9040,12 @@ char *pkg_doc[] = {
     "Legacy rootfs compatibility state additionally records:",
     "  /var/lib/pkg/installed/<name>/files",
     "",
-    "Trust: installs require a sibling <PKGFILE>.sig verified by",
-    "bashsignify by default; -S spells that production policy explicitly,",
+    "Trust: installs require a sibling <PKGFILE>.sig, a signify-format",
+    "Ed25519 signature checked against a key in $BASHSIGNIFY_TRUSTED_KEYS_DIR",
+    "(default /etc/bashsignify/trusted) or one of the compiled-in bash-os",
+    "publisher keys; key ids listed in $BASHSIGNIFY_REVOKED_KEYS (default",
+    "/etc/bashsignify/revoked-keys) are refused. That is the default policy;",
+    "-S spells it explicitly,",
     "and -A allows unsigned bootstrap/development installs.",
     "Legacy rootfs packages are additionally disabled by default and",
     "require --legacy-rootfs or BASHPKG_ALLOW_LEGACY_ROOTFS=1.",
@@ -7683,6 +9053,10 @@ char *pkg_doc[] = {
     "delegating to Bash's native `enable -f PATH BUILTIN`.",
     "unload verifies installed v2 loadable state and delegates to",
     "Bash's native `enable -d BUILTIN` dlclose path.",
+    "A loadable package may also carry libexec/NAME/ and share/NAME/ trees,",
+    "installed under /usr/lib/bash-os. MANIFEST `data: PATH MODE SHA256` lines",
+    "declare every file; install swaps the trees in whole, remove deletes",
+    "them, and verify PKGNAME rechecks them.",
     "",
     "update local-fetch: sources.list entries of the form",
     "  file:///abs/path/to/INDEX     copy INDEX in place",
@@ -7691,17 +9065,24 @@ char *pkg_doc[] = {
     "are fetched in-process. Directory repos may also expose",
     "<arch>/INDEX plus noarch/INDEX or any/INDEX; update mirrors the",
     "selected arch (default: uname -m) plus universal dirs. Other schemes",
-    "are rejected by default. With --remote, https:// sources (and http://",
-    "only under --remote-insecure) are materialized through curl before",
-    "the same INDEX.sig gate; sources.list may prefix a line with `remote`",
-    "or `remote-insecure` for persistent opt-in. A sibling <INDEX>.sig is verified via bashsignify when",
+    "are rejected by default. With --remote, update fetches the signed INDEX",
+    "files of https:// sources (and http:// only under --remote-insecure)",
+    "through the curl builtin, behind the same INDEX.sig gate; sources.list",
+    "may prefix a line with `remote` or `remote-insecure` for persistent",
+    "opt-in. Without sources.list, --remote uses",
+    "https://github.com/itsmygithubacct/bash-os/releases/download/packages.",
+    "download, install and upgrade then fetch only the packages, signatures",
+    "and deltas they use, keeping a package only if its SHA-256 matches the",
+    "INDEX, with the TLS options update was given.",
+    "Redirects are followed. A sibling <INDEX>.sig is verified by the signature check when",
     "present; verification failure refuses to copy the source INDEX",
     "content; the destination remains absent or keeps its previous snapshot.",
     "",
     "fetch also remote-materializes http:// and https:// sources into the same",
-    "local mirror tree consumed by update/download/upgrade. It delegates",
+    "local mirror tree consumed by update/download/upgrade, for installing",
+    "without a network later. It delegates",
     "network I/O to curl, fetches signed per-arch INDEX files, promotes",
-    "them through the same INDEX.sig bashsignify gate as update, and stages",
+    "them through the same INDEX.sig signature gate as update, and stages",
     "referenced artifacts only after SHA-256 package checks or delta",
     "from/to header checks. With a cached package whose hash matches",
     "delta_from, fetch requests the delta sidecar and signatures; otherwise",

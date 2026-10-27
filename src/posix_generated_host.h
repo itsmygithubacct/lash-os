@@ -3,6 +3,12 @@ _Static_assert(sizeof(struct timespec) == 16, "Linux ABI layout: struct timespec
 _Static_assert(sizeof(((struct timespec *)0)->tv_nsec) == 8, "Linux ABI layout: struct timespec");
 _Static_assert(sizeof(gid_t) == 4, "Linux ABI layout: gid_t");
 _Static_assert(sizeof(struct tms) == 32, "Linux ABI layout: struct tms");
+_Static_assert(sizeof(off_t) == 8, "Linux ABI layout: off_t");
+_Static_assert(sizeof(struct mq_attr) == 64, "Linux ABI layout: struct mq_attr");
+_Static_assert(offsetof(struct mq_attr, mq_curmsgs) == 24, "Linux ABI layout: struct mq_attr");
+_Static_assert(sizeof(struct statfs) == 120, "Linux ABI layout: struct statfs");
+_Static_assert(offsetof(struct statfs, f_fsid) == 56, "Linux ABI layout: struct statfs");
+_Static_assert(offsetof(struct statfs, f_flags) == 80, "Linux ABI layout: struct statfs");
 static int64_t service_posix(struct bridge_host *h, struct posix_request *request) {
     uint64_t *a = request->args;
     switch (request->operation) {
@@ -725,6 +731,123 @@ static int64_t service_posix(struct bridge_host *h, struct posix_request *reques
         if (!name)
             return -1;
         return fremovexattr(descriptor, name);
+    }
+    case PX_RENAMEAT: {
+        int old_directory = (int)a[0] == -2 ? AT_FDCWD : fd(h, (int)a[0]);
+        if (old_directory < 0 && old_directory != AT_FDCWD)
+            return -1;
+        char old_path_storage[BRIDGE_PATH_SIZE];
+        const char *old_path = path_string_mode(h, a[1], old_path_storage, 0);
+        if (!old_path)
+            return -1;
+        int new_directory = (int)a[2] == -2 ? AT_FDCWD : fd(h, (int)a[2]);
+        if (new_directory < 0 && new_directory != AT_FDCWD)
+            return -1;
+        char new_path_storage[BRIDGE_PATH_SIZE];
+        const char *new_path = path_string_mode(h, a[3], new_path_storage, 0);
+        if (!new_path)
+            return -1;
+        return renameat(old_directory, old_path, new_directory, new_path);
+    }
+    case PX_COPY_FILE_RANGE: {
+        size_t length = (size_t)a[4];
+        unsigned flags = (unsigned)a[5];
+        int input = fd(h, (int)a[0]);
+        if (input < 0)
+            return -1;
+        off_t *input_offset = a[1] ? memory(h, a[1], sizeof(off_t)) : NULL;
+        if (a[1] && !input_offset)
+            return -1;
+        int output = fd(h, (int)a[2]);
+        if (output < 0)
+            return -1;
+        off_t *output_offset = a[3] ? memory(h, a[3], sizeof(off_t)) : NULL;
+        if (a[3] && !output_offset)
+            return -1;
+        return copy_file_range(input, input_offset, output, output_offset, length, flags);
+    }
+    case PX_MQ_UNLINK: {
+        const char *name = string(h, a[0]);
+        if (!name)
+            return -1;
+        return mq_unlink(name);
+    }
+    case PX_MQ_OPEN: {
+        mode_t mode = (mode_t)a[2];
+        const char *name = string(h, a[0]);
+        if (!name)
+            return -1;
+        int flags = open_flags(a[1]);
+        const struct mq_attr *attributes = a[3] ? memory(h, a[3], sizeof(struct mq_attr)) : NULL;
+        if (a[3] && !attributes)
+            return -1;
+        return save_fd(h, mq_open(name, flags, mode, attributes), 0);
+    }
+    case PX_LINKAT: {
+        int old_directory = (int)a[0] == -2 ? AT_FDCWD : fd(h, (int)a[0]);
+        if (old_directory < 0 && old_directory != AT_FDCWD)
+            return -1;
+        char old_path_storage[BRIDGE_PATH_SIZE];
+        const char *old_path =
+            path_string_mode(h, a[1], old_path_storage, (at_flags(a[4]) & AT_SYMLINK_FOLLOW) != 0);
+        if (!old_path)
+            return -1;
+        int new_directory = (int)a[2] == -2 ? AT_FDCWD : fd(h, (int)a[2]);
+        if (new_directory < 0 && new_directory != AT_FDCWD)
+            return -1;
+        char new_path_storage[BRIDGE_PATH_SIZE];
+        const char *new_path = path_string_mode(h, a[3], new_path_storage, 0);
+        if (!new_path)
+            return -1;
+        int flags = at_flags(a[4]);
+        if (flags < 0)
+            return -1;
+        return linkat(old_directory, old_path, new_directory, new_path, flags);
+    }
+    case PX_STATFS: {
+        char path_storage[BRIDGE_PATH_SIZE];
+        const char *path = path_string_mode(h, a[0], path_storage, 1);
+        if (!path)
+            return -1;
+        struct statfs *out = memory(h, a[1], sizeof(struct statfs));
+        if (!out && (sizeof(struct statfs)) != 0)
+            return -1;
+        return statfs(path, out);
+    }
+    case PX_MKFIFOAT: {
+        mode_t mode = (mode_t)a[2];
+        int directory = (int)a[0] == -2 ? AT_FDCWD : fd(h, (int)a[0]);
+        if (directory < 0 && directory != AT_FDCWD)
+            return -1;
+        char path_storage[BRIDGE_PATH_SIZE];
+        const char *path = path_string_mode(h, a[1], path_storage, 0);
+        if (!path)
+            return -1;
+        return mkfifoat(directory, path, mode);
+    }
+    case PX_MKDIRAT: {
+        mode_t mode = (mode_t)a[2];
+        int directory = (int)a[0] == -2 ? AT_FDCWD : fd(h, (int)a[0]);
+        if (directory < 0 && directory != AT_FDCWD)
+            return -1;
+        char path_storage[BRIDGE_PATH_SIZE];
+        const char *path = path_string_mode(h, a[1], path_storage, 0);
+        if (!path)
+            return -1;
+        return mkdirat(directory, path, mode);
+    }
+    case PX_SYMLINKAT: {
+        const char *target = string(h, a[0]);
+        if (!target)
+            return -1;
+        int directory = (int)a[1] == -2 ? AT_FDCWD : fd(h, (int)a[1]);
+        if (directory < 0 && directory != AT_FDCWD)
+            return -1;
+        char path_storage[BRIDGE_PATH_SIZE];
+        const char *path = path_string_mode(h, a[2], path_storage, 0);
+        if (!path)
+            return -1;
+        return symlinkat(target, directory, path);
     }
     default:
         return service_posix_extra(h, request);

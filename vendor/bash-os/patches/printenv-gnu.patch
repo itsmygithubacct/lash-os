@@ -1,0 +1,141 @@
+--- builtins/printenv.c
++++ builtins/printenv.c
+@@ -25,4 +25,5 @@
+ 
+ #include <config.h>
++#include <string.h>
+ #include <stdio.h>
+ 
+@@ -34,45 +35,82 @@
+ extern char **export_env;
+ 
++/* Read the exported environment, including temporary command assignments.
++   A shell variable lookup would miss non-identifier environment names. */
++static char *
++printenv_value (const char *name)
++{
++  char **entry;
++  size_t length = strlen (name);
++  if (strchr (name, '='))
++    return 0;
++  for (entry = export_env; *entry; entry++)
++    if (strncmp (*entry, name, length) == 0 && (*entry)[length] == '=')
++      return *entry + length + 1;
++  return 0;
++}
++
+ int
+ printenv_builtin (WORD_LIST *list)
+ {
+-  register char **envp;
+-  int opt;
+-  SHELL_VAR *var;
++  WORD_LIST *word;
++  char **names, **entry, *value, *arg;
++  size_t count, used, i;
++  int delimiter = '\n', options = 1, result = EXECUTION_SUCCESS;
+ 
+-  reset_internal_getopt ();
+-  while ((opt = internal_getopt (list, "")) != -1)
++  maybe_make_export_env ();
++  for (count = 0, word = list; word; word = word->next) count++;
++  names = xmalloc ((count + 1) * sizeof (*names));
++  used = 0;
++  for (word = list; word; word = word->next)
+     {
+-      switch (opt)
+-	{
+-	CASE_HELPOPT;
+-	default:
+-	  builtin_usage ();
+-	  return (EX_USAGE);
+-	}
++      arg = word->word->word;
++      if (options && strcmp (arg, "--") == 0)
++        { options = 0; continue; }
++      if (options && arg[0] == '-' && arg[1])
++        {
++          if (arg[1] == '-')
++            {
++              size_t length = strlen (arg + 2);
++              if (length <= 4 && strncmp (arg + 2, "null", length) == 0)
++                delimiter = 0;
++              else if (length <= 4 && strncmp (arg + 2, "help", length) == 0)
++                { builtin_help (); goto done; }
++              else if (length <= 7 && strncmp (arg + 2, "version", length) == 0)
++                { printf ("printenv (bash-os builtin)\n"); goto done; }
++              else goto invalid;
++            }
++          else
++            for (i = 1; arg[i]; i++)
++              {
++                if (arg[i] != '0') goto invalid;
++                delimiter = 0;
++              }
++          continue;
++        }
++      names[used++] = arg;
++      options = 0;
+     }
+-  list = loptend;
+-
+-  /* printenv */
+-  if (list == 0)
++  if (used == 0)
+     {
+-      maybe_make_export_env ();		/* this allows minimal code */
+-      for (envp = export_env; *envp; envp++)
+-	printf ("%s\n", *envp);
+-      return (EXECUTION_SUCCESS);
++      for (entry = export_env; *entry; entry++)
++        { fputs (*entry, stdout); putchar (delimiter); }
+     }
+-
+-  /* printenv varname */
+-  var = find_variable (list->word->word);
+-  if (var == 0 || (exported_p (var) == 0))
+-    return (EXECUTION_FAILURE);
+-
+-  if (function_p (var))
+-    print_var_function (var);
+   else
+-    print_var_value (var, 0);
+-
+-  printf("\n");
+-  return (EXECUTION_SUCCESS);
++    for (i = 0; i < used; i++)
++      {
++        value = printenv_value (names[i]);
++        if (value == 0)
++          result = EXECUTION_FAILURE;
++        else
++          { fputs (value, stdout); putchar (delimiter); }
++      }
++  goto done;
++invalid:
++  builtin_error ("invalid option: %s", arg);
++  builtin_usage ();
++  result = EX_USAGE;
++done:
++  free (names);
++  return sh_chkwrite (result);
+ }
+ 
+@@ -80,5 +118,9 @@
+ 	"Display environment.",
+ 	"",
+-	"Print names and values of environment variables",
++	"Print values of each exported VARIABLE, or all name=value pairs.",
++	"Missing variables set status 1; remaining operands are still printed.",
++	"  -0, --null  terminate each value with NUL instead of newline",
++	"  --help      display this help and return success",
++	"  --version   display the implementation identity",
+ 	(char *)NULL
+ };
+@@ -89,5 +131,5 @@
+ 	BUILTIN_ENABLED,
+ 	printenv_doc,
+-	"printenv [varname]",
++	"printenv [-0|--null] [--] [VARIABLE...]",
+ 	0
+ };

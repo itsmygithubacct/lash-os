@@ -13,10 +13,12 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <poll.h>
 #include <regex.h>
 #include <signal.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
@@ -129,16 +131,28 @@ be_child_guard_child_end (struct be_child_guard *g)
   sigprocmask (SIG_SETMASK, &g->oldmask, NULL);
 }
 
-static long
+static int64_t
 be_now_ms (void)
 {
   struct timespec ts;
   if (clock_gettime (CLOCK_MONOTONIC, &ts) < 0)
     return 0;
-  return (long) ts.tv_sec * 1000L + (long) ts.tv_nsec / 1000000L;
+  return (int64_t) ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
 static int be_write_all (int fd, const char *data, size_t n);
+
+static int
+be_parse_timeout (const char *s, int *out)
+{
+  char *end;
+  errno = 0;
+  long seconds = strtol (s, &end, 10);
+  if (errno || end == s || *end || seconds < 0 || seconds > INT_MAX)
+    { builtin_error ("invalid timeout: %s", s); return -1; }
+  *out = (int) seconds;
+  return 0;
+}
 
 static int
 be_parse_fd (const char *s, int *out)
@@ -327,20 +341,23 @@ be_write_all (int fd, const char *data, size_t n)
 }
 
 static int
-be_poll_read (be_state *st, int timeout_sec, int eof_rc, int timeout_rc)
+be_poll_read (be_state *st, int64_t deadline, int eof_rc, int timeout_rc)
 {
-  long deadline = be_now_ms () + (long) timeout_sec * 1000L;
   for (;;)
     {
-      long rem = deadline - be_now_ms ();
-      if (rem < 0) rem = 0;
+      /* A zero deadline preserves -t 0's nonblocking drain of ready input. */
+      int64_t rem = deadline ? deadline - be_now_ms () : 0;
+      if (deadline && rem <= 0) return timeout_rc;
       struct pollfd pfd = { .fd = st->fd, .events = POLLIN | POLLHUP | POLLERR, .revents = 0 };
-      int pr = poll (&pfd, 1, (int) rem);
+      int pr = poll (&pfd, 1, rem > INT_MAX ? INT_MAX : (int) rem);
       if (pr < 0 && errno == EINTR) continue;
       if (pr < 0)
         { builtin_error ("poll: %s", strerror (errno)); return EXECUTION_FAILURE; }
       if (pr == 0)
-        return timeout_rc;
+        {
+          if (!deadline) return timeout_rc;
+          continue; /* A clamped interval may be shorter than the deadline. */
+        }
       char tmp[256];
       ssize_t r = read (st->fd, tmp, sizeof tmp);
       if (r < 0 && errno == EINTR) continue;
@@ -595,7 +612,10 @@ be_expect_cmd (WORD_LIST *args)
     {
       const char *w = p->word->word;
       if (strcmp (w, "-t") == 0 && p->next)
-        { p = p->next; timeout = atoi (p->word->word); }
+        {
+          p = p->next;
+          if (be_parse_timeout (p->word->word, &timeout) < 0) return EX_USAGE;
+        }
       else if (strcmp (w, "-V") == 0 && p->next)
         { p = p->next; match_var = p->word->word; }
       else { builtin_error ("expect: unexpected arg: %s", w); return EX_USAGE; }
@@ -604,6 +624,7 @@ be_expect_cmd (WORD_LIST *args)
   if (!st)
     { builtin_error ("expect: state table full"); return EXECUTION_FAILURE; }
 
+  int64_t deadline = timeout ? be_now_ms () + (int64_t) timeout * 1000 : 0;
   for (;;)
     {
       char *m = NULL;
@@ -615,7 +636,7 @@ be_expect_cmd (WORD_LIST *args)
           free (m);
           return EXECUTION_SUCCESS;
         }
-      int rr = be_poll_read (st, timeout, 2, 1);
+      int rr = be_poll_read (st, deadline, 2, 1);
       if (rr != EXECUTION_SUCCESS)
         return rr;
     }
@@ -637,8 +658,12 @@ be_expect_alt_cmd (WORD_LIST *args)
   for (WORD_LIST *p = args->next; p; p = p->next)
     {
       const char *w = p->word->word;
-      if (strcmp (w, "-t") == 0 && p->next)
-        { p = p->next; timeout = atoi (p->word->word); }
+      if (strcmp (w, "-t") == 0)
+        {
+          if (!p->next) { builtin_error ("-t needs SEC"); return EX_USAGE; }
+          p = p->next;
+          if (be_parse_timeout (p->word->word, &timeout) < 0) return EX_USAGE;
+        }
       else if (strcmp (w, "-V") == 0 && p->next)
         {
           p = p->next;
@@ -659,6 +684,7 @@ be_expect_alt_cmd (WORD_LIST *args)
   if (!st)
     { builtin_error ("expect-alt: state table full"); return EXECUTION_FAILURE; }
 
+  int64_t deadline = timeout ? be_now_ms () + (int64_t) timeout * 1000 : 0;
   for (;;)
     {
       for (int i = 0; i < npat; i++)
@@ -676,7 +702,7 @@ be_expect_alt_cmd (WORD_LIST *args)
               return EXECUTION_SUCCESS;
             }
         }
-      int rr = be_poll_read (st, timeout, 2, 1);
+      int rr = be_poll_read (st, deadline, 2, 1);
       if (rr != EXECUTION_SUCCESS)
         return rr;
     }
@@ -695,15 +721,19 @@ be_eof_cmd (WORD_LIST *args)
     {
       const char *w = p->word->word;
       if (strcmp (w, "-t") == 0 && p->next)
-        { p = p->next; timeout = atoi (p->word->word); }
+        {
+          p = p->next;
+          if (be_parse_timeout (p->word->word, &timeout) < 0) return EX_USAGE;
+        }
       else { builtin_error ("eof: unexpected arg: %s", w); return EX_USAGE; }
     }
   be_state *st = be_get_state (fd, 1);
   if (!st)
     { builtin_error ("eof: state table full"); return EXECUTION_FAILURE; }
+  int64_t deadline = timeout ? be_now_ms () + (int64_t) timeout * 1000 : 0;
   for (;;)
     {
-      int rr = be_poll_read (st, timeout, 3, EXECUTION_FAILURE);
+      int rr = be_poll_read (st, deadline, 3, EXECUTION_FAILURE);
       if (rr == 3)
         return EXECUTION_SUCCESS;
       if (rr != EXECUTION_SUCCESS)
@@ -886,6 +916,12 @@ char *expect_doc[] = {
   "    expect interact",
   "    expect -d|--debug",
   "    expect --version",
+  "",
+  "Positive -t SEC bounds the whole wait, including while output keeps arriving.",
+  "SEC must be a nonnegative integer; zero checks buffered and ready input",
+  "without waiting for more bytes.",
+  "expect and expect-alt return 0 for a match, 1 for timeout, 2 for EOF.",
+  "eof returns 0 for EOF or 1 for timeout.",
   (char *)NULL
 };
 

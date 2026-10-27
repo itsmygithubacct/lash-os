@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <limits.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <termios.h>
@@ -67,12 +68,16 @@ static struct {
     char  *ob;
     size_t ob_len, ob_cap;
 
+    int    output_error;
+    struct sigaction old_winch, old_term, old_hup;
     int    timeout_ms;
 
     bls_win *stdscr;
 } S;
 
 static volatile sig_atomic_t g_winch = 0;
+static int resize_event = 0;
+static int exit_registered = 0;
 
 /* ===================================================================== */
 /* output buffer                                                         */
@@ -85,7 +90,7 @@ ob_putn(const char *s, size_t n)
         size_t nc = S.ob_cap ? S.ob_cap : 8192;
         while (S.ob_len + n + 1 > nc) nc *= 2;
         char *np = (char *) realloc(S.ob, nc);
-        if (!np) return;
+        if (!np) { S.output_error = 1; return; }
         S.ob = np; S.ob_cap = nc;
     }
     memcpy(S.ob + S.ob_len, s, n);
@@ -100,7 +105,7 @@ ob_flush(void)
     const char *p = S.ob; size_t left = S.ob_len;
     while (left > 0) {
         ssize_t w = write(S.fd, p, left);
-        if (w < 0) { if (errno == EINTR) continue; break; }
+        if (w <= 0) { if (w < 0 && errno == EINTR) continue; S.output_error = 1; break; }
         p += w; left -= (size_t) w;
     }
     S.ob_len = 0;
@@ -113,7 +118,7 @@ raw_write(int fd, const char *s)
     size_t left = strlen(s); const char *p = s;
     while (left > 0) {
         ssize_t w = write(fd, p, left);
-        if (w < 0) { if (errno == EINTR) continue; break; }
+        if (w <= 0) { if (w < 0 && errno == EINTR) continue; break; }
         p += w; left -= (size_t) w;
     }
 }
@@ -197,7 +202,18 @@ sgr_color(char *buf, size_t cap, size_t *len, int is_fg, int32_t color)
         snprintf(frag, sizeof frag, ";%d", is_fg ? 39 : 49);
     } else if (color >= BLS_PAL_BASE) {
         idx = color - BLS_PAL_BASE;               /* palette index 0..255 */
-        if (S.color_mode == BLS_MODE_16 && idx < 16) {
+        if (S.color_mode == BLS_MODE_16) {
+            if (idx >= 16) {
+                int r, g, b;
+                if (idx >= 232) r = g = b = 8 + 10 * (idx - 232);
+                else {
+                    static const int level[] = { 0, 95, 135, 175, 215, 255 };
+                    int cube = idx - 16;
+                    r = level[cube / 36]; g = level[(cube / 6) % 6]; b = level[cube % 6];
+                }
+                idx = rgb_to_16(BLS_RGB(r, g, b), &bright);
+                if (bright) idx += 8;
+            }
             int base = idx & 7, hi = idx >= 8;
             snprintf(frag, sizeof frag, ";%d", (is_fg ? 30 : 40) + base + (hi ? 60 : 0));
         } else {
@@ -267,7 +283,7 @@ query_size(void)
 {
     struct winsize ws;
     S.rows = 24; S.cols = 80;
-    if (S.fd >= 0 && ioctl(S.fd, TIOCGWINSZ, &ws) == 0 && ws.ws_row > 0) {
+    if (S.fd >= 0 && ioctl(S.fd, TIOCGWINSZ, &ws) == 0 && ws.ws_row > 0 && ws.ws_col > 0) {
         S.rows = ws.ws_row; S.cols = ws.ws_col;
     }
 }
@@ -277,7 +293,11 @@ static void winch_handler(int sig) { (void) sig; g_winch = 1; }
 static void
 fatal_handler(int sig)
 {
-    bls_end();
+    /* Do not free heap objects from a signal handler. The process exits. */
+    if (S.active && S.owner_pid == getpid()) {
+        raw_write(S.fd, "\033[0m\033[?25h\033[?1049l");
+        if (S.saved_valid) tcsetattr(S.fd, TCSANOW, &S.saved);
+    }
     signal(sig, SIG_DFL);
     raise(sig);
 }
@@ -310,39 +330,65 @@ free_screens(void)
 
 /* Resize: realloc to the new size, blank curscr (physical state unknown after
    a resize), clear the terminal, and mark everything dirty for a full redraw. */
-static void
+static int
 handle_resize(void)
 {
     bls_win *std = S.stdscr;
-    free_screens();
+    int old_rows = S.rows, old_cols = S.cols;
+    cell *old_new = S.newscr, *old_cur = S.curscr;
+    int *old_first = S.new_first, *old_last = S.new_last;
     query_size();
-    if (alloc_screens() != 0) return;
-    if (std) {
-        cell *nc = (cell *) malloc((size_t) S.rows * S.cols * sizeof(cell));
-        if (nc) {
-            for (int y = 0; y < S.rows; y++)
-                for (int x = 0; x < S.cols; x++)
-                    nc[y * S.cols + x] = (y < std->h && x < std->w)
-                        ? std->cells[y * std->w + x] : BLANK;
-            free(std->cells);
-            std->cells = nc; std->h = S.rows; std->w = S.cols;
-            std->touched = 1;
-        }
+    cell *nc = malloc((size_t) S.rows * S.cols * sizeof(cell));
+    if (!nc || alloc_screens() != 0) {
+        free(nc); S.rows = old_rows; S.cols = old_cols; return -1;
     }
-    ob_puts("\033[2J");
+    for (int y = 0; y < S.rows; y++)
+        for (int x = 0; x < S.cols; x++)
+            nc[y * S.cols + x] = (y < std->h && x < std->w)
+                ? std->cells[y * std->w + x] : BLANK;
+    free(std->cells);
+    std->cells = nc; std->h = S.rows; std->w = S.cols; std->touched = 1;
+    free(old_new); free(old_cur); free(old_first); free(old_last);
+    /* ED uses the current background, so reset it before clearing. */
+    ob_puts("\033[0m\033[2J");
     S.pcursor_known = 0;
-    S.cur_attr = 0xFFFF;   /* force next set_rendition */
+    S.cur_attr = 0xFFFF;
+    return 0;
+}
+
+static int
+sync_size(void)
+{
+    if (S.active && g_winch) {
+        g_winch = 0;
+        if (handle_resize() != 0) { g_winch = 1; return -1; }
+        resize_event = 1;
+    }
+    return 0;
 }
 
 /* ===================================================================== */
 /* lifecycle                                                             */
 /* ===================================================================== */
 
+/* bash hands a loadable one buffer for a variable set for a single
+   command (VAR=x cmd) and frees it when the next one is asked for, so a
+   value has to be taken away before another is read. */
+static const char *
+bls_env (const char *name, char *out, size_t outsz)
+{
+  const char *value = getenv (name);
+  if (!value || !*value) return NULL;
+  snprintf (out, outsz, "%s", value);
+  return out;
+}
+
 static void
 detect_color_mode(void)
 {
-    const char *ct = getenv("COLORTERM");
-    const char *tm = getenv("TERM");
+    char ct_held[128], tm_held[128];
+    const char *ct = bls_env ("COLORTERM", ct_held, sizeof ct_held);
+    const char *tm = bls_env ("TERM", tm_held, sizeof tm_held);
     if (ct && (strstr(ct, "truecolor") || strstr(ct, "24bit"))) { S.color_mode = BLS_MODE_TRUECOLOR; return; }
     if (tm && strstr(tm, "256")) { S.color_mode = BLS_MODE_256; return; }
     if (tm && strcmp(tm, "linux") == 0) { S.color_mode = BLS_MODE_16; return; }
@@ -356,6 +402,7 @@ bls_init(void)
     if (S.active) return 0;
     memset(&S, 0, sizeof S);
     S.timeout_ms = -1;
+    g_winch = 0; resize_event = 0;
 
     if (isatty(STDIN_FILENO)) { S.fd = STDIN_FILENO; S.own_fd = 0; }
     else {
@@ -388,13 +435,18 @@ bls_init(void)
     S.active = 1;
 
     /* alt screen + hide cursor + home + clear */
-    ob_puts("\033[?1049h\033[?25l\033[H\033[2J");
+    ob_puts("\033[?1049h\033[?25l\033[0m\033[H\033[2J");
     ob_flush();
 
-    signal(SIGWINCH, winch_handler);
-    signal(SIGTERM, fatal_handler);
-    signal(SIGHUP,  fatal_handler);
-    atexit(bls_end);
+    struct sigaction sa;
+    /* SA_RESTART keeps signal()'s BSD semantics: a resize must not fail a
+       blocked builtin read/write. poll() in bls_getch still sees EINTR. */
+    memset(&sa, 0, sizeof sa); sigemptyset(&sa.sa_mask); sa.sa_flags = SA_RESTART;
+    sa.sa_handler = winch_handler; sigaction(SIGWINCH, &sa, &S.old_winch);
+    sa.sa_handler = fatal_handler; sigaction(SIGTERM, &sa, &S.old_term);
+    sigaction(SIGHUP, &sa, &S.old_hup);
+    if (!exit_registered) { atexit(bls_end); exit_registered = 1; }
+    if (S.output_error) { bls_end(); return -1; }
     return 0;
 }
 
@@ -408,6 +460,10 @@ bls_end(void)
        Only the process that called bls_init() owns teardown. */
     if (S.owner_pid && getpid() != S.owner_pid) return;
     S.active = 0;
+    sigaction(SIGWINCH, &S.old_winch, NULL);
+    sigaction(SIGTERM, &S.old_term, NULL);
+    sigaction(SIGHUP, &S.old_hup, NULL);
+    g_winch = 0; resize_event = 0;
     /* leave alt screen, show cursor, reset rendition — unbuffered, signal-safe */
     raw_write(S.fd, "\033[0m\033[?25h\033[?1049l");
     if (S.saved_valid) tcsetattr(S.fd, TCSANOW, &S.saved);
@@ -418,16 +474,25 @@ bls_end(void)
     S.fd = -1;
 }
 
-int bls_lines(void) { return S.rows; }
-int bls_cols(void)  { return S.cols; }
+int bls_lines(void) { sync_size(); return S.rows; }
+int bls_cols(void)  { sync_size(); return S.cols; }
 int bls_tty_fd(void){ return S.fd; }
 int bls_color_mode(void) { return S.color_mode; }
-void bls_set_color_mode(int m) { if (m >= BLS_MODE_16 && m <= BLS_MODE_TRUECOLOR) S.color_mode = m; }
+void bls_set_color_mode(int m) {
+    if (m >= BLS_MODE_16 && m <= BLS_MODE_TRUECOLOR && m != S.color_mode) {
+        S.color_mode = m;
+        if (S.active) {
+            for (size_t i = 0; i < (size_t) S.rows * S.cols; i++) S.curscr[i].ch = UINT32_MAX;
+            S.stdscr->touched = 1; S.cur_attr = 0xFFFF;
+        }
+    }
+}
 
 int
 bls_resized(void)
 {
-    if (g_winch) { g_winch = 0; return 1; }
+    sync_size();
+    if (resize_event) { resize_event = 0; return 1; }
     return 0;
 }
 
@@ -572,13 +637,15 @@ bls_addstr_ansi(bls_win *w, const char *s, int n)
                 int j = i + 2, params[32], np = 0, cur = 0, seen = 0;
                 while (j < len) {
                     unsigned char d = (unsigned char) s[j];
-                    if (d >= '0' && d <= '9') { cur = cur * 10 + (d - '0'); seen = 1; j++; }
+                    if (d >= '0' && d <= '9') { cur = cur > (INT_MAX - (d - '0')) / 10 ? INT_MAX : cur * 10 + (d - '0'); seen = 1; j++; }
                     else if (d == ';') { if (np < 32) params[np++] = cur; cur = 0; seen = 1; j++; }
                     else break;
                 }
                 if (seen && np < 32) params[np++] = cur;
                 if (j < len && s[j] == 'm') apply_sgr(w, params, np);  /* SGR only */
-                i = (j < len) ? j + 1 : len;   /* consume the whole CSI */
+                /* Consume private/intermediate parameters through the final byte. */
+                while (j < len && !((unsigned char) s[j] >= 0x40 && (unsigned char) s[j] <= 0x7e)) j++;
+                i = (j < len) ? j + 1 : len;
             } else if (i + 1 < len) {
                 i += 2;                         /* two-char escape: ignore */
             } else {
@@ -757,26 +824,28 @@ transform_line(int y)
         use_clr = 1;
     }
 
-    go_to(y, first);
     for (int x = first; x <= emit_to; x++) {
+        if (cell_eq(&nl[x], &ol[x])) continue;
+        go_to(y, x);
         set_rendition(nl[x].attr, nl[x].fg, nl[x].bg);
         ob_put_cp(nl[x].ch);
         ol[x] = nl[x];
         S.pcx = x + 1;                     /* char auto-advances the cursor */
     }
     if (use_clr) {
+        go_to(y, blank_from > first ? blank_from : first);
         set_rendition(BLS_A_NORMAL, BLS_DEFAULT, BLS_DEFAULT);  /* clr_eol uses current bg */
         ob_puts("\033[K");
         for (int x = blank_from; x < S.cols; x++) ol[x] = BLANK;
     }
 }
 
-void
-bls_refresh(bls_win *w)
+int
+bls_refresh_checked(bls_win *w)
 {
-    if (!S.active || !w) return;
-
-    if (g_winch) { g_winch = 0; handle_resize(); }
+    if (!S.active || !w) return -1;
+    S.output_error = 0;
+    if (sync_size() != 0) return -1;
 
     wnoutrefresh(w);
 
@@ -794,7 +863,16 @@ bls_refresh(bls_win *w)
     if (cy >= 0 && cy < S.rows && cx >= 0 && cx < S.cols) go_to(cy, cx);
 
     ob_flush();
+    if (S.output_error) {
+        /* A partial write leaves the physical state unknown. Retry all cells. */
+        for (size_t i = 0; i < (size_t) S.rows * S.cols; i++) S.curscr[i].ch = UINT32_MAX;
+        w->touched = 1; S.pcursor_known = 0; S.cur_attr = 0xFFFF;
+        return -1;
+    }
+    return 0;
 }
+
+void bls_refresh(bls_win *w) { (void) bls_refresh_checked(w); }
 
 /* ===================================================================== */
 /* input                                                                 */
@@ -806,6 +884,7 @@ int
 bls_getch(void)
 {
     if (S.fd < 0) return BLS_KEY_NONE;
+    if (bl_key_pending()) return bl_read_key(S.fd);
     /* Always poll (timeout_ms = -1 blocks indefinitely) so a SIGWINCH-
        interrupted wait surfaces as BLS_ERR and the caller redraws at the
        fresh size, rather than getting swallowed inside a blocking read(). */

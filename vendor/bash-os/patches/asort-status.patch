@@ -1,0 +1,34 @@
+--- a/asort.c
++++ b/asort.c
+@@ -187,7 +187,7 @@
+ {
+     SHELL_VAR *var, *var2;
+     char *word;
+-    int opt, ret;
++    int opt, ret, status = EXECUTION_SUCCESS;
+     int index_flag = 0;
+ 
+     numeric_flag = 0;
+@@ -244,18 +244,20 @@
+ 
+         if (var == 0 || array_p(var) == 0) {
+             builtin_error("%s: Not an array", word);
++            status = EXECUTION_FAILURE;
+             continue;
+         }
+         if (readonly_p(var) || noassign_p(var)) {
+             if (readonly_p(var))
+-                err_readonly(word);
++                sh_readonly(word);
++            status = EXECUTION_FAILURE;
+             continue;
+         }
+ 
+         if ( (ret = sort_inplace(var)) != EXECUTION_SUCCESS )
+             return ret;
+     }
+-    return EXECUTION_SUCCESS;
++    return status;
+ 
+ }
+ 

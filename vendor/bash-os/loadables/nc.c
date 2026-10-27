@@ -46,11 +46,13 @@
 #include <string.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <signal.h>
 #include <netdb.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <time.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
@@ -59,6 +61,52 @@
 #define BASHNC_VERSION "0.1 (TCP/UDP + -z scan; multiplex via epoll)"
 
 #define BNC_IO_BUF 4096
+
+static int
+bnc_number (const char *s, int min, int max, int *out)
+{
+  char *end;
+  if (!s || !*s) return -1;
+  for (const char *p = s; *p; p++)
+    if (*p < '0' || *p > '9') return -1;
+  errno = 0;
+  long n = strtol (s, &end, 10);
+  if (errno || *end || n < min || n > max) return -1;
+  *out = (int) n;
+  return 0;
+}
+
+static int
+bnc_wait_arg (const char *s, int *out)
+{
+  if (bnc_number (s, 0, INT_MAX / 1000, out) == 0) return 0;
+  builtin_error ("-w needs seconds in 0..%d", INT_MAX / 1000);
+  return -1;
+}
+
+/* A signal must not restart a finite idle/probe timeout. */
+static int
+bnc_wait (int epfd, struct epoll_event *events, int count, int timeout)
+{
+  struct timespec now;
+  long long deadline = 0;
+  if (timeout >= 0)
+    {
+      if (clock_gettime (CLOCK_MONOTONIC, &now) < 0) return -1;
+      deadline = (long long) now.tv_sec * 1000 + now.tv_nsec / 1000000 + timeout;
+    }
+  for (;;)
+    {
+      int rc = epoll_wait (epfd, events, count, timeout);
+      if (rc >= 0 || errno != EINTR) return rc;
+      if (timeout >= 0)
+        {
+          if (clock_gettime (CLOCK_MONOTONIC, &now) < 0) return -1;
+          long long remaining = deadline - (long long) now.tv_sec * 1000 - now.tv_nsec / 1000000;
+          timeout = remaining > 0 ? (int) remaining : 0;
+        }
+    }
+}
 
 /* Resolve "HOST" + "PORT" (string) into a single sockaddr_storage.
  * type is SOCK_STREAM or SOCK_DGRAM. passive=1 means AI_PASSIVE for
@@ -100,23 +148,48 @@ bnc_set_nonblock (int fd, int on)
 }
 
 /* Write a buffer to fd until done or a fatal error. Loops over EINTR
- * and short writes. Returns 0 on success, -1 on error (errno set). */
+ * and short writes. Returns 0 on success, -1 on error (errno set).
+ * A socket uses MSG_NOSIGNAL. A pipe or other non-socket is written
+ * with SIGPIPE ignored for this call only, then the caller's disposition
+ * is restored, so a closed reader returns EPIPE instead of killing the
+ * shell or running its PIPE trap. */
 static int
-bnc_write_all (int fd, const void *buf, size_t n)
+bnc_write_all (int fd, const void *buf, size_t n, int socket_output)
 {
   const unsigned char *p = buf;
+  struct sigaction ignore, saved;
+  int restore = 0;
+
+  if (!socket_output)
+    {
+      memset (&ignore, 0, sizeof ignore);
+      ignore.sa_handler = SIG_IGN;
+      sigemptyset (&ignore.sa_mask);
+      if (sigaction (SIGPIPE, &ignore, &saved) == 0)
+        restore = 1;
+    }
+
+  int rc = 0;
   while (n > 0)
     {
-      ssize_t w = write (fd, p, n);
-      if (w < 0)
+      ssize_t w = socket_output ? send (fd, p, n, MSG_NOSIGNAL) : write (fd, p, n);
+      if (w <= 0)
         {
-          if (errno == EINTR) continue;
-          return -1;
+          if (w < 0 && errno == EINTR) continue;
+          if (w == 0) errno = EIO;
+          rc = -1;
+          break;
         }
       p += (size_t) w;
       n -= (size_t) w;
     }
-  return 0;
+  if (restore)
+    {
+      int saved_errno = errno;
+      sigaction (SIGPIPE, &saved, NULL);
+      errno = saved_errno;
+    }
+  return rc;
 }
 
 /* TCP multiplex loop. Both halves are streamed bidirectionally:
@@ -125,7 +198,7 @@ bnc_write_all (int fd, const void *buf, size_t n)
  * Closing stdin shuts the socket's write half via shutdown(SHUT_WR).
  * EOF or RDHUP on the socket ends the loop. */
 static int
-bnc_tcp_pump (int sock)
+bnc_tcp_pump (int sock, int wait_secs)
 {
   int epfd = epoll_create1 (EPOLL_CLOEXEC);
   if (epfd < 0) { builtin_error ("epoll_create1: %s", strerror (errno)); return EXECUTION_FAILURE; }
@@ -153,71 +226,70 @@ bnc_tcp_pump (int sock)
    * stdin is a pipe-from-here-doc that's already EOF. */
   if (!stdin_open)
     {
-      ssize_t n;
-      while ((n = read (STDIN_FILENO, buf, sizeof buf)) > 0)
+      for (;;)
         {
-          if (bnc_write_all (sock, buf, (size_t) n) < 0)
+          ssize_t n = read (STDIN_FILENO, buf, sizeof buf);
+          if (n < 0 && errno == EINTR) continue;
+          if (n < 0)
+            { builtin_error ("read stdin: %s", strerror (errno)); close (epfd); return EXECUTION_FAILURE; }
+          if (n == 0) break;
+          if (bnc_write_all (sock, buf, (size_t) n, 1) < 0)
             { builtin_error ("write sock: %s", strerror (errno)); close (epfd); return EXECUTION_FAILURE; }
         }
       shutdown (sock, SHUT_WR);
     }
 
-  int sock_open = 1;
-  while (sock_open || stdin_open)
+  while (1)
     {
       struct epoll_event ready[2];
-      int n;
-      do { n = epoll_wait (epfd, ready, 2, -1); }
-      while (n < 0 && errno == EINTR);
+      int n = bnc_wait (epfd, ready, 2, wait_secs > 0 ? wait_secs * 1000 : -1);
       if (n < 0) { builtin_error ("epoll_wait: %s", strerror (errno)); close (epfd); return EXECUTION_FAILURE; }
+      if (n == 0) { builtin_error ("idle timeout"); close (epfd); return EXECUTION_FAILURE; }
 
       for (int i = 0; i < n; i++)
         {
           int fd = ready[i].data.fd;
-          int events = ready[i].events;
-
           if (fd == STDIN_FILENO && stdin_open)
             {
               ssize_t r = read (STDIN_FILENO, buf, sizeof buf);
+              if (r < 0 && errno == EINTR) continue;
+              if (r < 0)
+                { builtin_error ("read stdin: %s", strerror (errno)); close (epfd); return EXECUTION_FAILURE; }
               if (r > 0)
                 {
-                  if (bnc_write_all (sock, buf, (size_t) r) < 0)
+                  if (bnc_write_all (sock, buf, (size_t) r, 1) < 0)
                     { builtin_error ("write sock: %s", strerror (errno)); close (epfd); return EXECUTION_FAILURE; }
                 }
               else
                 {
-                  /* EOF or error on stdin. Close the write half so the
-                   * peer sees an orderly shutdown. */
-                  shutdown (sock, SHUT_WR);
-                  epoll_ctl (epfd, EPOLL_CTL_DEL, STDIN_FILENO, NULL);
-                  stdin_open = 0;
-                }
-              if ((events & (EPOLLHUP | EPOLLRDHUP)) && stdin_open)
-                {
+                  /* HUP can accompany unread bytes. Only read's EOF ends
+                   * this half, after every queued byte reaches the peer. */
                   shutdown (sock, SHUT_WR);
                   epoll_ctl (epfd, EPOLL_CTL_DEL, STDIN_FILENO, NULL);
                   stdin_open = 0;
                 }
             }
-          else if (fd == sock && sock_open)
+          else if (fd == sock)
             {
               ssize_t r = read (sock, buf, sizeof buf);
+              if (r < 0 && errno == EINTR) continue;
+              if (r < 0)
+                { builtin_error ("read sock: %s", strerror (errno)); close (epfd); return EXECUTION_FAILURE; }
               if (r > 0)
                 {
-                  if (bnc_write_all (STDOUT_FILENO, buf, (size_t) r) < 0)
+                  if (bnc_write_all (STDOUT_FILENO, buf, (size_t) r, 0) < 0)
                     { builtin_error ("write stdout: %s", strerror (errno)); close (epfd); return EXECUTION_FAILURE; }
                 }
               else
                 {
-                  /* EOF or hup on socket. The session is over. */
-                  epoll_ctl (epfd, EPOLL_CTL_DEL, sock, NULL);
-                  sock_open = 0;
+                  /* The peer ended the session; an open stdin must not
+                   * keep the caller's shell waiting for more input. */
+                  close (epfd);
+                  return EXECUTION_SUCCESS;
                 }
             }
         }
     }
-  close (epfd);
-  return EXECUTION_SUCCESS;
 }
 
 /* UDP receive-then-respond loop. Once a peer is heard, stdin can be
@@ -285,9 +357,7 @@ bnc_udp_pump (int sock, const struct sockaddr_storage *peer_in,
     {
       struct epoll_event ready[2];
       int timeout = stdin_open ? -1 : after_eof_ms;
-      int n;
-      do { n = epoll_wait (epfd, ready, 2, timeout); }
-      while (n < 0 && errno == EINTR);
+      int n = bnc_wait (epfd, ready, 2, timeout);
       if (n < 0) { builtin_error ("epoll_wait: %s", strerror (errno)); close (epfd); return EXECUTION_FAILURE; }
       if (n == 0) break;        /* drain window elapsed (stdin already closed) */
 
@@ -306,7 +376,7 @@ bnc_udp_pump (int sock, const struct sockaddr_storage *peer_in,
               if (!have_peer)
                 { memcpy (&peer, &src, srclen); peerlen = srclen; have_peer = 1; }
               if (r > 0)
-                if (bnc_write_all (STDOUT_FILENO, buf, (size_t) r) < 0)
+                if (bnc_write_all (STDOUT_FILENO, buf, (size_t) r, 0) < 0)
                   { builtin_error ("write stdout: %s", strerror (errno)); close (epfd); return EXECUTION_FAILURE; }
             }
           else if (fd == STDIN_FILENO && stdin_open)
@@ -314,6 +384,8 @@ bnc_udp_pump (int sock, const struct sockaddr_storage *peer_in,
               ssize_t r = read (STDIN_FILENO, buf, sizeof buf);
               if (r < 0 && errno == EINTR)
                 continue;
+              if (r < 0)
+                { builtin_error ("read stdin: %s", strerror (errno)); close (epfd); return EXECUTION_FAILURE; }
               if (r > 0 && have_peer)
                 {
                   ssize_t w = sendto (sock, buf, (size_t) r, 0,
@@ -342,14 +414,14 @@ bnc_connect (WORD_LIST *args)
   const char *host = NULL;
   const char *port = NULL;
   int udp = 0;
-  int wait_secs = 0;          /* 0 = unset; only used for UDP peer-wait */
+  int wait_secs = 0;          /* 0 = no TCP timeout; default UDP drain window */
   for (WORD_LIST *p = args; p; p = p->next)
     {
       const char *w = p->word->word;
       if (strcmp (w, "-u") == 0) udp = 1;
       else if (strcmp (w, "-w") == 0)
         { if (!p->next) { builtin_error ("-w needs SECS"); return EX_USAGE; }
-          p = p->next; wait_secs = atoi (p->word->word); }
+          p = p->next; if (bnc_wait_arg (p->word->word, &wait_secs) < 0) return EX_USAGE; }
       else if (!host) host = w;
       else if (!port) port = w;
       else { builtin_error ("connect: extra arg %s", w); return EX_USAGE; }
@@ -380,7 +452,7 @@ bnc_connect (WORD_LIST *args)
       if (connect (fd, (struct sockaddr *) &ss, sl) < 0)
         { builtin_error ("connect %s:%s: %s", host, port, strerror (errno));
           close (fd); return EXECUTION_FAILURE; }
-      int rc = bnc_tcp_pump (fd);
+      int rc = bnc_tcp_pump (fd, wait_secs);
       close (fd);
       return rc;
     }
@@ -413,7 +485,7 @@ bnc_listen (WORD_LIST *args)
           p = p->next; addr = p->word->word; }
       else if (strcmp (w, "-w") == 0)
         { if (!p->next) { builtin_error ("-w needs SECS"); return EX_USAGE; }
-          p = p->next; wait_secs = atoi (p->word->word); }
+          p = p->next; if (bnc_wait_arg (p->word->word, &wait_secs) < 0) return EX_USAGE; }
       else if (!port) port = w;
       else { builtin_error ("listen: extra arg %s", w); return EX_USAGE; }
     }
@@ -438,6 +510,8 @@ bnc_listen (WORD_LIST *args)
       struct timeval tv = { .tv_sec = wait_secs, .tv_usec = 0 };
       if (setsockopt (fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv) < 0)
         builtin_warning ("setsockopt SO_RCVTIMEO: %s", strerror (errno));
+      if (setsockopt (fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv) < 0)
+        builtin_warning ("setsockopt SO_SNDTIMEO: %s", strerror (errno));
     }
 
   if (bind (fd, (struct sockaddr *) &ss, sl) < 0)
@@ -453,7 +527,7 @@ bnc_listen (WORD_LIST *args)
       while (cfd < 0 && errno == EINTR);
       close (fd);                /* listener no longer needed for v1 */
       if (cfd < 0) { builtin_error ("accept: %s", strerror (errno)); return EXECUTION_FAILURE; }
-      int rc = bnc_tcp_pump (cfd);
+      int rc = bnc_tcp_pump (cfd, wait_secs);
       close (cfd);
       return rc;
     }
@@ -493,9 +567,7 @@ bnc_probe_port (const char *host, int port, int wait_secs)
   if (epoll_ctl (epfd, EPOLL_CTL_ADD, fd, &ev) < 0) { close (epfd); close (fd); return -1; }
   struct epoll_event ready[1];
   int timeout_ms = (wait_secs > 0 ? wait_secs : 1) * 1000;
-  int n;
-  do { n = epoll_wait (epfd, ready, 1, timeout_ms); }
-  while (n < 0 && errno == EINTR);
+  int n = bnc_wait (epfd, ready, 1, timeout_ms);
   close (epfd);
   if (n <= 0) { close (fd); return 0; }              /* timeout or error */
 
@@ -519,10 +591,12 @@ bnc_scan (WORD_LIST *args)
       const char *w = p->word->word;
       if (strcmp (w, "-w") == 0)
         { if (!p->next) { builtin_error ("-w needs SECS"); return EX_USAGE; }
-          p = p->next; wait_secs = atoi (p->word->word); }
+          p = p->next; if (bnc_wait_arg (p->word->word, &wait_secs) < 0) return EX_USAGE; }
       else if (!host) host = w;
-      else if (first < 0) first = atoi (w);
-      else if (last  < 0) last  = atoi (w);
+      else if (first < 0)
+        { if (bnc_number (w, 1, 65535, &first) < 0) { builtin_error ("scan: invalid port %s", w); return EX_USAGE; } }
+      else if (last < 0)
+        { if (bnc_number (w, 1, 65535, &last) < 0) { builtin_error ("scan: invalid port %s", w); return EX_USAGE; } }
       else { builtin_error ("scan: extra arg %s", w); return EX_USAGE; }
     }
   if (!host || first < 0)
@@ -572,6 +646,8 @@ char *nc_doc[] = {
   "    nc listen  PORT -s ADDR [-u] [-w SECS]   bind + accept-one (TCP) / recv (UDP)",
   "    nc scan    HOST FIRST [LAST] [-w SECS]   -z TCP port scan",
   "    nc --version",
+  "-w bounds TCP connect/accept, writes and idle reads (timeout returns 1);",
+  "for UDP it sets the reply drain window after stdin EOF. Zero uses defaults.",
   "",
   "Multiplexes stdin and the socket via epoll(7). Listen mode requires",
   "explicit `-s ADDR`; use `-s 127.0.0.1` for loopback or `-s 0.0.0.0`",

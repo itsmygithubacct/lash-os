@@ -108,6 +108,7 @@ struct builtin;
 #define PCAP_MAGIC_USEC    0xa1b2c3d4u   /* microsecond resolution */
 #define PCAP_MAGIC_NSEC    0xa1b23c4du   /* nanosecond resolution */
 #define PCAP_MAGIC_SWAPPED 0xd4c3b2a1u   /* opposite-endian usec */
+#define PCAP_MAGIC_NSEC_SWAPPED 0x4d3cb2a1u /* opposite-endian nsec */
 #define PCAP_VERSION_MAJ   2
 #define PCAP_VERSION_MIN   4
 
@@ -265,7 +266,8 @@ bpc_info_file (const char *path)
     int swapped = 0;
     if (h.magic_number != PCAP_MAGIC_USEC &&
         h.magic_number != PCAP_MAGIC_NSEC) {
-        if (h.magic_number == PCAP_MAGIC_SWAPPED) {
+        if (h.magic_number == PCAP_MAGIC_SWAPPED ||
+            h.magic_number == PCAP_MAGIC_NSEC_SWAPPED) {
             swapped = 1;
         } else {
             builtin_error ("info: %s: bad magic 0x%08x", path,
@@ -301,7 +303,7 @@ bpc_info_file (const char *path)
     printf ("linktype: %u (%s)\n", (unsigned) linktype,
             bpc_linktype_name (linktype));
 
-    /* Walk records to count them; skip-by-incl_len is cheap. */
+    /* Consume each payload so an EOF inside it cannot look like a clean end. */
     size_t records = 0;
     size_t total_bytes = 0;
     while (1) {
@@ -321,17 +323,22 @@ bpc_info_file (const char *path)
                  | ((incl & 0x00ff0000u) >>  8)
                  | ((incl & 0xff000000u) >> 24);
         }
-        if (incl > snaplen + 64) {
+        if ((uint64_t) incl > (uint64_t) snaplen + 64) {
             builtin_error ("info: %s: record %zu len=%u exceeds snaplen+64",
                            path, records, (unsigned) incl);
             close (fd);
             return EXECUTION_FAILURE;
         }
-        if (incl > 0 && lseek (fd, (off_t) incl, SEEK_CUR) == (off_t) -1) {
-            builtin_error ("info: %s: seek past record %zu: %s",
-                           path, records, strerror (errno));
-            close (fd);
-            return EXECUTION_FAILURE;
+        unsigned char discard[4096];
+        uint32_t remaining = incl;
+        while (remaining) {
+            size_t chunk = remaining < sizeof discard ? remaining : sizeof discard;
+            if (bpc_read_all (fd, discard, chunk) < 0) {
+                builtin_error ("info: %s: truncated payload in record %zu", path, records);
+                close (fd);
+                return EXECUTION_FAILURE;
+            }
+            remaining -= (uint32_t) chunk;
         }
         records++;
         total_bytes += incl;

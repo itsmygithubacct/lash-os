@@ -32,14 +32,21 @@ reboot_impl (WORD_LIST *list, int cmd, const char *name)
 	{
 	case 'f': force = 1; break;	/* skip the sync */
 	case 'n': dry = 1; break;	/* dry run: report, do not act */
+	CASE_HELPOPT;
 	default: builtin_usage (); return (EX_USAGE);
 	}
     }
+  if (loptend)
+    { builtin_usage (); return (EX_USAGE); }
   if (dry)
-    { printf ("%s: would %s (dry run)\n", name, name); return (EXECUTION_SUCCESS); }
+    {
+      printf ("%s: would %s (dry run)\n", name, name);
+      return (sh_chkwrite (EXECUTION_SUCCESS));
+    }
   if (force == 0)
     sync ();
-  reboot (cmd);
+  if (reboot (cmd) == 0)
+    return (EXECUTION_SUCCESS);
   builtin_error ("%s: %s", name, strerror (errno));	/* only reached on failure */
   return (EXECUTION_FAILURE);
 }
@@ -50,6 +57,7 @@ reboot_impl (WORD_LIST *list, int cmd, const char *name)
   char *fn##_doc[] = {							\
     verb " the system.", "",						\
     #fn " [-f] [-n]   -f: skip sync;  -n: dry run (report, do not act).",\
+    "Calls reboot(2) directly; does not change runlevel or write accounting records.",\
     (char *) NULL };							\
   struct builtin fn##_struct = {					\
     #fn, fn##_builtin, BUILTIN_ENABLED, fn##_doc, #fn " [-f] [-n]", 0 };

@@ -266,7 +266,7 @@ slab_run_once(void)
 {
     blp_slabinfo slabs;
     if (slab_load(&slabs) < 0)
-        return EXECUTION_SUCCESS;
+        return EXECUTION_FAILURE;
     slab_print_table(stdout, &slabs);
     blp_free_slabinfo(&slabs);
     return EXECUTION_SUCCESS;
@@ -343,9 +343,12 @@ slab_run_interactive(int delay)
 static int
 slab_arg_missing(const char *opt)
 {
-    fprintf(stderr, "slabtop: option requires an argument -- '%s'\n", opt);
+    if (opt[0] == '-' && opt[1] == '-')
+        fprintf(stderr, "slabtop: option '%s' requires an argument\n", opt);
+    else
+        fprintf(stderr, "slabtop: option requires an argument -- '%s'\n", opt + 1);
     slab_usage(stderr);
-    return EXECUTION_SUCCESS;
+    return EXECUTION_FAILURE;
 }
 
 static int
@@ -358,7 +361,7 @@ slab_invalid_option(const char *opt)
     else
         fprintf(stderr, "slabtop: invalid option -- '%s'\n", opt);
     slab_usage(stderr);
-    return EXECUTION_SUCCESS;
+    return EXECUTION_FAILURE;
 }
 
 int
@@ -395,7 +398,7 @@ slabtop_builtin(WORD_LIST *list)
         if (!strcmp(w, "-d") || !strcmp(w, "--delay")) {
             list = list->next;
             if (!list)
-                return slab_arg_missing("d");
+                return slab_arg_missing(w);
             delay = atoi(list->word->word);
             if (delay < 1)
                 delay = 1;
@@ -413,7 +416,7 @@ slabtop_builtin(WORD_LIST *list)
             slab_sort sort;
             list = list->next;
             if (!list)
-                return slab_arg_missing("s");
+                return slab_arg_missing(w);
             if (!slab_valid_sort(list->word->word, &sort))
                 return slab_invalid_option(list->word->word);
             slab_current_sort = sort;

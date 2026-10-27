@@ -32,6 +32,7 @@ struct ar_member {
     struct ar_hdr h;
     unsigned char *data;
     long size;
+    char *name;  /* Resolved basename while merging replacement members. */
 };
 
 struct ar_symbol {
@@ -52,9 +53,14 @@ static long decfield(const char *s, size_t n) {
     while(n>0 && (b[n-1]==' '||b[n-1]==0)){ b[n-1]=0; n--; }
     return strtol(b, NULL, 10);
 }
-/* Trim a 16-byte name field at the first '/' or space. */
+/* A slash terminates a short name; spaces before it belong to the name.
+   Without a slash, remove only the fixed-width field's trailing padding. */
 static void clean_name(char *dst, const char *src) {
-    size_t n=0; while(n<16 && src[n] && src[n]!=' ' && src[n]!='/') { dst[n]=src[n]; n++; } dst[n]=0;
+    size_t n=0;
+    while(n<16 && src[n] && src[n]!='/') n++;
+    if(n==16 || src[n]!='/') while(n>0 && src[n-1]==' ') n--;
+    memcpy(dst, src, n);
+    dst[n]=0;
 }
 static int check_magic(FILE *f) { char m[AR_MAGIC_LEN]; rewind(f); return fread(m,1,AR_MAGIC_LEN,f)==AR_MAGIC_LEN && !memcmp(m,AR_MAGIC,AR_MAGIC_LEN); }
 
@@ -199,18 +205,27 @@ static int elf_collect_symbols(const unsigned char *data, size_t len,
 }
 
 /* GNU strtab lookup: long name starts at `off` and ends at the first
-   '/' or '\n'. Returns 0 on success, -1 if off is out of bounds for the
-   provided strtab (corrupt /N reference). */
+   '/' or '\n'. Returns -1 for an invalid offset or a name that will not fit;
+   callers must not rewrite an archive using a silently truncated name. */
 static int longname_from_strtab(char *dst, size_t dstn, long off, const char *strtab, size_t tablen){
-    if(off < 0 || (size_t)off >= tablen){ if(dstn) dst[0]=0; return -1; }
+    if(!dstn || off < 0 || (size_t)off >= tablen){ if(dstn) dst[0]=0; return -1; }
     size_t i=0; size_t j=(size_t)off;
-    while(j<tablen && i+1<dstn && strtab[j]!='/' && strtab[j]!='\n'){ dst[i++]=strtab[j++]; }
+    while(j<tablen && strtab[j]!='/' && strtab[j]!='\n'){
+        if(i+1>=dstn){ dst[0]=0; return -1; }
+        dst[i++]=strtab[j++];
+    }
     dst[i]=0;
     return 0;
 }
 
 static int list_or_extract(const char *arch, int extract, WORD_LIST *want) {
-    FILE *f = fopen(arch, "rb"); if (!f) { builtin_error("%s: %s", arch, strerror(errno)); return EXECUTION_FAILURE; }
+    FILE *f = fopen(arch, "rb");
+    if (!f) {
+        int saved_errno = errno;
+        builtin_error("%s: %s", arch, strerror(saved_errno));
+        /* The reference uses 9 for an absent archive in t/x; s uses 1. */
+        return saved_errno == ENOENT ? 9 : EXECUTION_FAILURE;
+    }
     if (!check_magic(f)) { builtin_error("%s: bad ar magic", arch); fclose(f); return EXECUTION_FAILURE; }
     struct ar_hdr h; int rc = EXECUTION_SUCCESS;
     char *strtab = NULL; size_t strtab_len = 0;
@@ -328,7 +343,7 @@ static int write_one(FILE *out, const char *path, int deterministic) {
     long mtime = deterministic ? 0L : (long)st.st_mtime;
     int uid    = deterministic ? 0  : (int)st.st_uid;
     int gid    = deterministic ? 0  : (int)st.st_gid;
-    unsigned mode = (unsigned)(st.st_mode & 0777);
+    unsigned mode = (unsigned)st.st_mode;
     if(deterministic) mode = (mode & 0111) ? 0755 : 0644;
     fprintf(out, "%-16s%-12ld%-6d%-6d%-8o%-10ld`\n",
             nbuf, mtime, uid, gid, mode, (long)st.st_size);
@@ -338,134 +353,9 @@ static int write_one(FILE *out, const char *path, int deterministic) {
     return 0;
 }
 
-/* Replace archive with new members. If any member basename exceeds 15
-   chars, builds a GNU `//` strtab and emits long-name members via /N
-   offset references (matching the read-side GNU strtab support). */
-static int replace(const char *arch, WORD_LIST *files, int deterministic) {
-    FILE *out = fopen(arch, "wb");
-    if (!out) { builtin_error("%s: %s", arch, strerror(errno)); return EXECUTION_FAILURE; }
-    fputs(AR_MAGIC, out);
-
-    /* Pass 1: detect long names. */
-    int need_strtab = 0;
-    for (WORD_LIST *p = files; p; p = p->next) {
-        const char *base = strrchr(p->word->word, '/');
-        base = base ? base + 1 : p->word->word;
-        if (strlen(base) > 15) { need_strtab = 1; break; }
-    }
-
-    if (!need_strtab) {
-        /* Fast path — all names fit in the 16-byte header field. */
-        for (WORD_LIST *p = files; p; p = p->next) {
-            if (write_one(out, p->word->word, deterministic) < 0) { fclose(out); return EXECUTION_FAILURE; }
-        }
-        fclose(out);
-        return EXECUTION_SUCCESS;
-    }
-
-    /* Build GNU strtab: each long name stored as basename + '/'. */
-    size_t tab_size = 0;
-    for (WORD_LIST *p = files; p; p = p->next) {
-        const char *base = strrchr(p->word->word, '/');
-        base = base ? base + 1 : p->word->word;
-        size_t blen = strlen(base);
-        if (blen > 15) tab_size += blen + 2;  /* GNU entry: name + '/' + '\n' */
-    }
-
-    char *strtab = malloc(tab_size + 1);
-    if (!strtab) { fclose(out); return EXECUTION_FAILURE; }
-
-    size_t pos = 0;
-    int n_long = 0;
-    for (WORD_LIST *p = files; p; p = p->next) {
-        const char *base = strrchr(p->word->word, '/');
-        base = base ? base + 1 : p->word->word;
-        size_t blen = strlen(base);
-        if (blen > 15) {
-            memcpy(strtab + pos, base, blen);
-            strtab[pos + blen] = '/';
-            strtab[pos + blen + 1] = '\n';   /* GNU terminates each entry with "/\n" */
-            pos += blen + 2;
-            n_long++;
-        }
-    }
-    strtab[pos] = 0;
-
-    /* Track per-file strtab offset for the write pass. */
-    long *offsets = malloc((size_t)n_long * sizeof(long));
-    if (!offsets) { free(strtab); fclose(out); return EXECUTION_FAILURE; }
-    pos = 0;
-    int idx = 0;
-    for (WORD_LIST *p = files; p; p = p->next) {
-        const char *base = strrchr(p->word->word, '/');
-        base = base ? base + 1 : p->word->word;
-        size_t blen = strlen(base);
-        if (blen > 15) {
-            offsets[idx++] = (long)pos;
-            pos += blen + 2;
-        }
-    }
-
-    /* Pad strtab data to even byte count. */
-    size_t tab_data_len = tab_size;
-    if (tab_data_len % 2) tab_data_len++;  /* even pad for ar format */
-
-    /* Write `//` strtab member. GNU ar leaves this member's
-       mtime/uid/gid/mode fields BLANK (space-filled) — it is a string
-       table, not a real file — and populates only the name, size, and
-       trailing magic. Filling them with 0/0/0/644 (the normal file-header
-       path) produced an archive that differed from `ar -D` byte-for-byte. */
-    fprintf(out, "%-16s%-12s%-6s%-6s%-8s%-10zu`\n",
-            "//", "", "", "", "", tab_data_len);
-    fwrite(strtab, 1, tab_size, out);
-    if (tab_data_len > tab_size) fputc('\n', out);
-
-    /* Pass 2: write each member, using /N references for long names. */
-    idx = 0;
-    for (WORD_LIST *p = files; p; p = p->next) {
-        const char *base = strrchr(p->word->word, '/');
-        base = base ? base + 1 : p->word->word;
-        size_t blen = strlen(base);
-
-        if (blen > 15) {
-            /* Write member with /N name reference into the strtab. */
-            long off = offsets[idx++];
-            struct stat st;
-            FILE *in = fopen(p->word->word, "rb");
-            if (!in || stat(p->word->word, &st) < 0) {
-                builtin_error("%s: %s", p->word->word, strerror(errno));
-                if (in) fclose(in);
-                free(strtab); free(offsets); fclose(out);
-                return EXECUTION_FAILURE;
-            }
-            char nbuf[17]; snprintf(nbuf, sizeof nbuf, "/%-15ld", off);
-            long mtime = deterministic ? 0L : (long)st.st_mtime;
-            int uid    = deterministic ? 0  : (int)st.st_uid;
-            int gid    = deterministic ? 0  : (int)st.st_gid;
-            unsigned mode = (unsigned)(st.st_mode & 0777);
-            if(deterministic) mode = (mode & 0111) ? 0755 : 0644;
-            fprintf(out, "%-16s%-12ld%-6d%-6d%-8o%-10ld`\n",
-                    nbuf, mtime, uid, gid, mode, (long)st.st_size);
-            int c; while((c=fgetc(in))!=EOF) fputc(c,out);
-            if (st.st_size & 1) fputc('\n',out);
-            fclose(in);
-        } else {
-            if (write_one(out, p->word->word, deterministic) < 0) {
-                free(strtab); free(offsets); fclose(out);
-                return EXECUTION_FAILURE;
-            }
-        }
-    }
-
-    free(strtab);
-    free(offsets);
-    fclose(out);
-    return EXECUTION_SUCCESS;
-}
-
 static void free_members(struct ar_member *members, size_t n) {
     if (!members) return;
-    for (size_t i = 0; i < n; i++) free(members[i].data);
+    for (size_t i = 0; i < n; i++) { free(members[i].data); free(members[i].name); }
     free(members);
 }
 
@@ -481,6 +371,7 @@ static int append_member(struct ar_member **members, size_t *n, size_t *cap,
     (*members)[*n].h = *h;
     (*members)[*n].size = size;
     (*members)[*n].data = NULL;
+    (*members)[*n].name = NULL;
     if (size > 0) {
         (*members)[*n].data = malloc((size_t)size);
         if (!(*members)[*n].data) return -1;
@@ -542,6 +433,155 @@ static int read_members_without_symtab(const char *arch, struct ar_member **out_
     return EXECUTION_SUCCESS;
 }
 
+/* Load replacements before opening the archive for writing. A missing input
+   must not discard the existing archive or its unrelated members. */
+static int load_replacement(struct ar_member *m, const char *path, int deterministic) {
+    struct stat st;
+    FILE *in = fopen(path, "rb");
+    if (!in || fstat(fileno(in), &st) < 0) {
+        builtin_error("%s: %s", path, strerror(errno));
+        if (in) fclose(in);
+        return -1;
+    }
+    const char *base = strrchr(path, '/');
+    base = base ? base + 1 : path;
+    m->name = strdup(base);
+    m->size = (long)st.st_size;
+    if (m->size < 0 || !m->name ||
+        (m->size && !(m->data = malloc((size_t)m->size)))) {
+        builtin_error("out of memory"); fclose(in); return -1;
+    }
+    if (m->size && fread(m->data, 1, (size_t)m->size, in) != (size_t)m->size) {
+        builtin_error("%s: read error", path); fclose(in); return -1;
+    }
+    if (fclose(in) != 0) { builtin_error("%s: %s", path, strerror(errno)); return -1; }
+    unsigned mode = (unsigned)st.st_mode;
+    if (deterministic) mode = (mode & 0111) ? 0755 : 0644;
+    char header[sizeof(struct ar_hdr) + 1];
+    int len = snprintf(header, sizeof header, "%-16s%-12ld%-6d%-6d%-8o%-10ld`\n",
+                       "", deterministic ? 0L : (long)st.st_mtime,
+                       deterministic ? 0 : (int)st.st_uid,
+                       deterministic ? 0 : (int)st.st_gid, mode, m->size);
+    if (len != (int)sizeof(struct ar_hdr)) {
+        builtin_error("%s: metadata does not fit ar header", path); return -1;
+    }
+    memcpy(&m->h, header, sizeof m->h);
+    return 0;
+}
+
+/* Merge by basename, keeping each untouched member's body, metadata and order.
+   Regenerate GNU long-name offsets from the final member order. The input
+   reader discards the old symbol index; the caller refreshes it for `rs`. */
+static int replace(const char *arch, WORD_LIST *files, int deterministic) {
+    struct ar_member *members = NULL, *replacements = NULL;
+    size_t n = 0, nr = 0, cap;
+    char *strtab = NULL;
+    int rc = EXECUTION_FAILURE;
+    struct stat st;
+    if (stat(arch, &st) == 0) {
+        if (read_members_without_symtab(arch, &members, &n) != EXECUTION_SUCCESS)
+            return EXECUTION_FAILURE;
+    } else if (errno != ENOENT) {
+        builtin_error("%s: %s", arch, strerror(errno)); return EXECUTION_FAILURE;
+    }
+    cap = n;
+    const char *oldtab = NULL;
+    size_t oldtab_len = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (member_is_strtab(&members[i].h)) {
+            oldtab = (const char *)members[i].data;
+            oldtab_len = (size_t)members[i].size;
+            break;
+        }
+    }
+    for (size_t i = 0; i < n; i++) {
+        struct ar_member *m = &members[i];
+        char name[256];
+        if (member_is_strtab(&m->h)) continue;
+        if (m->h.name[0] == '/' && m->h.name[1] >= '0' && m->h.name[1] <= '9') {
+            long off = decfield(m->h.name + 1, sizeof m->h.name - 1);
+            if (!oldtab || longname_from_strtab(name, sizeof name, off, oldtab, oldtab_len) < 0) {
+                builtin_error("%s: invalid long-name reference", arch); goto done;
+            }
+        } else clean_name(name, m->h.name);
+        m->name = strdup(name);
+        if (!m->name) { builtin_error("out of memory"); goto done; }
+    }
+    for (WORD_LIST *p = files; p; p = p->next) nr++;
+    replacements = calloc(nr, sizeof(*replacements));
+    if (!replacements) { builtin_error("out of memory"); goto done; }
+    size_t r = 0;
+    for (WORD_LIST *p = files; p; p = p->next, r++)
+        if (load_replacement(&replacements[r], p->word->word, deterministic) < 0) goto done;
+
+    for (size_t i = 0; i < n; i++) {
+        if (!members[i].name) continue;
+        for (r = 0; r < nr; r++) {
+            if (replacements[r].name && !strcmp(members[i].name, replacements[r].name)) {
+                free(members[i].data); free(members[i].name);
+                members[i] = replacements[r];
+                memset(&replacements[r], 0, sizeof replacements[r]);
+                break;
+            }
+        }
+    }
+    for (r = 0; r < nr; r++) {
+        if (!replacements[r].name) continue;
+        if (append_member(&members, &n, &cap, &replacements[r].h,
+                          replacements[r].data, replacements[r].size) < 0) {
+            builtin_error("out of memory"); goto done;
+        }
+        members[n-1].name = replacements[r].name;
+        replacements[r].name = NULL;
+    }
+
+    size_t tab_len = 0;
+    for (size_t i = 0; i < n; i++)
+        if (members[i].name && strlen(members[i].name) > 15)
+            tab_len += strlen(members[i].name) + 2;
+    strtab = malloc(tab_len + 1);
+    if (!strtab) { builtin_error("out of memory"); goto done; }
+    size_t pos = 0;
+    for (size_t i = 0; i < n; i++) {
+        struct ar_member *m = &members[i];
+        if (!m->name) continue;
+        size_t len = strlen(m->name);
+        char encoded[32];
+        if (len > 15) {
+            snprintf(encoded, sizeof encoded, "/%zu", pos);
+            memcpy(strtab + pos, m->name, len);
+            strtab[pos + len] = '/'; strtab[pos + len + 1] = '\n';
+            pos += len + 2;
+        } else snprintf(encoded, sizeof encoded, "%s/", m->name);
+        memset(m->h.name, ' ', sizeof m->h.name);
+        memcpy(m->h.name, encoded, strlen(encoded));
+    }
+    FILE *out = fopen(arch, "wb");
+    if (!out) { builtin_error("%s: %s", arch, strerror(errno)); goto done; }
+    fputs(AR_MAGIC, out);
+    if (tab_len) {
+        fprintf(out, "%-16s%-12s%-6s%-6s%-8s%-10zu`\n",
+                "//", "", "", "", "", tab_len + (tab_len & 1));
+        fwrite(strtab, 1, tab_len, out);
+        if (tab_len & 1) fputc('\n', out);
+    }
+    for (size_t i = 0; i < n; i++) {
+        if (!members[i].name) continue;
+        fwrite(&members[i].h, 1, sizeof members[i].h, out);
+        if (members[i].size) fwrite(members[i].data, 1, (size_t)members[i].size, out);
+        if (members[i].size & 1) fputc('\n', out);
+    }
+    int failed = ferror(out);
+    if (fclose(out) != 0) failed = 1;
+    if (failed) builtin_error("%s: write error", arch);
+    else rc = EXECUTION_SUCCESS;
+done:
+    free(strtab);
+    free_members(replacements, nr);
+    free_members(members, n);
+    return rc;
+}
+
 static int write_symtab_member(FILE *out, const struct ar_symvec *sv,
                                const long *member_offsets, int deterministic) {
     size_t names_len = 0;
@@ -596,7 +636,7 @@ static int refresh_symtab(const char *arch, int deterministic) {
     size_t names_len = 0;
     for (size_t i = 0; i < sv.n; i++) names_len += strlen(sv.v[i].name) + 1;
     size_t sym_body_len = 4 + sv.n * 4 + names_len;
-    size_t sym_total_len = sizeof(struct ar_hdr) + sym_body_len + (sym_body_len & 1);
+    size_t sym_total_len = sv.n ? sizeof(struct ar_hdr) + sym_body_len + (sym_body_len & 1) : 0;
 
     long *offsets = calloc(n ? n : 1, sizeof(*offsets));
     if (!offsets) {
@@ -617,7 +657,7 @@ static int refresh_symtab(const char *arch, int deterministic) {
         return EXECUTION_FAILURE;
     }
     fputs(AR_MAGIC, out);
-    if (write_symtab_member(out, &sv, offsets, deterministic) < 0) {
+    if (sv.n && write_symtab_member(out, &sv, offsets, deterministic) < 0) {
         fclose(out); free(offsets); symvec_free(&sv); free_members(members, n);
         return EXECUTION_FAILURE;
     }

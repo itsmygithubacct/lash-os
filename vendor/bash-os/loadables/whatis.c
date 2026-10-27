@@ -2,7 +2,7 @@
 /* whatis.c — whatis(1) over the whatis index.
  *
  * Sibling of man.c / apropos.c. Looks up exact-name matches
- * in $MANPATH/whatis. Exits 1 if the corpus's index is absent or
+ * in $MANPATH/whatis. Exits 16 if the corpus's index is absent or
  * the name has no entry.
  *
  *   whatis NAME [NAME ...]
@@ -43,10 +43,10 @@ whatis_builtin (WORD_LIST *list)
         }
         builtin_error ("unknown flag: %s", w);
         builtin_usage ();
-        return EX_USAGE;
+        return EXECUTION_FAILURE;
     }
 
-    if (!list || !list->word) { builtin_usage (); return EX_USAGE; }
+    if (!list || !list->word) { builtin_usage (); return EXECUTION_FAILURE; }
 
     /* Buffer the index once and rewind per name so multiple lookups
        in a single invocation do not pay N reads. */
@@ -54,7 +54,7 @@ whatis_builtin (WORD_LIST *list)
     if (!f)
     {
         builtin_error ("no whatis index found under $MANPATH (corpus may be absent)");
-        return EXECUTION_FAILURE;
+        return 16;
     }
 
     int any_hit = 0;
@@ -80,7 +80,7 @@ whatis_builtin (WORD_LIST *list)
             fprintf (stderr, "%s: nothing appropriate\n", p->word->word);
     }
     fclose (f);
-    return any_hit ? EXECUTION_SUCCESS : EXECUTION_FAILURE;
+    return any_hit ? EXECUTION_SUCCESS : 16;
 }
 
 char *whatis_doc[] = {
@@ -89,8 +89,8 @@ char *whatis_doc[] = {
     "    whatis NAME [NAME ...]",
     "",
     "Reads the whatis cache from $MANPATH (default /usr/share/man).",
-    "Returns nonzero when no NAME has an entry or when the corpus's",
-    "whatis index is missing.",
+    "Returns 16 when no NAME has an entry or when the corpus's",
+    "whatis index is missing; usage errors return 1.",
     (char *)NULL
 };
 

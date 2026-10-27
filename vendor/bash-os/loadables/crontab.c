@@ -131,6 +131,37 @@ bct_user_path (char *buf, size_t buflen)
 }
 
 static int
+bct_copy_stream (FILE *in, FILE *out)
+{
+    char buf[4096];
+    size_t n;
+    while ((n = fread (buf, 1, sizeof buf, in)) > 0)
+        if (fwrite (buf, 1, n, out) != n)
+            return -1;
+    return ferror (in) || ferror (out) ? -1 : 0;
+}
+
+static FILE *
+bct_temp (const char *path, const char *kind, char *tmp, size_t size)
+{
+    if (snprintf (tmp, size, "%s.%s.XXXXXX", path, kind) >= (int) size) {
+        errno = ENAMETOOLONG;
+        return NULL;
+    }
+    int fd = mkstemp (tmp);
+    if (fd < 0) return NULL;
+    FILE *stream = NULL;
+    if (fcntl (fd, F_SETFD, FD_CLOEXEC) >= 0) stream = fdopen (fd, "w");
+    if (!stream) {
+        int saved = errno;
+        close (fd);
+        unlink (tmp);
+        errno = saved;
+    }
+    return stream;
+}
+
+static int
 bct_copy_file (const char *src, const char *dst)
 {
     FILE *in = fopen (src, "r");
@@ -139,35 +170,19 @@ bct_copy_file (const char *src, const char *dst)
         return EXECUTION_FAILURE;
     }
     char tmp[PATH_MAX];
-    if (snprintf (tmp, sizeof tmp, "%s.tmp.%ld", dst, (long) getpid ()) >= (int) sizeof tmp) {
-        fclose (in);
-        return EXECUTION_FAILURE;
-    }
-    FILE *out = fopen (tmp, "w");
+    FILE *out = bct_temp (dst, "tmp", tmp, sizeof tmp);
     if (!out) {
         fclose (in);
         builtin_error ("create crontab: %s", strerror (errno));
         return EXECUTION_FAILURE;
     }
-    chmod (tmp, 0600);
-    char buf[4096];
-    size_t n;
-    while ((n = fread (buf, 1, sizeof buf, in)) > 0) {
-        if (fwrite (buf, 1, n, out) != n) {
-            fclose (in);
-            fclose (out);
-            unlink (tmp);
-            return EXECUTION_FAILURE;
-        }
-    }
-    int input_error = ferror (in);
-    int output_error = fclose (out) != 0;
-    if (input_error || output_error) {
-        fclose (in);
+    int bad = bct_copy_stream (in, out) < 0;
+    if (fclose (in) != 0) bad = 1;
+    if (fclose (out) != 0) bad = 1;
+    if (bad) {
         unlink (tmp);
         return EXECUTION_FAILURE;
     }
-    fclose (in);
     if (rename (tmp, dst) < 0) {
         unlink (tmp);
         builtin_error ("install crontab: %s", strerror (errno));
@@ -184,12 +199,10 @@ bct_cat (const char *path)
         builtin_error ("no crontab for %s", bct_user ());
         return EXECUTION_FAILURE;
     }
-    char buf[4096];
-    size_t n;
-    while ((n = fread (buf, 1, sizeof buf, f)) > 0)
-        fwrite (buf, 1, n, stdout);
-    int bad = ferror (f);
-    fclose (f);
+    int bad = bct_copy_stream (f, stdout) < 0;
+    if (fclose (f) != 0) bad = 1;
+    if (fflush (stdout) == EOF || ferror (stdout)) bad = 1;
+    if (bad) clearerr (stdout);
     return bad ? EXECUTION_FAILURE : EXECUTION_SUCCESS;
 }
 
@@ -203,39 +216,45 @@ bct_edit (const char *path)
         ed = "vi";
 
     char tmp[PATH_MAX];
-    if (snprintf (tmp, sizeof tmp, "%s.edit.%ld", path, (long) getpid ()) >= (int) sizeof tmp)
-        return EXECUTION_FAILURE;
-    FILE *out = fopen (tmp, "w");
+    FILE *out = bct_temp (path, "edit", tmp, sizeof tmp);
     if (!out) {
         builtin_error ("create temp crontab: %s", strerror (errno));
         return EXECUTION_FAILURE;
     }
-    chmod (tmp, 0600);
     FILE *in = fopen (path, "r");
+    int bad = 0;
     if (in) {
-        char buf[4096];
-        size_t n;
-        while ((n = fread (buf, 1, sizeof buf, in)) > 0)
-            fwrite (buf, 1, n, out);
-        fclose (in);
+        bad = bct_copy_stream (in, out) < 0;
+        if (fclose (in) != 0) bad = 1;
+    } else if (errno != ENOENT) bad = 1;
+    if (fclose (out) != 0) bad = 1;
+    if (bad) {
+        unlink (tmp);
+        builtin_error ("could not copy the current crontab for editing");
+        return EXECUTION_FAILURE;
     }
-    fclose (out);
 
     struct sigaction chld_dfl, chld_save;
     memset (&chld_dfl, 0, sizeof chld_dfl);
     chld_dfl.sa_handler = SIG_DFL;
     sigemptyset (&chld_dfl.sa_mask);
-    sigaction (SIGCHLD, &chld_dfl, &chld_save);
-
     sigset_t chld_set, prev_mask;
     sigemptyset (&chld_set);
     sigaddset (&chld_set, SIGCHLD);
-    sigprocmask (SIG_BLOCK, &chld_set, &prev_mask);
+    if (sigprocmask (SIG_BLOCK, &chld_set, &prev_mask) < 0) {
+        unlink (tmp);
+        return EXECUTION_FAILURE;
+    }
+    if (sigaction (SIGCHLD, &chld_dfl, &chld_save) < 0) {
+        sigprocmask (SIG_SETMASK, &prev_mask, NULL);
+        unlink (tmp);
+        return EXECUTION_FAILURE;
+    }
 
     pid_t pid = fork ();
     if (pid < 0) {
-        sigprocmask (SIG_SETMASK, &prev_mask, NULL);
         sigaction (SIGCHLD, &chld_save, NULL);
+        sigprocmask (SIG_SETMASK, &prev_mask, NULL);
         unlink (tmp);
         return EXECUTION_FAILURE;
     }
@@ -247,15 +266,28 @@ bct_edit (const char *path)
     int st;
     pid_t w;
     while ((w = waitpid (pid, &st, 0)) < 0 && errno == EINTR) ;
+    sigaction (SIGCHLD, &chld_save, NULL);
+    sigprocmask (SIG_SETMASK, &prev_mask, NULL);
     if (w < 0 || !WIFEXITED (st) || WEXITSTATUS (st) != 0) {
-        sigprocmask (SIG_SETMASK, &prev_mask, NULL);
-        sigaction (SIGCHLD, &chld_save, NULL);
         unlink (tmp);
         builtin_error ("editor failed");
         return EXECUTION_FAILURE;
     }
-    sigprocmask (SIG_SETMASK, &prev_mask, NULL);
-    sigaction (SIGCHLD, &chld_save, NULL);
+    /* Editors may replace their input file. Publish a regular file with
+       private permissions, never an editor-created symlink or special file. */
+    int fd = open (tmp, O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW);
+    struct stat stbuf;
+    bad = fd < 0;
+    if (fd >= 0) {
+        if (fstat (fd, &stbuf) < 0 || !S_ISREG (stbuf.st_mode) ||
+            fchmod (fd, stbuf.st_mode & 0600) < 0) bad = 1;
+        if (close (fd) < 0) bad = 1;
+    }
+    if (bad) {
+        unlink (tmp);
+        builtin_error ("editor did not leave a readable regular crontab");
+        return EXECUTION_FAILURE;
+    }
     if (rename (tmp, path) < 0) {
         unlink (tmp);
         return EXECUTION_FAILURE;
@@ -268,13 +300,9 @@ crontab_builtin (WORD_LIST *list)
 {
     char path[PATH_MAX];
     const char *user = bct_user ();
-    if (bct_user_path (path, sizeof path) < 0) {
-        builtin_error ("invalid crontab path");
-        return EXECUTION_FAILURE;
-    }
     if (!list) {
         builtin_error ("usage: crontab FILE | -l | -e | -r");
-        return EX_USAGE;
+        return EXECUTION_FAILURE;
     }
     const char *arg = list->word->word;
     if (!strcmp (arg, "--help") || !strcmp (arg, "-h")) {
@@ -282,14 +310,22 @@ crontab_builtin (WORD_LIST *list)
         char *const *dp;
         for (dp = crontab_doc; *dp; dp++)
             puts (*dp);
-        return EX_USAGE;
+        return EXECUTION_SUCCESS;
     }
     if (list->next) {
         builtin_error ("unexpected extra argument");
-        return EX_USAGE;
+        return EXECUTION_FAILURE;
+    }
+    if (arg[0] == '-' && strcmp (arg, "-l") && strcmp (arg, "-r") && strcmp (arg, "-e")) {
+        builtin_error ("unknown option: %s", arg);
+        return EXECUTION_FAILURE;
     }
     if (!bct_user_allowed (user)) {
         builtin_error ("user %s is not allowed to use crontab", user);
+        return EXECUTION_FAILURE;
+    }
+    if (bct_user_path (path, sizeof path) < 0) {
+        builtin_error ("invalid crontab path");
         return EXECUTION_FAILURE;
     }
     if (!strcmp (arg, "-l"))
@@ -303,10 +339,6 @@ crontab_builtin (WORD_LIST *list)
     }
     if (!strcmp (arg, "-e"))
         return bct_edit (path);
-    if (arg[0] == '-') {
-        builtin_error ("unknown option: %s", arg);
-        return EX_USAGE;
-    }
     return bct_copy_file (arg, path);
 }
 
