@@ -568,7 +568,7 @@ static int allow_path(int rules, const char *name, uint64_t rights, int optional
 #else
 #define SB_AUDIT_ARCH AUDIT_ARCH_RISCV64
 #endif
-#define SB_FILTER_MAX 24
+#define SB_FILTER_MAX 32
 #define SB_DENY(error) BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ((error) & SECCOMP_RET_DATA))
 /*
  * QEMU receives its console and serial sockets already connected, so it never needs to create
@@ -599,11 +599,16 @@ static size_t socket_filter(int network, struct sock_filter *program) {
         SB_DENY(EAFNOSUPPORT),
         network ? (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW)
                 : (struct sock_filter)SB_DENY(EAFNOSUPPORT),
-        /* socketpair(2) cannot reach named sockets; keep only the UNIX family. */
+        /* A datagram pair can connect() to a named socket. Connection-mode pairs cannot. */
         BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, args[0])),
-        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AF_UNIX, 0, 1),
-        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AF_UNIX, 1, 0),
         SB_DENY(EAFNOSUPPORT),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, args[1])),
+        BPF_STMT(BPF_ALU | BPF_AND | BPF_K, ~(unsigned)(SOCK_CLOEXEC | SOCK_NONBLOCK)),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SOCK_STREAM, 1, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SOCK_SEQPACKET, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+        SB_DENY(ESOCKTNOSUPPORT),
     };
     _Static_assert(sizeof(instructions) / sizeof(*instructions) <= SB_FILTER_MAX,
                    "socket filter exceeds its buffer");

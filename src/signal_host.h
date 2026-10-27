@@ -1,3 +1,4 @@
+#include <poll.h>
 /* Async handlers only record delivery. Guest handlers execute inside BPF. */
 static volatile sig_atomic_t pending_signals[65];
 static int installed_signal_flags[65];
@@ -68,6 +69,42 @@ static int suspend_signals(volatile struct kernel_control *c, uint64_t mask) {
     if (sigprocmask(SIG_SETMASK, &previous, NULL))
         return -1;
     errno = saved;
+    return rc;
+}
+/* A signal already recorded cannot interrupt a later blocking read or write.
+ * Publish under a blocked mask, and wait with the caller's mask only when
+ * nothing unblocked is queued. A zero-length transfer must not wait. */
+static int64_t interruptible_transfer(volatile struct kernel_control *c, int fd, void *buffer,
+                                      size_t count, int writing) {
+    if (count == 0)
+        return writing ? write(fd, buffer, 0) : read(fd, buffer, 0);
+    sigset_t all, previous;
+    sigfillset(&all);
+    if (sigprocmask(SIG_BLOCK, &all, &previous))
+        return -1;
+    publish_signals(c);
+    int64_t rc;
+    int error = 0;
+    if (c->pending_signals & ~pack_signal_mask(&previous)) {
+        error = EINTR;
+        rc = -1;
+    } else {
+        struct pollfd item = {.fd = fd, .events = writing ? POLLOUT : POLLIN};
+        int ready = ppoll(&item, 1, NULL, &previous);
+        error = errno;
+        if (ready > 0) {
+            rc = writing ? write(fd, buffer, count) : read(fd, buffer, count);
+            error = rc < 0 ? errno : 0;
+        } else {
+            rc = -1;
+            if (ready == 0)
+                error = EINTR;
+        }
+    }
+    publish_signals(c);
+    if (sigprocmask(SIG_SETMASK, &previous, NULL))
+        return -1;
+    errno = error;
     return rc;
 }
 static int guest_wait_status(int status) {

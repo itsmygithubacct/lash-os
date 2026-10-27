@@ -1,5 +1,7 @@
 #define _GNU_SOURCE
 #include <assert.h>
+#include <string.h>
+#include <sys/un.h>
 #include "../src/sandbox_host.c"
 
 static int identity(const char *text) {
@@ -127,6 +129,16 @@ static void socket_policy(void) {
         }
         return;
     }
+    char directory[] = "/tmp/lashos-unix-XXXXXX";
+    assert(mkdtemp(directory));
+    char outside_path[sizeof(directory) + 3];
+    snprintf(outside_path, sizeof(outside_path), "%s/s", directory);
+    int outside = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    assert(outside >= 0);
+    struct sockaddr_un address = {.sun_family = AF_UNIX};
+    assert(strlen(outside_path) < sizeof(address.sun_path));
+    memcpy(address.sun_path, outside_path, strlen(outside_path) + 1);
+    assert(!bind(outside, (struct sockaddr *)&address, sizeof(address)));
     for (int network = 0; network <= 1; network++) {
         pid_t pid = fork();
         assert(pid >= 0);
@@ -144,11 +156,30 @@ static void socket_policy(void) {
             int pair[2];
             if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair))
                 _exit(14);
+            struct sockaddr_un target = {.sun_family = AF_UNIX};
+            memcpy(target.sun_path, outside_path, strlen(outside_path) + 1);
+            /* The pair is already connected, and its type does not match the
+             * datagram socket. Either failure keeps the byte off that socket. */
+            if (!connect(pair[0], (struct sockaddr *)&target, sizeof(target))) {
+                send(pair[0], "x", 1, 0);
+                _exit(21);
+            }
+            if (errno != EPROTOTYPE && errno != EISCONN)
+                _exit(21);
             int inet = socket(AF_INET, SOCK_DGRAM, 0);
             if (network ? inet < 0 : inet != -1 || errno != EAFNOSUPPORT)
                 _exit(15);
             if (syscall(__NR_io_uring_setup, 1, NULL) != -1 || errno != ENOSYS)
                 _exit(16);
+            if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0, pair))
+                _exit(17);
+            if (socketpair(AF_UNIX, SOCK_DGRAM, 0, pair) != -1 || errno != ESOCKTNOSUPPORT)
+                _exit(18);
+            if (socketpair(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0, pair) != -1 ||
+                errno != ESOCKTNOSUPPORT)
+                _exit(19);
+            if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair))
+                _exit(20);
             _exit(0);
         }
         int status;
@@ -157,6 +188,11 @@ static void socket_policy(void) {
             fprintf(stderr, "socket policy network=%d status=%#x\n", network, status);
         assert(WIFEXITED(status) && !WEXITSTATUS(status));
     }
+    char scratch[8];
+    ssize_t got = recv(outside, scratch, sizeof(scratch), MSG_DONTWAIT);
+    assert(got == -1 && errno == EAGAIN);
+    close(outside);
+    assert(!unlink(outside_path) && !rmdir(directory));
 }
 static void private_streams(void) {
     struct sb_queue *q = calloc(1, sizeof(*q));

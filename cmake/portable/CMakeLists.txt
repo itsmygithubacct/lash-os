@@ -40,7 +40,7 @@ add_executable(sandbox-init "${LINUX_BASH_ROOT}/src/sandbox_init.c")
 
 include(CTest)
 if(BUILD_TESTING)
-    foreach(test queued-signals poll inherited-fds syscall-abi bridge-abi)
+    foreach(test queued-signals poll inherited-fds syscall-abi bridge-abi exec-locks)
         add_executable(${test}-test "${LINUX_BASH_ROOT}/tests/${test}.c")
         target_compile_options(${test}-test PRIVATE -UNDEBUG -Wno-unused-function -Wno-unused-variable)
         add_test(NAME ${test} COMMAND ${test}-test)

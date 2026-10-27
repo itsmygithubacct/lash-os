@@ -378,7 +378,7 @@ static int64_t service(struct bridge_host *h, volatile struct kernel_control *c)
         buffer = memory(h, b, n);
         if (actual < 0 || !buffer || n > SSIZE_MAX)
             return -1;
-        return c->operation == BR_WRITE ? write(actual, buffer, n) : read(actual, buffer, n);
+        return interruptible_transfer(c, actual, buffer, n, c->operation == BR_WRITE);
     case BR_OPEN:
         path = path_string_mode(h, a, path_storage, !(b & BO_NOFOLLOW));
         if (!path)
