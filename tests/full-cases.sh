@@ -156,7 +156,8 @@ for ((service_check=0;service_check<32;service_check++)); do
     if sv restart missing > /dev/null 2>&1; then exit 63; fi
 done
 unset BASHSV_DIR BASHSV_RUNDIR BASHSV_LOGDIR
-rmdir services service-run service-log
+# Failed restarts retain want/down state inside the private runtime tree.
+rm -r services service-run service-log
 printf 'service workspace reuse: yes\n'
 read -r line < <(printf 'process-substitution\n')
 printf '%s\n' "$line"
