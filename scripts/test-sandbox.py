@@ -299,6 +299,10 @@ exit 37
         expect(b"\r\nCALCULATOR_READY\r\n")
         send(b"2+2\n")
         expect(b"\r\n4\r\n")
+        send(b'print "prompt", ">"; read()\n')
+        expect(b"prompt>")
+        send(b"42\n")
+        expect(b"\r\n42\r\n")
         send(b"quit\n")
         expect(b"kernel-bash# ")
         # The terminal's shared description stays blocking while the session runs.

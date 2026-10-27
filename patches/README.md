@@ -95,7 +95,8 @@ exit cleanup. This preserves Capsule's existing 2 MiB fiber-stack limit and
 the reserve used for compiler-generated spills.
 
 `bash-os-bc-interactive-output.patch` flushes the calculator's private output
-buffer and stdio before reading another terminal input item. Without this,
+buffer and stdio before reading another terminal input item or a `read()`
+expression. Without this,
 short interactive results remain buffered until `quit` or EOF. The patch is
 applied to the isolated native reference and guest build; the vendored bash-os
 release stays unchanged. The production PTY test checks a result before sending
