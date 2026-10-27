@@ -5,13 +5,13 @@ the Linux POSIX process ABI. All 286 selected bash-os builtins are included in
 the build; their existing source-level feature subsets still apply. Runtime
 verification covers the cases in `tests/`, not every option of every builtin.
 
-In the previous 0.1.2 release, x86_64 is the primary tested target; ARM64 and RISC-V64 are experimental.
+In release 0.1.2.1, x86_64 is the primary tested target; ARM64 and RISC-V64 are experimental.
 On x86_64 under KVM, the production sandbox suite, the production guest runtime,
 and the full builtin and terminal job-control suite passed. ARM64 and RISC-V64
 passed their host tests under user-mode emulation and booted their own guest
-kernels under full-system emulation, registering all 279 builtins; native KVM,
+kernels under full-system emulation, registering all 286 selected builtins; native KVM,
 production launcher confinement, and complete process and job tests remain
-unverified on those targets. See the [release notes](docs/releases/0.1.2.md).
+unverified on those targets. See the [release notes](docs/releases/0.1.2.1.md).
 
 Hosted launches default to a bundled KVM VM matching the executable's x86_64,
 ARM64 or RISC-V64 architecture. The portable executable
