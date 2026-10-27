@@ -26,7 +26,8 @@ Host checks also cover the bash-os version policy, Git calendar conversion,
 and named semaphore handle bounds, shared identity, cleanup and fork inheritance.
 The full guest suite exercises the new archive and hash builtins, Git commits,
 dates and remotes, calculator exit, IPC creation and service workspace cleanup.
-The sandbox PTY suite enters and leaves a nested shell and exits `bc` with `quit`.
+The sandbox PTY suite enters and leaves a nested shell, checks calculator output
+before EOF, and exits `bc` with `quit`.
 
 The host C tests need no BPF privileges or VM; their Make targets build the
 image first. Existing builds can be tested directly with `scripts/dev.py ctest

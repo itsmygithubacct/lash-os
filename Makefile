@@ -67,7 +67,7 @@ portable-x86_64 portable-aarch64 portable-riscv64: portable-%: $(BUILD)/kernel-f
 prepare: $(BUILD)/native-full.stamp
 bitcode: $(BUILD)/full-bitcode.stamp
 
-$(BUILD)/native-full.stamp: scripts/prepare-bash.py scripts/workspace.py scripts/source_tree.py scripts/adapt-workspaces.py SOURCE.json $(NATIVE_TOOLCHAIN) $(BASH_SOURCE_INPUTS)
+$(BUILD)/native-full.stamp: scripts/prepare-bash.py scripts/workspace.py scripts/source_tree.py scripts/adapt-workspaces.py $(wildcard patches/bash-os-*.patch) SOURCE.json $(NATIVE_TOOLCHAIN) $(BASH_SOURCE_INPUTS)
 	$(WORKSPACE) --mark-build
 	$(DEV) python3 -B scripts/prepare-bash.py --profile full > $(BUILD)/prepare-full.log 2>&1 || { tail -60 $(BUILD)/prepare-full.log; exit 1; }
 	touch $@

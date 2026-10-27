@@ -130,9 +130,11 @@ if git -C sample-repo remote get-url missing > /dev/null 2>&1; then exit 64; fi
 grep -q 'Fetch URL: ../remote-fixture' remote-info
 rm remote-info
 ipcmk --posix-semaphore --name /lashos-sem-$$ > /dev/null
-[[ -f /dev/shm/sem.lashos-sem-$$ ]]
+# glibc and musl use different backing-file prefixes for named semaphores.
+semaphore_files=(/dev/shm/*lashos-sem-$$)
+[[ ${#semaphore_files[@]} == 1 && -f ${semaphore_files[0]} ]]
 if ipcmk --posix-semaphore --name /lashos-sem-$$ > /dev/null 2>&1; then exit 62; fi
-rm /dev/shm/sem.lashos-sem-$$
+rm -- "${semaphore_files[0]}"
 ipcmk --posix-mqueue --name /lashos-mq-$$ > /dev/null
 [[ -e /dev/mqueue/lashos-mq-$$ ]]
 rm /dev/mqueue/lashos-mq-$$

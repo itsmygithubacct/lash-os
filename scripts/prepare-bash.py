@@ -57,6 +57,9 @@ def main():
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(src, dst)
     if args.profile=='full':
+        subprocess.run(['patch', '-p1', '--batch', '-i',
+                        str(ROOT/'patches/bash-os-bc-interactive-output.patch')],
+                       cwd=SOURCE, check=True)
         subprocess.run(['python3',str(ROOT/'scripts/adapt-workspaces.py'),str(SOURCE/'loadables')],check=True)
     env = dict(os.environ, CONFIGURE_EXTRA=configuration, JOBS="4")
     subprocess.run(["bash", "build.sh", "--profile", args.profile, "--name", "kernel-reference", "--no-strip"],

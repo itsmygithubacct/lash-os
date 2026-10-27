@@ -293,7 +293,11 @@ exit 37
         expect(b"kernel-bash# ")
         send(b"exit\n")
         expect(b"kernel-bash# ")
-        send(b"bc\n2+2\n")
+        # Wait until Readline has handed control to command execution before
+        # sending the calculator's input; do not queue it in Readline's buffer.
+        send(b"printf 'CALCULATOR_%s\\n' READY; bc\n")
+        expect(b"\r\nCALCULATOR_READY\r\n")
+        send(b"2+2\n")
         expect(b"\r\n4\r\n")
         send(b"quit\n")
         expect(b"kernel-bash# ")

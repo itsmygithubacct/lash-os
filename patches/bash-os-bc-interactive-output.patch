@@ -1,0 +1,27 @@
+--- a/loadables/bc.c
++++ b/loadables/bc.c
+@@ -3942,6 +3942,7 @@
+     p.ip = ip;
+     p.src = src;
+     ip->src = src;
++    int interactive = src->in && isatty (src->in->fd);
+ 
+     while (!ip->stop) {
+         bc_arena arena = { NULL };
+@@ -3949,6 +3950,16 @@
+         int type;
+ 
++        /* Publish the preceding result before waiting for another terminal
++           line. Both the private calculator buffer and stdio must drain. */
++        if (interactive) {
++            bc_flush_for_message (ip);
++            if (ferror (stdout)) {
++                ip->fatal = ip->stop = 1;
++                break;
++            }
++        }
++
+         p.arena = &arena;
+         p.err = 0;
+         p.stray_arrays = 0;
+         p.void_calls = 0;

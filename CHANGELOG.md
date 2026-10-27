@@ -11,6 +11,8 @@
   POSIX message queues and named semaphore lifetimes through the checked bridge.
 - Mount guest IPC filesystems, move oversized service-manager and Git tables
   to unwind-managed heap memory, and ship the new sed regex license notice.
+- Flush interactive calculator output before waiting for more input, so results
+  appear immediately and `quit` returns to the shell.
 - Cover version mismatches, Git timezone formatting, semaphore reference counts
   and fork inheritance, and the updated archive, hash, Git, calculator and IPC builtins.
 

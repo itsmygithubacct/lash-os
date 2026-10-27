@@ -94,6 +94,13 @@ heap. Each allocation uses Bash's unwind frames for normal-return and nonlocal
 exit cleanup. This preserves Capsule's existing 2 MiB fiber-stack limit and
 the reserve used for compiler-generated spills.
 
+`bash-os-bc-interactive-output.patch` flushes the calculator's private output
+buffer and stdio before reading another terminal input item. Without this,
+short interactive results remain buffered until `quit` or EOF. The patch is
+applied to the isolated native reference and guest build; the vendored bash-os
+release stays unchanged. The production PTY test checks a result before sending
+`quit` and verifies that the shell prompt returns.
+
 `linux-riscv64-jit-zext.patch` selects the RV64 JIT's existing conservative
 zero-extension path. The verifier's optional sub-register optimization inserts
 instructions one at a time and repeatedly shifts large instruction arrays;
