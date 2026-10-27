@@ -56,6 +56,8 @@ if(BUILD_TESTING)
     # test then checks the filter program but not its installed behavior.
     if(CMAKE_CROSSCOMPILING_EMULATOR)
         set_tests_properties(sandbox PROPERTIES ENVIRONMENT LASHOS_TEST_EMULATED=1)
+        set_tests_properties(exec-locks PROPERTIES
+            ENVIRONMENT "LASHOS_TEST_EXEC_EMULATOR=${CMAKE_CROSSCOMPILING_EMULATOR}")
     endif()
     add_test(NAME source-tree COMMAND ${Python3_EXECUTABLE} "${LINUX_BASH_ROOT}/tests/source-tree.py")
     add_test(NAME workspace COMMAND ${Python3_EXECUTABLE} -B "${LINUX_BASH_ROOT}/tests/workspace.py")

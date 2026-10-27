@@ -70,14 +70,9 @@ static int64_t service_misc(struct bridge_host *h, struct posix_request *request
             return -1;
         for (int i = 0; i < MAX_DIRS; i++)
             if (!h->dirs[i]) {
-                int copy = dup(actual);
-                if (copy < 0)
+                DIR *dir = fdopendir(actual);
+                if (!dir)
                     return -1;
-                DIR *dir = fdopendir(copy);
-                if (!dir) {
-                    close(copy);
-                    return -1;
-                }
                 h->dirs[i] = dir;
                 h->dir_fds[i] = a[0];
                 return i;

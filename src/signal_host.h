@@ -1,4 +1,5 @@
 #include <poll.h>
+#include "signal_io.h"
 /* Async handlers only record delivery. Guest handlers execute inside BPF. */
 static volatile sig_atomic_t pending_signals[65];
 static int installed_signal_flags[65];
@@ -31,10 +32,11 @@ static uint64_t pack_signal_mask(const sigset_t *set) {
 }
 static void record_signal(int number, siginfo_t *info, void *context) {
     (void)info;
-    (void)context;
     int guest = guest_signal(number);
-    if (guest)
+    if (guest) {
         pending_signals[guest] = 1;
+        interrupt_signal_io(context);
+    }
 }
 static void publish_signals(volatile struct kernel_control *c) {
     sigset_t all, previous;
@@ -71,9 +73,9 @@ static int suspend_signals(volatile struct kernel_control *c, uint64_t mask) {
     errno = saved;
     return rc;
 }
-/* A signal already recorded cannot interrupt a later blocking read or write.
- * Publish under a blocked mask, and wait with the caller's mask only when
- * nothing unblocked is queued. A zero-length transfer must not wait. */
+/* Check the queue under a blocked mask, then transfer with the caller's mask.
+ * The syscall entry handles signals delivered between unmasking and entry,
+ * without polling nonblocking descriptors or masking a blocking transfer. */
 static int64_t interruptible_transfer(volatile struct kernel_control *c, int fd, void *buffer,
                                       size_t count, int writing) {
     if (count == 0)
@@ -89,16 +91,18 @@ static int64_t interruptible_transfer(volatile struct kernel_control *c, int fd,
         error = EINTR;
         rc = -1;
     } else {
-        struct pollfd item = {.fd = fd, .events = writing ? POLLOUT : POLLIN};
-        int ready = ppoll(&item, 1, NULL, &previous);
-        error = errno;
-        if (ready > 0) {
-            rc = writing ? write(fd, buffer, count) : read(fd, buffer, count);
-            error = rc < 0 ? errno : 0;
-        } else {
+        signal_io_interrupted = 0;
+        signal_io_active = 1;
+        if (sigprocmask(SIG_SETMASK, &previous, NULL)) {
+            signal_io_active = 0;
+            return -1;
+        }
+        rc = signal_io_syscall(writing ? SYS_write : SYS_read, fd, buffer, count,
+                               &signal_io_interrupted);
+        signal_io_active = 0;
+        if (rc < 0) {
+            error = (int)-rc;
             rc = -1;
-            if (ready == 0)
-                error = EINTR;
         }
     }
     publish_signals(c);

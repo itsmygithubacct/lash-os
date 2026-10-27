@@ -27,6 +27,13 @@ image first. Existing builds can be tested directly with `scripts/dev.py ctest
 --test-dir PATH --output-on-failure` (add `--shell portable` before `ctest` for
 the portable build).
 
+The signal tests cover nonblocking reads and writes, partial writes interrupted
+by signals, and dispatch after a native syscall restart. Descriptor tests check
+loader slot reservation, restoration of descriptor limits, and failure cleanup.
+Exec tests verify read and write record locks, a competing lock waiter throughout failed exec attempts,
+and lock ownership after successful exec, along with descriptor flags and
+private descriptor cleanup.
+
 `make portable-all` builds static loaders for x86_64, aarch64 and riscv64 and
 runs the host tests for each. Cross-compiled host tests use QEMU user emulation.
 The architecture boot harness uses KVM when available for the native target and

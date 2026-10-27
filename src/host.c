@@ -132,17 +132,7 @@ static int fd(struct bridge_host *h, int guest) {
 }
 #include "paths_host.h"
 static int save_fd(struct bridge_host *h, int real, int minimum) {
-    if (real < 0)
-        return -1;
-    if (minimum >= 0)
-        for (int i = minimum; i < MAX_FDS; i++)
-            if (h->fds[i] < 0) {
-                h->fds[i] = real;
-                return i;
-            }
-    close(real);
-    errno = EMFILE;
-    return -1;
+    return adopt_descriptor(h->fds, real, minimum);
 }
 #include "abi_host.h"
 static unsigned pack_flags(int flags) {
@@ -435,7 +425,12 @@ static int64_t service(struct bridge_host *h, volatile struct kernel_control *c)
             return fcntl(actual, F_SETFL, open_flags(n));
         case BF_DUPFD:
         case BF_DUPFD_CLOEXEC:
-            return save_fd(h, fcntl(actual, b == BF_DUPFD ? F_DUPFD : F_DUPFD_CLOEXEC, 3), (int)n);
+            if (n >= MAX_FDS) {
+                errno = EINVAL;
+                return -1;
+            }
+            return save_fd(h, fcntl(actual, b == BF_DUPFD ? F_DUPFD : F_DUPFD_CLOEXEC, (int)n),
+                           (int)n);
         default:
             errno = EINVAL;
             return -1;
@@ -450,11 +445,9 @@ static int64_t service(struct bridge_host *h, volatile struct kernel_control *c)
         }
         if (a == b)
             return b;
-        rc = dup(actual);
+        rc = dup2(actual, (int)b);
         if (rc < 0)
             return -1;
-        if (h->fds[b] >= 0)
-            close(h->fds[b]);
         h->fds[b] = rc;
         return b;
     case BR_STAT:
@@ -612,12 +605,15 @@ static int64_t service(struct bridge_host *h, volatile struct kernel_control *c)
                 h->dirs[i] = opendir(path);
                 if (!h->dirs[i])
                     return -1;
-                h->dir_fds[i] = save_fd(h, dup(dirfd(h->dirs[i])), 0);
-                if (h->dir_fds[i] < 0) {
+                int number = dirfd(h->dirs[i]);
+                if (number >= MAX_FDS) {
                     closedir(h->dirs[i]);
                     h->dirs[i] = NULL;
+                    errno = EMFILE;
                     return -1;
                 }
+                h->dir_fds[i] = number;
+                h->fds[number] = number;
                 return i;
             }
         errno = EMFILE;
@@ -674,7 +670,6 @@ static int64_t service(struct bridge_host *h, volatile struct kernel_control *c)
             return -1;
         }
         actual = h->dir_fds[a];
-        close(h->fds[actual]);
         h->fds[actual] = -1;
         rc = closedir(h->dirs[a]);
         h->dirs[a] = NULL;
@@ -896,8 +891,13 @@ int main(int argc, char **argv) {
     struct bash *skel = NULL;
     struct bpf_capsule capsule = {0};
     struct bridge_host host = {.capsule = &capsule};
+    struct descriptor_reservation reserved = {0};
     if (inherit_descriptors(host.fds)) {
         perror("inherited descriptors");
+        goto cleanup;
+    }
+    if (reserve_descriptor_slots(&reserved)) {
+        perror("loader descriptor slots");
         goto cleanup;
     }
     skel = bash__open();
@@ -960,6 +960,10 @@ int main(int argc, char **argv) {
     c->ppid = getppid();
     if (show_stats)
         stats = bpf_enable_stats(BPF_STATS_RUN_TIME);
+    if (release_descriptor_slots(&reserved)) {
+        perror("loader descriptor limit");
+        goto cleanup;
+    }
     int start = bpf_program__fd(skel->progs.bash_start),
         next = bpf_program__fd(skel->progs.bash_continue);
     int current = start;
@@ -1058,12 +1062,15 @@ int main(int argc, char **argv) {
                 calls + 1, (unsigned long long)c->io_calls);
     }
 cleanup:
+    release_descriptor_slots(&reserved);
+    for (int i = 0; i < MAX_DIRS; i++)
+        if (host.dirs[i]) {
+            host.fds[host.dir_fds[i]] = -1;
+            closedir(host.dirs[i]);
+        }
     for (int i = 0; i < MAX_FDS; i++)
         if (host.fds[i] >= 0)
             close(host.fds[i]);
-    for (int i = 0; i < MAX_DIRS; i++)
-        if (host.dirs[i])
-            closedir(host.dirs[i]);
     if (stats >= 0)
         close(stats);
     bpf_capsule_release(&capsule);

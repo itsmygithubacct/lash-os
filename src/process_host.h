@@ -121,8 +121,8 @@ static int save_process(struct bridge_host *h, struct bash *skel, struct process
     return -1;
 }
 
-static int restore_process(struct bridge_host *h, struct bash **current,
-                           const struct process_snapshot *s) {
+static int restore_reserved_process(struct bridge_host *h, struct bash **current,
+                                    const struct process_snapshot *s) {
     /* These close the child's references; the parent's map/link references live on. */
     bpf_capsule_release(h->capsule);
     bash__destroy(*current);
@@ -170,6 +170,17 @@ static int restore_process(struct bridge_host *h, struct bash **current,
     skel->data_ctrl->control.pid = getpid();
     skel->data_ctrl->control.ppid = getppid();
     return 0;
+}
+
+static int restore_process(struct bridge_host *h, struct bash **current,
+                           const struct process_snapshot *s) {
+    struct descriptor_reservation reserved;
+    if (reserve_descriptor_slots(&reserved))
+        return -1;
+    int result = restore_reserved_process(h, current, s);
+    if (release_descriptor_slots(&reserved))
+        return -1;
+    return result;
 }
 
 static pid_t fork_process(struct bridge_host *h, struct bash **skel, unsigned long clone_flags) {
